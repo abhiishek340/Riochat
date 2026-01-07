@@ -1,0 +1,24 @@
+{
+  "name": "riochat",
+  "version": "0.4.5",
+  "private": true,
+  "description": "Riochat monorepo: Go server, web client and desktop shell.",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=20.9"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "check": "turbo run lint typecheck",
+    "test": "turbo run test",
+    "verify": "turbo run lint typecheck test build",
+    "clean": "node scripts/clean.mjs",
+    "version:sync": "node scripts/sync-version.mjs",
+    "version:check": "node scripts/sync-version.mjs --check",
+    "test:scripts": "node --test scripts/sync-version.test.mjs scripts/build-api.test.mjs"
+  },
+  "devDependencies": {
+    "turbo": "2.11.5"
+  }
+}

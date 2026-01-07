@@ -1,0 +1,15 @@
+# Workspace members: the Go server (so task-runner scripts can drive it), the
+# web client and the desktop shell. Shared libraries, if any are added later,
+# go under packages/.
+packages:
+  - backend
+  - web
+  - desktop
+  - "packages/*"
+
+# pnpm blocks dependency install scripts by default. Only the few packages that
+# really need a native post-install step are allowed to run one.
+allowBuilds:
+  "@tailwindcss/oxide": true
+  esbuild: true
+  unrs-resolver: true
