@@ -1,0 +1,11 @@
+Riochat
+Copyright (c) the Riochat authors.
+
+This repository does not yet carry a license grant; until the owner adds one,
+all rights are reserved. The container image copies this notice to
+/app/licenses/Riochat/NOTICE. When a LICENSE file is added to the repository
+root, add it to the same directory in the Dockerfile.
+
+The image also contains third-party software (Go modules compiled into the
+server binary, the exported web client's JavaScript dependencies, and Debian
+packages). Their licenses are those published by their respective authors.
