@@ -1,0 +1,8 @@
+*.reg text eol=crlf
+*.admx text eol=crlf
+*.adml text eol=crlf
+*.sh text eol=lf
+*.mjs text eol=lf
+Dockerfile text eol=lf
+Makefile text eol=lf
+VERSION text eol=lf

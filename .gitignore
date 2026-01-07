@@ -1,0 +1,70 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build outputs
+.cache/
+.turbo/
+.next/
+out/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+backend/bin/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+# the server sidecar binaries are produced by `scripts/build-api.mjs --sidecar`
+desktop/src-tauri/binaries/*
+!desktop/src-tauri/binaries/.gitkeep
+
+# local configuration, data and secrets (templates live in deploy/*.example.*)
+/config.yaml
+/config.yml
+backend/config.yaml
+backend/config.yml
+deploy/config.yaml
+deploy/config.yml
+deploy/.env
+deploy/secrets/*
+!deploy/secrets/README.md
+!deploy/secrets/*.example
+.env
+.env.*
+!.env.example
+*.local
+.local/
+backend/data/
+backend/storage/
+/data/
+/storage/
+*.db
+*.db-shm
+*.db-wal
+
+# logs and temp files
+*.log
+npm-debug.log*
+pnpm-debug.log*
+tmp/
+.tmp/
+
+# python (optional extraction services)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+
+# editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# local run state and tool caches
+.run/
+.ruff_cache/
