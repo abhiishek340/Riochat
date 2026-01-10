@@ -1,0 +1,35 @@
+# Copy to config.yaml (or point CONFIG_FILE at it). Environment variables win
+# over this file; this file wins over built-in defaults. Relative paths resolve
+# against this file's directory.
+app:
+  name: Riochat
+  env: prod            # dev | prod
+
+server:
+  http_port: 8080
+  cors_allow_origin: https://chat.example.com   # comma separated string or a list
+  trusted_proxies: []                            # IPs or CIDRs of your reverse proxy
+  public_api_base_url: https://chat.example.com
+  public_web_base_url: https://chat.example.com
+
+security:
+  jwt_secret: replace-with-a-random-string-of-32-or-more-chars
+  data_encryption_key: replace-with-a-random-string-of-32-or-more-chars
+  data_encryption_keys_previous: []   # retired keys, decrypt-only, for rotation
+
+database:
+  driver: postgres     # postgres | sqlite
+  postgres:
+    dsn: host=127.0.0.1 port=5432 user=riochat password=riochat dbname=riochat sslmode=disable TimeZone=UTC
+  sqlite:
+    path: ./data/riochat.db
+  redis:
+    addr: 127.0.0.1:6379
+
+cache:
+  driver: redis        # redis | memory
+
+storage:
+  backend: local       # local | s3
+  local:
+    root_dir: ./storage
