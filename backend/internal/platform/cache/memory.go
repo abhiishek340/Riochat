@@ -137,3 +137,138 @@ func (m *Memory) Get(_ context.Context, key string) ([]byte, bool, error) {
 	}
 	return clone(e.value), true, nil
 }
+
+// Set implements KV.
+func (m *Memory) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
+	now, err := m.begin()
+	if err != nil {
+		return err
+	}
+	defer m.mu.Unlock()
+	m.kv[key] = memEntry{value: clone(value), expires: now.Add(ttlOrDefault(ttl))}
+	return nil
+}
+
+// SetNX implements KV.
+func (m *Memory) SetNX(_ context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	now, err := m.begin()
+	if err != nil {
+		return false, err
+	}
+	defer m.mu.Unlock()
+	if _, ok := m.liveLocked(key, now); ok {
+		return false, nil
+	}
+	m.kv[key] = memEntry{value: clone(value), expires: now.Add(ttlOrDefault(ttl))}
+	return true, nil
+}
+
+// GetDel implements KV.
+func (m *Memory) GetDel(_ context.Context, key string) ([]byte, bool, error) {
+	now, err := m.begin()
+	if err != nil {
+		return nil, false, err
+	}
+	defer m.mu.Unlock()
+	e, ok := m.liveLocked(key, now)
+	if !ok {
+		return nil, false, nil
+	}
+	delete(m.kv, key)
+	return clone(e.value), true, nil
+}
+
+// Delete implements KV.
+func (m *Memory) Delete(_ context.Context, keys ...string) error {
+	if _, err := m.begin(); err != nil {
+		return err
+	}
+	defer m.mu.Unlock()
+	for _, k := range keys {
+		delete(m.kv, k)
+	}
+	return nil
+}
+
+// Incr implements KV.
+func (m *Memory) Incr(_ context.Context, key string, ttl time.Duration) (int64, error) {
+	now, err := m.begin()
+	if err != nil {
+		return 0, err
+	}
+	defer m.mu.Unlock()
+	e, ok := m.liveLocked(key, now)
+	var n int64
+	if ok {
+		n, _ = strconv.ParseInt(string(e.value), 10, 64)
+	} else {
+		e.expires = now.Add(ttlOrDefault(ttl))
+	}
+	n++
+	e.value = []byte(strconv.FormatInt(n, 10))
+	m.kv[key] = e
+	return n, nil
+}
+
+// AllowSliding implements RateLimiter.
+func (m *Memory) AllowSliding(_ context.Context, key string, limit int, window, ttl time.Duration) (bool, error) {
+	if key == "" || limit <= 0 {
+		return true, nil
+	}
+	if window <= 0 {
+		window = time.Minute
+	}
+	if ttl <= 0 {
+		ttl = 2 * window
+	}
+	now, err := m.begin()
+	if err != nil {
+		return false, err
+	}
+	defer m.mu.Unlock()
+	w := m.sliding[key]
+	if w == nil || !w.expires.After(now) {
+		w = &memWindow{}
+		m.sliding[key] = w
+	}
+	cutoff := now.Add(-window)
+	kept := w.events[:0]
+	for _, t := range w.events {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	w.events = kept
+	if len(w.events) >= limit {
+		return false, nil
+	}
+	w.events = append(w.events, now)
+	w.expires = now.Add(ttl)
+	return true, nil
+}
+
+// AllowFixed implements RateLimiter.
+func (m *Memory) AllowFixed(_ context.Context, keys []string, limit int, ttl time.Duration) (bool, error) {
+	if len(keys) == 0 || limit <= 0 {
+		return true, nil
+	}
+	ttl = ttlOrDefault(ttl)
+	now, err := m.begin()
+	if err != nil {
+		return false, err
+	}
+	defer m.mu.Unlock()
+	allowed := true
+	for _, k := range keys {
+		c := m.fixed[k]
+		if !c.expires.After(now) {
+			c = memCounter{expires: now.Add(ttl)}
+		}
+		c.count++
+		m.fixed[k] = c
+		if c.count > int64(limit) {
+			allowed = false
+		}
+	}
+	return allowed, nil
+}
