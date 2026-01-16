@@ -164,3 +164,155 @@ func TestConsumeIsAtomicUnderContention(t *testing.T) {
 		}
 	})
 }
+
+func TestJSONHelpers(t *testing.T) {
+	eachBackend(t, func(t *testing.T, b backend) {
+		ctx := context.Background()
+		type rec struct{ A int }
+		if err := SetJSON(ctx, b.cache, "j", rec{A: 4}, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if v, found, err := GetJSON[rec](ctx, b.cache, "j"); err != nil || !found || v.A != 4 {
+			t.Fatalf("GetJSON: %+v %v %v", v, found, err)
+		}
+		if v, found, err := ConsumeJSON[rec](ctx, b.cache, "j"); err != nil || !found || v.A != 4 {
+			t.Fatalf("ConsumeJSON: %+v %v %v", v, found, err)
+		}
+		if _, found, _ := GetJSON[rec](ctx, b.cache, "j"); found {
+			t.Fatal("consumed")
+		}
+		_ = b.cache.Set(ctx, "bad", []byte("not json"), time.Minute)
+		if _, found, err := GetJSON[rec](ctx, b.cache, "bad"); found || err != nil {
+			t.Fatalf("undecodable value must read as a miss: %v %v", found, err)
+		}
+	})
+}
+
+func TestSlidingWindow(t *testing.T) {
+	eachBackend(t, func(t *testing.T, b backend) {
+		ctx := context.Background()
+		for i := 0; i < 3; i++ {
+			ok, err := b.cache.AllowSliding(ctx, "u1", 3, time.Minute, 0)
+			if err != nil || !ok {
+				t.Fatalf("call %d: %v %v", i+1, ok, err)
+			}
+			b.advance(time.Second)
+		}
+		if ok, _ := b.cache.AllowSliding(ctx, "u1", 3, time.Minute, 0); ok {
+			t.Fatal("fourth call must be denied")
+		}
+		if ok, _ := b.cache.AllowSliding(ctx, "u2", 3, time.Minute, 0); !ok {
+			t.Fatal("keys are independent")
+		}
+		b.advance(time.Minute)
+		if ok, _ := b.cache.AllowSliding(ctx, "u1", 3, time.Minute, 0); !ok {
+			t.Fatal("allowed again after the window passed")
+		}
+		// degenerate inputs always allow
+		for _, args := range []struct {
+			key   string
+			limit int
+		}{{"", 1}, {"x", 0}, {"x", -1}} {
+			if ok, err := b.cache.AllowSliding(ctx, args.key, args.limit, time.Minute, 0); !ok || err != nil {
+				t.Fatalf("%+v must allow", args)
+			}
+		}
+	})
+}
+
+func TestFixedWindow(t *testing.T) {
+	eachBackend(t, func(t *testing.T, b backend) {
+		ctx := context.Background()
+		keys := []string{"{p}:a", "{p}:b"}
+		for i := 0; i < 2; i++ {
+			if ok, err := b.cache.AllowFixed(ctx, keys, 2, time.Minute); !ok || err != nil {
+				t.Fatalf("call %d: %v %v", i+1, ok, err)
+			}
+		}
+		if ok, _ := b.cache.AllowFixed(ctx, keys, 2, time.Minute); ok {
+			t.Fatal("third call must be denied")
+		}
+		// either key exceeding denies
+		if ok, _ := b.cache.AllowFixed(ctx, []string{"{p}:fresh", "{p}:a"}, 2, time.Minute); ok {
+			t.Fatal("an exhausted key must deny the whole call")
+		}
+		b.advance(61 * time.Second)
+		if ok, _ := b.cache.AllowFixed(ctx, keys, 2, time.Minute); !ok {
+			t.Fatal("window must reset after ttl")
+		}
+		if ok, _ := b.cache.AllowFixed(ctx, nil, 2, time.Minute); !ok {
+			t.Fatal("no keys allows")
+		}
+		if ok, _ := b.cache.AllowFixed(ctx, keys, 0, time.Minute); !ok {
+			t.Fatal("non-positive limit allows")
+		}
+	})
+}
+
+func TestMemoryClosedAndCopySemantics(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory(nil)
+	buf := []byte("abc")
+	_ = m.Set(ctx, "k", buf, time.Minute)
+	buf[0] = 'X'
+	got, _, _ := m.Get(ctx, "k")
+	if string(got) != "abc" {
+		t.Fatalf("stored value must be a copy: %q", got)
+	}
+	got[0] = 'Y'
+	again, _, _ := m.Get(ctx, "k")
+	if string(again) != "abc" {
+		t.Fatalf("returned value must be a copy: %q", again)
+	}
+	_ = m.Close()
+	if err := m.Ping(ctx); err != ErrClosed {
+		t.Fatalf("ping after close: %v", err)
+	}
+	if _, _, err := m.Get(ctx, "k"); err != ErrClosed {
+		t.Fatalf("get after close: %v", err)
+	}
+}
+
+func TestMemorySweepsOpportunistically(t *testing.T) {
+	fake := clock.NewFake(time.Now())
+	m := NewMemory(fake)
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		_ = m.Set(ctx, "k"+strings.Repeat("x", i), []byte("v"), time.Second)
+	}
+	fake.Advance(time.Minute)
+	for i := 0; i < sweepEvery; i++ {
+		_, _, _ = m.Get(ctx, "nothing")
+	}
+	m.mu.Lock()
+	n := len(m.kv)
+	m.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("expired entries should have been swept, %d left", n)
+	}
+}
+
+func TestOpenSelectsDriver(t *testing.T) {
+	cfg := config.Default()
+	cfg.Cache.Driver = config.CacheMemory
+	c, err := Open(context.Background(), &cfg, nil)
+	if err != nil || c.Name() != "memory" {
+		t.Fatalf("memory: %v %v", c, err)
+	}
+	cfg.Cache.Driver = "etcd"
+	if _, err := Open(context.Background(), &cfg, nil); err == nil {
+		t.Fatal("unknown driver must fail")
+	}
+	mr := miniredis.RunT(t)
+	cfg.Cache.Driver = config.CacheRedis
+	cfg.Database.Redis.Addr = mr.Addr()
+	rc, err := Open(context.Background(), &cfg, nil)
+	if err != nil || rc.Name() != "redis" {
+		t.Fatalf("redis: %v %v", rc, err)
+	}
+	_ = rc.Close()
+	cfg.Database.Redis.Addr = "127.0.0.1:1"
+	if _, err := Open(context.Background(), &cfg, nil); err == nil {
+		t.Fatal("unreachable redis must fail startup")
+	}
+}
