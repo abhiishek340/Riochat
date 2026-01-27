@@ -305,3 +305,308 @@ func TestUniqueSettingRowPerUserAndKey(t *testing.T) {
 		t.Fatalf("other user may reuse the key: %v", err)
 	}
 }
+
+func TestSettingsStoreDeleteAll(t *testing.T) {
+	env := newEnv(t, Ports{})
+	patchSettings(env, 1, map[string]any{"settings": map[string]string{"chat.file_mode": "rag"}})
+	patchSettings(env, 2, map[string]any{"settings": map[string]string{"chat.file_mode": "rag"}})
+	store := NewSettingsStore(env.DB, env.Clock, nil, nil, nil)
+	if err := store.DeleteAll(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	var n int64
+	env.DB.Model(&Setting{}).Where("user_id = 1").Count(&n)
+	if n != 0 {
+		t.Fatal("rows remain")
+	}
+	env.DB.Model(&Setting{}).Where("user_id = 2").Count(&n)
+	if n != 1 {
+		t.Fatal("other user's rows must stay")
+	}
+}
+
+func TestWriteHookReceivesCommittedKeys(t *testing.T) {
+	var mu sync.Mutex
+	var gotUser uint
+	var gotKeys []string
+	env := newEnv(t, Ports{OnSettingsWritten: func(_ context.Context, uid uint, keys []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		gotUser, gotKeys = uid, append([]string(nil), keys...)
+	}})
+	patchSettings(env, 7, map[string]any{"settings": map[string]string{"chat.file_mode": "rag", " chat.markdown_render": "false"}})
+	mu.Lock()
+	defer mu.Unlock()
+	if gotUser != 7 || len(gotKeys) != 2 || gotKeys[0] != "chat.file_mode" || gotKeys[1] != "chat.markdown_render" {
+		t.Fatalf("hook got %d %v", gotUser, gotKeys)
+	}
+	// Failed requests never reach the hook.
+	gotUser = 0
+	mu.Unlock()
+	patchSettings(env, 8, map[string]any{"settings": map[string]string{"chat.file_mode": "bogus"}})
+	mu.Lock()
+	if gotUser != 0 {
+		t.Fatal("hook ran for a rejected request")
+	}
+}
+
+// ---- cache --------------------------------------------------------------------
+
+// flakyKV wraps a cache and fails on demand.
+type flakyKV struct {
+	cache.KV
+	mu       sync.Mutex
+	failGet  bool
+	failSet  bool
+	failAll  bool
+	getCalls int
+}
+
+var errCacheDown = errors.New("cache down")
+
+func (f *flakyKV) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	f.mu.Lock()
+	f.getCalls++
+	fail := f.failGet || f.failAll
+	f.mu.Unlock()
+	if fail {
+		return nil, false, errCacheDown
+	}
+	return f.KV.Get(ctx, key)
+}
+
+func (f *flakyKV) Set(ctx context.Context, key string, v []byte, ttl time.Duration) error {
+	f.mu.Lock()
+	fail := f.failSet || f.failAll
+	f.mu.Unlock()
+	if fail {
+		return errCacheDown
+	}
+	return f.KV.Set(ctx, key, v, ttl)
+}
+
+func (f *flakyKV) SetNX(ctx context.Context, key string, v []byte, ttl time.Duration) (bool, error) {
+	f.mu.Lock()
+	fail := f.failAll
+	f.mu.Unlock()
+	if fail {
+		return false, errCacheDown
+	}
+	return f.KV.SetNX(ctx, key, v, ttl)
+}
+
+func cacheFixture(t *testing.T) (*testkit.Env, *flakyKV, *SettingsCache, *SettingsStore) {
+	t.Helper()
+	env := newEnv(t, Ports{})
+	kv := &flakyKV{KV: env.Deps.Cache}
+	c := NewSettingsCache(env.DB, kv, nil)
+	return env, kv, c, NewSettingsStore(env.DB, env.Clock, c, nil, nil)
+}
+
+func TestCacheUnsetKeyReadsAsEmptyString(t *testing.T) {
+	env, _, c, _ := cacheFixture(t)
+	_ = env
+	v, err := c.Get(context.Background(), 1, SettingContextCompactAuto)
+	if err != nil || v != "" {
+		t.Fatalf("got %q, %v; want empty (not the catalog default)", v, err)
+	}
+	v2, ok, err := c.UserSetting(context.Background(), 1, SettingContextCompactAuto)
+	if err != nil || ok || v2 != "" {
+		t.Fatalf("UserSetting = %q %v %v", v2, ok, err)
+	}
+}
+
+func TestCacheServesWrittenValueImmediately(t *testing.T) {
+	_, _, c, store := cacheFixture(t)
+	ctx := context.Background()
+	// Warm the cache with the "unset" answer, as an older read would.
+	for _, k := range []string{SettingContextCompactAuto, SettingFileMode, SettingReasoningContentPassing} {
+		if v, _ := c.Get(ctx, 1, k); v != "" {
+			t.Fatalf("%s warm value %q", k, v)
+		}
+	}
+	if _, err := store.Patch(ctx, 1, map[string]string{
+		SettingContextCompactAuto: "false", SettingFileMode: "rag", SettingReasoningContentPassing: "false"}); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{SettingContextCompactAuto: "false", SettingFileMode: "rag", SettingReasoningContentPassing: "false"} {
+		if v, err := c.Get(ctx, 1, k); err != nil || v != want {
+			t.Errorf("%s = %q, %v; want %q", k, v, err, want)
+		}
+	}
+}
+
+func TestCacheSecondInstanceSharingTheCacheSeesWrites(t *testing.T) {
+	env, _, c, store := cacheFixture(t)
+	other := NewSettingsCache(env.DB, env.Deps.Cache, nil)
+	ctx := context.Background()
+	other.Get(ctx, 1, SettingFileMode)
+	if _, err := store.Patch(ctx, 1, map[string]string{SettingFileMode: "rag"}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := other.Get(ctx, 1, SettingFileMode); v != "rag" {
+		t.Fatalf("second instance read %q", v)
+	}
+	_ = c
+}
+
+func TestCacheStaleInFlightReadCannotOverwriteNewValue(t *testing.T) {
+	env, kv, c, store := cacheFixture(t)
+	ctx := context.Background()
+	// An old reader resolved the version and loaded the old DB value, but has not
+	// stored it yet.
+	oldToken, err := c.version(ctx, 1, SettingFileMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleValue := "auto-from-old-read"
+	if _, err := store.Patch(ctx, 1, map[string]string{SettingFileMode: "rag"}); err != nil {
+		t.Fatal(err)
+	}
+	// The slow reader finally writes under the version it had.
+	if err := kv.Set(ctx, valueKey(1, SettingFileMode, oldToken), []byte(staleValue), settingsCacheTTL); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := c.Get(ctx, 1, SettingFileMode); v != "rag" {
+		t.Fatalf("stale write won: %q", v)
+	}
+	// And a concurrent second update still wins over the first.
+	if _, err := store.Patch(ctx, 1, map[string]string{SettingFileMode: "full_context"}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := c.Get(ctx, 1, SettingFileMode); v != "full_context" {
+		t.Fatalf("got %q", v)
+	}
+	_ = env
+}
+
+func TestCacheFillsFromDatabaseAndThenServesFromCache(t *testing.T) {
+	env, _, c, _ := cacheFixture(t)
+	ctx := context.Background()
+	env.DB.Create(&Setting{UserID: 1, Key: SettingFileMode, Value: "rag", UpdatedAt: env.Clock.Now()})
+	if v, _ := c.Get(ctx, 1, SettingFileMode); v != "rag" {
+		t.Fatalf("got %q", v)
+	}
+	// Change the row behind the cache's back: the cached value is served.
+	env.DB.Model(&Setting{}).Where(map[string]any{"user_id": 1, "key": SettingFileMode}).Update("value", "full_context")
+	if v, _ := c.Get(ctx, 1, SettingFileMode); v != "rag" {
+		t.Fatalf("expected cached value, got %q", v)
+	}
+}
+
+func TestCacheEntriesExpireAfterTenMinutes(t *testing.T) {
+	// The memory cache uses wall time, so check the configured lifetime instead.
+	if settingsCacheTTL != 10*time.Minute {
+		t.Fatalf("ttl = %v", settingsCacheTTL)
+	}
+}
+
+func TestCacheBackendDownFallsBackToDatabase(t *testing.T) {
+	env, kv, c, store := cacheFixture(t)
+	ctx := context.Background()
+	env.DB.Create(&Setting{UserID: 1, Key: SettingFileMode, Value: "rag", UpdatedAt: env.Clock.Now()})
+	kv.mu.Lock()
+	kv.failAll = true
+	kv.mu.Unlock()
+	if v, err := c.Get(ctx, 1, SettingFileMode); err != nil || v != "rag" {
+		t.Fatalf("read with cache down: %q, %v", v, err)
+	}
+	if v, err := c.Get(ctx, 1, SettingContextCompactAuto); err != nil || v != "" {
+		t.Fatalf("unset read with cache down: %q, %v", v, err)
+	}
+	got, err := store.Patch(ctx, 1, map[string]string{SettingFileMode: "full_context"})
+	if err != nil || got[SettingFileMode] != "full_context" {
+		t.Fatalf("patch with cache down: %v, %v", got, err)
+	}
+}
+
+func TestCacheValueReadFailureStillReturnsDatabaseValue(t *testing.T) {
+	env, kv, c, _ := cacheFixture(t)
+	env.DB.Create(&Setting{UserID: 1, Key: SettingFileMode, Value: "rag", UpdatedAt: env.Clock.Now()})
+	c.Get(context.Background(), 1, SettingFileMode) // create the version
+	kv.mu.Lock()
+	kv.failGet = true
+	kv.mu.Unlock()
+	if v, err := c.Get(context.Background(), 1, SettingFileMode); err != nil || v != "rag" {
+		t.Fatalf("got %q, %v", v, err)
+	}
+}
+
+func TestPatchWithClosedCacheStillSucceedsOverHTTP(t *testing.T) {
+	env := newEnv(t, Ports{})
+	if err := env.Deps.Cache.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, code, _, _ := patchSettings(env, 1, map[string]any{"settings": map[string]string{SettingFileMode: "rag"}})
+	if code != 200 || got[SettingFileMode] != "rag" {
+		t.Fatalf("%d %v", code, got)
+	}
+	if getSettings(t, env, 1)[SettingFileMode] != "rag" {
+		t.Fatal("not stored")
+	}
+}
+
+func TestNilCacheReadsDatabaseDirectly(t *testing.T) {
+	env := newEnv(t, Ports{})
+	c := NewSettingsCache(env.DB, nil, nil)
+	env.DB.Create(&Setting{UserID: 1, Key: SettingFileMode, Value: "rag", UpdatedAt: env.Clock.Now()})
+	if v, err := c.Get(context.Background(), 1, SettingFileMode); err != nil || v != "rag" {
+		t.Fatalf("got %q, %v", v, err)
+	}
+	c.Refresh(context.Background(), 1, []string{SettingFileMode}) // must not panic
+	var nilCache *SettingsCache
+	nilCache.Refresh(context.Background(), 1, []string{"x"})
+}
+
+func TestFailedWriteLeavesCacheUntouched(t *testing.T) {
+	env, _, c, store := cacheFixture(t)
+	ctx := context.Background()
+	env.DB.Create(&Setting{UserID: 1, Key: SettingFileMode, Value: "rag", UpdatedAt: env.Clock.Now()})
+	if v, _ := c.Get(ctx, 1, SettingFileMode); v != "rag" {
+		t.Fatalf("warm: %q", v)
+	}
+	// Break the table so the upsert fails.
+	if err := env.DB.Exec("ALTER TABLE user_settings RENAME TO user_settings_gone").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Patch(ctx, 1, map[string]string{SettingFileMode: "full_context"}); err == nil {
+		t.Fatal("write should have failed")
+	}
+	env.DB.Exec("ALTER TABLE user_settings_gone RENAME TO user_settings")
+	if v, _ := c.Get(ctx, 1, SettingFileMode); v != "rag" {
+		t.Fatalf("cached value changed: %q", v)
+	}
+}
+
+func TestStorageFailureIs500WithoutLeakingDetails(t *testing.T) {
+	env := newEnv(t, Ports{})
+	if err := env.DB.Exec("DROP TABLE user_settings").Error; err != nil {
+		t.Fatal(err)
+	}
+	w := env.Do("GET", "/api/v1/user/settings", env.Bearer(testkit.User(1)), nil)
+	testkit.Expect(t, w, 500, "internal.error")
+	if strings.Contains(w.Body.String(), "user_settings") {
+		t.Fatalf("leaked detail: %s", w.Body)
+	}
+	w = env.Do("PATCH", "/api/v1/user/settings", env.Bearer(testkit.User(1)), map[string]any{"settings": map[string]string{SettingFileMode: "rag"}})
+	testkit.Expect(t, w, 500, "internal.error")
+}
+
+func TestConcurrentPatchesDoNotCorruptRows(t *testing.T) {
+	env := newEnv(t, Ports{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			mode := []string{"auto", "rag", "full_context"}[i%3]
+			patchSettings(env, 1, map[string]any{"settings": map[string]string{SettingFileMode: mode, "chat.default_model": fmt.Sprint(i)}})
+		}(i)
+	}
+	wg.Wait()
+	var n int64
+	env.DB.Model(&Setting{}).Where("user_id = 1").Count(&n)
+	if n != 2 {
+		t.Fatalf("rows: %d", n)
+	}
+}
