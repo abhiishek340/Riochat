@@ -1,0 +1,270 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Design tokens.
+ *
+ * Neutrals are warm paper in light mode and deep blue-ink in dark mode. A
+ * single accent hue drives every coloured surface: presets only change
+ * --accent-hue / --accent-chroma (see the [data-accent] blocks below), so a new
+ * preset is two lines. All colours are OKLCH.
+ */
+:root {
+  --accent-hue: 200;
+  --accent-chroma: 0.1;
+  --neutral-hue: 85;
+
+  --radius: 0.625rem;
+
+  --background: oklch(0.985 0.005 var(--neutral-hue));
+  --foreground: oklch(0.24 0.02 250);
+  --card: oklch(1 0 0);
+  --card-foreground: var(--foreground);
+  --popover: oklch(1 0 0);
+  --popover-foreground: var(--foreground);
+
+  --primary: oklch(0.5 var(--accent-chroma) var(--accent-hue));
+  --primary-foreground: oklch(0.99 0.004 var(--accent-hue));
+  --secondary: oklch(0.955 0.008 var(--neutral-hue));
+  --secondary-foreground: oklch(0.3 0.02 250);
+  --muted: oklch(0.958 0.007 var(--neutral-hue));
+  --muted-foreground: oklch(0.5 0.015 250);
+  --accent: oklch(0.945 0.03 var(--accent-hue));
+  --accent-foreground: oklch(0.33 0.07 var(--accent-hue));
+
+  --destructive: oklch(0.56 0.21 27);
+  --destructive-foreground: oklch(0.99 0.005 27);
+  --success: oklch(0.55 0.13 155);
+  --success-foreground: oklch(0.99 0.005 155);
+  --warning: oklch(0.75 0.14 75);
+  --warning-foreground: oklch(0.25 0.05 75);
+  --info: oklch(0.58 0.12 245);
+  --info-foreground: oklch(0.99 0.004 245);
+
+  --border: oklch(0.9 0.008 var(--neutral-hue));
+  --input: oklch(0.87 0.009 var(--neutral-hue));
+  --ring: oklch(0.62 var(--accent-chroma) var(--accent-hue));
+
+  --sidebar: oklch(0.968 0.007 var(--neutral-hue));
+  --sidebar-foreground: var(--foreground);
+  --sidebar-accent: oklch(0.93 0.015 var(--accent-hue));
+  --sidebar-accent-foreground: oklch(0.3 0.05 var(--accent-hue));
+  --sidebar-border: oklch(0.915 0.008 var(--neutral-hue));
+
+  --chart-1: oklch(0.55 0.12 var(--accent-hue));
+  --chart-2: oklch(0.68 0.14 60);
+  --chart-3: oklch(0.55 0.13 155);
+  --chart-4: oklch(0.58 0.15 300);
+  --chart-5: oklch(0.62 0.17 20);
+
+  --shadow-color: oklch(0.25 0.03 250 / 0.12);
+  --elev-1: 0 1px 2px var(--shadow-color);
+  --elev-2: 0 4px 12px -2px var(--shadow-color), 0 2px 4px -2px var(--shadow-color);
+  --elev-3: 0 16px 40px -8px var(--shadow-color), 0 4px 10px -4px var(--shadow-color);
+
+  --sidebar-width: 17.5rem;
+  --sidebar-rail-width: 3.5rem;
+  --header-height: 3.5rem;
+}
+
+.dark {
+  --neutral-hue: 250;
+
+  --background: oklch(0.18 0.014 var(--neutral-hue));
+  --foreground: oklch(0.95 0.006 var(--neutral-hue));
+  --card: oklch(0.215 0.016 var(--neutral-hue));
+  --popover: oklch(0.235 0.017 var(--neutral-hue));
+
+  --primary: oklch(0.74 var(--accent-chroma) var(--accent-hue));
+  --primary-foreground: oklch(0.2 0.03 var(--accent-hue));
+  --secondary: oklch(0.27 0.016 var(--neutral-hue));
+  --secondary-foreground: oklch(0.93 0.006 var(--neutral-hue));
+  --muted: oklch(0.255 0.015 var(--neutral-hue));
+  --muted-foreground: oklch(0.72 0.014 var(--neutral-hue));
+  --accent: oklch(0.3 0.04 var(--accent-hue));
+  --accent-foreground: oklch(0.9 0.05 var(--accent-hue));
+
+  --destructive: oklch(0.68 0.19 25);
+  --destructive-foreground: oklch(0.18 0.03 25);
+  --success: oklch(0.7 0.14 155);
+  --success-foreground: oklch(0.18 0.03 155);
+  --warning: oklch(0.8 0.13 80);
+  --warning-foreground: oklch(0.22 0.04 80);
+  --info: oklch(0.72 0.11 245);
+  --info-foreground: oklch(0.18 0.03 245);
+
+  --border: oklch(1 0 0 / 0.1);
+  --input: oklch(1 0 0 / 0.14);
+  --ring: oklch(0.7 var(--accent-chroma) var(--accent-hue) / 0.7);
+
+  --sidebar: oklch(0.155 0.013 var(--neutral-hue));
+  --sidebar-accent: oklch(0.27 0.03 var(--accent-hue));
+  --sidebar-accent-foreground: oklch(0.92 0.04 var(--accent-hue));
+  --sidebar-border: oklch(1 0 0 / 0.08);
+
+  --chart-1: oklch(0.74 0.12 var(--accent-hue));
+  --chart-2: oklch(0.8 0.13 75);
+  --chart-3: oklch(0.72 0.14 155);
+  --chart-4: oklch(0.72 0.14 300);
+  --chart-5: oklch(0.74 0.15 20);
+
+  --shadow-color: oklch(0 0 0 / 0.45);
+}
+
+/* Accent presets: the whole palette follows these two numbers. */
+[data-accent="tide"] { --accent-hue: 200; --accent-chroma: 0.1; }
+[data-accent="ember"] { --accent-hue: 45; --accent-chroma: 0.15; }
+[data-accent="moss"] { --accent-hue: 150; --accent-chroma: 0.11; }
+[data-accent="dusk"] { --accent-hue: 290; --accent-chroma: 0.14; }
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 10px);
+
+  --shadow-sm: var(--elev-1);
+  --shadow-md: var(--elev-2);
+  --shadow-lg: var(--elev-3);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/* --- keyframes used by overlays ------------------------------------------ */
+@keyframes rio-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rio-fade-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes rio-pop-in {
+  from { opacity: 0; transform: translate(var(--rio-tx, 0), var(--rio-ty, 0)) scale(0.96); }
+  to { opacity: 1; transform: translate(var(--rio-tx, 0), var(--rio-ty, 0)) scale(1); }
+}
+@keyframes rio-pop-out {
+  from { opacity: 1; transform: translate(var(--rio-tx, 0), var(--rio-ty, 0)) scale(1); }
+  to { opacity: 0; transform: translate(var(--rio-tx, 0), var(--rio-ty, 0)) scale(0.96); }
+}
+@keyframes rio-slide-in-left { from { transform: translateX(-100%); } to { transform: translateX(0); } }
+@keyframes rio-slide-out-left { from { transform: translateX(0); } to { transform: translateX(-100%); } }
+@keyframes rio-slide-in-right { from { transform: translateX(100%); } to { transform: translateX(0); } }
+@keyframes rio-slide-out-right { from { transform: translateX(0); } to { transform: translateX(100%); } }
+@keyframes rio-toast-in { from { opacity: 0; transform: translateY(var(--rio-toast-from, -8px)) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes rio-spin { to { transform: rotate(360deg); } }
+@keyframes rio-pulse { 50% { opacity: 0.5; } }
+
+@layer base {
+  *, ::before, ::after { border-color: var(--border); outline-color: color-mix(in oklab, var(--ring) 50%, transparent); }
+
+  html, body { height: 100%; overflow-x: clip; }
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    touch-action: manipulation;
+  }
+
+  button:not(:disabled), [role="button"]:not([aria-disabled="true"]), a[href] { cursor: pointer; }
+
+  /* Thin scrollbars that follow the theme. */
+  * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
+
+  ::selection { background: color-mix(in oklab, var(--primary) 28%, transparent); }
+
+  :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+}
+
+/*
+ * The root starts hidden until branding and the initial catalog are ready
+ * (capped at 3 s) so the default name never flashes before the real one.
+ * Without JavaScript the page must stay readable, hence the noscript override
+ * in the root layout.
+ */
+html[data-branding="pending"] body { opacity: 0; }
+body { transition: opacity 120ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@layer utilities {
+  .rio-gradient-text {
+    background-image: linear-gradient(100deg, var(--primary), oklch(0.65 0.14 calc(var(--accent-hue) + 70)), var(--primary));
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: rio-gradient-shift 8s linear infinite;
+  }
+  .rio-glass {
+    background: color-mix(in oklab, var(--background) 72%, transparent);
+    backdrop-filter: blur(18px) saturate(150%);
+    border: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+  }
+}
+@keyframes rio-gradient-shift { to { background-position: -200% 0; } }
+
+/*
+ * Appearance preferences set by Settings (see features/settings): the root
+ * attributes are absent for the default value. Text size scales every rem.
+ * Reply typography is exposed as variables for the chat view (.rio-reply).
+ */
+html[data-font-size="small"] { font-size: 88%; }
+html[data-font-size="medium"] { font-size: 112%; }
+html[data-font-size="large"] { font-size: 124%; }
+
+html[data-chat-font="songti"] { --chat-font-family: "Songti SC", "Noto Serif CJK SC", "Source Han Serif SC", Georgia, serif; }
+html[data-chat-font="heiti"] { --chat-font-family: "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif; }
+html[data-chat-font="mono"] { --chat-font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+html[data-chat-font-weight="medium"] { --chat-font-weight: 500; }
+html[data-chat-font-weight="semibold"] { --chat-font-weight: 600; }
+html[data-chat-font-weight="bold"] { --chat-font-weight: 700; }
+.rio-reply {
+  font-family: var(--chat-font-family, inherit);
+  font-weight: var(--chat-font-weight, inherit);
+}
