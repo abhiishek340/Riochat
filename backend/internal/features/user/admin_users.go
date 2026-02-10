@@ -230,3 +230,240 @@ type statusBody struct {
 	Status string `json:"status" binding:"required,max=32"`
 	Reason string `json:"reason" binding:"max=255"`
 }
+
+// settableStatus is one of the four statuses an administrator may set.
+func settableStatus(s string) bool {
+	switch s {
+	case StatusActive, StatusLocked, StatusSuspended, StatusDeactivated:
+		return true
+	}
+	return false
+}
+
+func (a *adminAPI) setStatus(c *gin.Context) {
+	id, ok := userID(c)
+	if !ok {
+		return
+	}
+	var req statusBody
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	status := strings.TrimSpace(req.Status)
+	if !settableStatus(status) {
+		httpx.Fail(c, http.StatusBadRequest, ErrInvalidStatus)
+		return
+	}
+	_, target, ok := a.load(c, id)
+	if !ok {
+		return
+	}
+	if target.Role == RoleSuperAdmin {
+		httpx.Fail(c, http.StatusConflict, ErrSuperadminStatus)
+		return
+	}
+	from := target.Status
+	if err := a.accounts.ApplyStatus(c.Request.Context(), id, status); err != nil {
+		fail(c, err)
+		return
+	}
+	a.record(c, "admin_update_user_status", id, gin.H{"from_status": from, "to_status": status, "reason": req.Reason})
+	a.respondUser(c, id)
+}
+
+// ---- credentials and sessions ---------------------------------------------------------
+
+type resetPasswordBody struct {
+	NewPassword       string `json:"newPassword" binding:"required,min=8,max=128"`
+	MustResetPassword *bool  `json:"mustResetPassword"`
+}
+
+func (a *adminAPI) resetPassword(c *gin.Context) {
+	id, ok := userID(c)
+	if !ok {
+		return
+	}
+	var req resetPasswordBody
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	acting, target, ok := a.load(c, id)
+	if !ok {
+		return
+	}
+	if target.Role == RoleSuperAdmin {
+		httpx.Fail(c, http.StatusConflict, ErrSuperadminPassword)
+		return
+	}
+	must := req.MustResetPassword == nil || *req.MustResetPassword
+	ctx := c.Request.Context()
+	if err := a.accounts.ResetPassword(ctx, id, req.NewPassword, must); err != nil {
+		fail(c, err)
+		return
+	}
+	if err := a.accounts.RevokeAllSessions(ctx, id, reasonPasswordReset); err != nil {
+		fail(c, err)
+		return
+	}
+	state := reqctx.FromRequest(c.Request)
+	// The trace event is best effort: a failure to store it never fails the reset.
+	_ = a.accounts.RecordAuthEvent(ctx, AuthEvent{
+		RequestID: state.RequestID(), UserID: id, EventType: "password_reset", Result: "success",
+		Reason: "admin_reset_password", ClientIP: state.ClientIP(), UserAgent: c.Request.UserAgent(),
+		DetailJSON: `{"actor_user_id":"` + idText(acting.ID) + `","must_reset_password":"` + strconv.FormatBool(must) + `"}`,
+	})
+	a.record(c, "admin_reset_user_password", id, gin.H{"must_reset_password": strconv.FormatBool(must)})
+	httpx.OK(c, gin.H{"reset": true})
+}
+
+func (a *adminAPI) resetTwoFactor(c *gin.Context) {
+	id, ok := userID(c)
+	if !ok {
+		return
+	}
+	_, target, ok := a.load(c, id)
+	if !ok {
+		return
+	}
+	if target.Role == RoleSuperAdmin {
+		httpx.Fail(c, http.StatusConflict, ErrSuperadminTwoFactor)
+		return
+	}
+	ctx := c.Request.Context()
+	available, err := a.accounts.ResetTwoFactor(ctx, id)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	if !available {
+		httpx.OK(c, gin.H{"reset": true})
+		return
+	}
+	if err := a.accounts.RevokeAllSessions(ctx, id, reasonTwoFactor); err != nil {
+		fail(c, err)
+		return
+	}
+	a.record(c, "admin_reset_user_2fa", id, gin.H{"target_user_id": idText(id)})
+	httpx.OK(c, gin.H{"reset": true})
+}
+
+func (a *adminAPI) revokeSessions(c *gin.Context) {
+	id, ok := userID(c)
+	if !ok {
+		return
+	}
+	if _, _, ok := a.load(c, id); !ok {
+		return
+	}
+	if err := a.accounts.RevokeAllSessions(c.Request.Context(), id, reasonRevokeAll); err != nil {
+		fail(c, err)
+		return
+	}
+	a.record(c, "admin_revoke_user_sessions", id, gin.H{"target_user_id": idText(id)})
+	httpx.OK(c, gin.H{"revoked": true})
+}
+
+// ---- delete ----------------------------------------------------------------------------
+
+func (a *adminAPI) remove(c *gin.Context) {
+	id, ok := userID(c)
+	if !ok {
+		return
+	}
+	acting, target, ok := a.load(c, id)
+	if !ok {
+		return
+	}
+	if acting.ID == target.ID {
+		httpx.Fail(c, http.StatusConflict, ErrSelfDelete)
+		return
+	}
+	if target.Role == RoleSuperAdmin {
+		httpx.Fail(c, http.StatusConflict, ErrSuperadminDeleteConf)
+		return
+	}
+	if err := a.accounts.HardDelete(c.Request.Context(), id); err != nil {
+		fail(c, err)
+		return
+	}
+	a.record(c, "admin_delete_user", id, gin.H{"target_user_id": idText(id), "username": target.Username, "public_id": target.PublicID})
+	httpx.OK(c, gin.H{"deleted": true})
+}
+
+// ---- authentication events -----------------------------------------------------------
+
+// AuthEventView is one authentication event with the current name of its user.
+type AuthEventView struct {
+	ID              uint      `json:"id"`
+	RequestID       string    `json:"requestID"`
+	UserID          uint      `json:"userID"`
+	Username        string    `json:"username"`
+	UserDisplayName string    `json:"userDisplayName"`
+	UserLabel       string    `json:"userLabel"`
+	EventType       string    `json:"eventType"`
+	Result          string    `json:"result"`
+	Reason          string    `json:"reason"`
+	ClientIP        string    `json:"clientIP"`
+	UserAgent       string    `json:"userAgent"`
+	DetailJSON      string    `json:"detailJSON"`
+	OccurredAt      time.Time `json:"occurredAt"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+}
+
+func (a *adminAPI) authEvents(c *gin.Context) {
+	q := c.Request.URL.Query()
+	f := AuthEventFilter{EventType: q.Get("event_type"), Result: q.Get("result")}
+	if raw := strings.TrimSpace(q.Get("user_id")); raw != "" {
+		n, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil || n == 0 || uint64(uint(n)) != n {
+			httpx.Fail(c, http.StatusBadRequest, ErrInvalidID)
+			return
+		}
+		f.UserID = uint(n)
+	}
+	ctx := c.Request.Context()
+	rows, total, err := a.accounts.ListAuthEvents(ctx, f, pagination.FromRequest(c.Request))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	idSet := map[uint]bool{}
+	for _, r := range rows {
+		if r.UserID != 0 {
+			idSet[r.UserID] = true
+		}
+	}
+	people, err := a.accounts.ByIDs(ctx, sortedIDs(idSet))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	out := make([]AuthEventView, 0, len(rows))
+	for _, r := range rows {
+		v := AuthEventView{
+			ID: r.ID, RequestID: r.RequestID, UserID: r.UserID, EventType: r.EventType, Result: r.Result,
+			Reason: r.Reason, ClientIP: r.ClientIP, UserAgent: r.UserAgent, DetailJSON: r.DetailJSON,
+			OccurredAt: r.OccurredAt, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		}
+		if p, ok := people[r.UserID]; ok {
+			v.Username, v.UserDisplayName = p.Username, p.DisplayName
+			v.UserLabel = userLabel(p)
+			if v.UserLabel == "" {
+				v.UserLabel = idText(p.ID)
+			}
+		}
+		out = append(out, v)
+	}
+	httpx.Paged(c, total, out)
+}
+
+// adminDeps are the collaborators of the administration routes.
+type adminDeps struct {
+	routes   deps.Routes
+	accounts *Accounts
+	billing  Billing
+	audit    Auditor
+	clock    clock.Clock
+	cfg      *config.Holder
+}
