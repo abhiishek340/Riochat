@@ -208,3 +208,189 @@ func (a *adminAPI) readSource(ctx context.Context, dsn string) ([]sourceUser, er
 }
 
 // ---- planning -----------------------------------------------------------------------------
+
+type candidate struct {
+	key, email string
+	row        sourceUser
+}
+
+// planImport classifies the source rows and builds the records to create.
+func (a *adminAPI) planImport(ctx context.Context, rows []sourceUser, multiplier float64) (ImportReport, []ImportRecord, error) {
+	report := ImportReport{Source: importSource, DedupeField: importDedupeField, DedupeRule: importDedupeRule, Scanned: len(rows)}
+	seen := map[string]bool{}
+	var cands []candidate
+	for _, r := range rows {
+		email, err := NormalizeEmail(r.Email)
+		if err != nil || email == "" {
+			report.SkippedInvalidEmail++
+			continue
+		}
+		lower := strings.ToLower(email)
+		if seen[lower] {
+			report.SkippedDuplicateSourceEmail++
+			continue
+		}
+		seen[lower] = true
+		key := strings.TrimSpace(r.ID)
+		if key == "" {
+			key = email
+		}
+		if key == "" {
+			report.SkippedInvalidRow++
+			continue
+		}
+		cands = append(cands, candidate{key: key, email: email, row: r})
+	}
+	emails := make([]string, 0, len(cands))
+	for _, c := range cands {
+		emails = append(emails, c.email)
+	}
+	existing, err := a.accounts.UsersByEmails(ctx, emails)
+	if err != nil {
+		return report, nil, err
+	}
+	taken, err := a.accounts.AllUsernames(ctx)
+	if err != nil {
+		return report, nil, err
+	}
+	used := make(map[string]bool, len(taken))
+	for n := range taken {
+		used[strings.ToLower(n)] = true
+	}
+
+	var records []ImportRecord
+	for _, c := range cands {
+		if _, dup := existing[strings.ToLower(c.email)]; dup {
+			report.SkippedExistingEmail++
+			continue
+		}
+		digest := sha256.Sum256([]byte(c.key + "\x00" + strings.ToLower(c.email)))
+		hexHash := hex.EncodeToString(digest[:])
+		username := pickUsername(c.row.ID, hexHash, used)
+		used[username] = true
+
+		hash, err := randomPasswordHash()
+		if err != nil {
+			return report, nil, err
+		}
+		records = append(records, ImportRecord{
+			Account: Account{
+				PublicID: "ow" + hexHash[:30], Username: username, DisplayName: importDisplayName(c.row.Name),
+				Email: c.email, Role: RoleUser, Status: StatusActive, Timezone: importTimezone, Locale: importLocale,
+				EmailSource: EmailSourceProviderVerified, AppearancePreferences: importAppearance,
+			},
+			Credential:     Credential{PasswordHash: hash, PasswordAlgo: "bcrypt", PasswordEnabled: true, PasswordOrigin: PasswordOriginAdminCreated},
+			BalanceNanoUSD: creditToNano(c.row.Credit, multiplier),
+			RefNo:          importRefNo,
+		})
+	}
+	report.Imported = len(records)
+	return report, records, nil
+}
+
+// randomPasswordHash hashes 32 random bytes: nobody knows the password.
+func randomPasswordHash() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hashPassword(base64.RawStdEncoding.EncodeToString(raw))
+}
+
+// creditToNano converts a source credit into nano-USD, never negative and
+// saturating at the largest int64.
+func creditToNano(credit, multiplier float64) int64 {
+	if credit <= 0 || multiplier <= 0 || math.IsNaN(credit) || math.IsInf(credit, 0) || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+		return 0
+	}
+	v := math.Round(credit * multiplier * 1e9)
+	if math.IsNaN(v) || v <= 0 {
+		return 0
+	}
+	if v >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
+
+// importDisplayName trims the source name, falls back to "user", cuts it to 16
+// characters and pads with underscores up to three.
+func importDisplayName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "user"
+	}
+	if r := []rune(name); len(r) > importNameMax {
+		name = string(r[:importNameMax])
+	}
+	for utf8.RuneCountInString(name) < importNameMin {
+		name += "_"
+	}
+	return name
+}
+
+// sanitizeUsername derives a login candidate from a source id.
+func sanitizeUsername(id string) string {
+	var b strings.Builder
+	pendingDash := false
+	for _, r := range strings.ToLower(id) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			if pendingDash {
+				b.WriteByte('-')
+				pendingDash = false
+			}
+			b.WriteRune(r)
+		case r == ' ' || r == '.' || r == ':' || r == '/' || r == '-':
+			pendingDash = true
+		}
+	}
+	if pendingDash {
+		b.WriteByte('-')
+	}
+	out := strings.Trim(b.String(), "-_")
+	if r := []rune(out); len(r) > importUsernameMax {
+		out = string(r[:importUsernameMax])
+	}
+	return out
+}
+
+// pickUsername chooses a free username for an imported account.
+func pickUsername(sourceID, hexHash string, used map[string]bool) string {
+	free := func(n string) bool {
+		if n == "" {
+			return false
+		}
+		if _, err := NormalizeUsername(n); err != nil {
+			return false
+		}
+		return !used[strings.ToLower(n)]
+	}
+	base := sanitizeUsername(sourceID)
+	if _, err := NormalizeUsername(base); err != nil {
+		base = importFallbackBase + hexHash[:8]
+	}
+	if free(base) {
+		return base
+	}
+	stem := strings.Trim(base, "-_")
+	if r := []rune(stem); len(r) > importUsernameMax-5 {
+		stem = strings.Trim(string(r[:importUsernameMax-5]), "-_")
+	}
+	for i := 0; i+4 <= len(hexHash); i += 4 {
+		if cand := stem + "-" + hexHash[i:i+4]; free(cand) {
+			return cand
+		}
+	}
+	for i := 0; i+11 <= len(hexHash); i++ {
+		if cand := importFallbackBase + hexHash[i:i+11]; free(cand) {
+			return cand
+		}
+	}
+	// Practically unreachable: the hash windows are exhausted.
+	for n := 1; ; n++ {
+		if cand := fmt.Sprintf("%s%d", importFallbackBase, n); free(cand) {
+			return cand
+		}
+	}
+}
