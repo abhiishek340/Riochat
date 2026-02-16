@@ -150,3 +150,149 @@ func (s *Service) userByID(ctx context.Context, id uint) (*User, error) {
 	}
 	return &u, nil
 }
+
+func (s *Service) credentialOf(ctx context.Context, userID uint) (*Credential, error) {
+	var c Credential
+	err := s.conn(ctx).Where("user_id = ?", userID).First(&c).Error
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (s *Service) mfaOf(ctx context.Context, userID uint) (*MFASettings, error) {
+	var m MFASettings
+	err := s.conn(ctx).Where("user_id = ?", userID).First(&m).Error
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &m, nil
+}
+
+func totpActive(m *MFASettings) bool {
+	return m != nil && m.TOTPEnabled && strings.TrimSpace(m.TOTPSecretEncrypted) != ""
+}
+
+// ---- user view --------------------------------------------------------------
+
+type userView struct {
+	ID                    uint       `json:"id"`
+	PublicID              string     `json:"publicID"`
+	Username              string     `json:"username"`
+	DisplayName           string     `json:"displayName"`
+	AvatarURL             string     `json:"avatarURL"`
+	Email                 string     `json:"email"`
+	Phone                 string     `json:"phone"`
+	Role                  string     `json:"role"`
+	Status                string     `json:"status"`
+	Timezone              string     `json:"timezone"`
+	Locale                string     `json:"locale"`
+	ProfilePreferences    string     `json:"profilePreferences"`
+	AppearancePreferences string     `json:"appearancePreferences"`
+	OnboardingCompletedAt *time.Time `json:"onboardingCompletedAt"`
+	EmailVerifiedAt       *time.Time `json:"emailVerifiedAt"`
+	EmailSource           string     `json:"emailSource"`
+	EmailBootstrapUsedAt  *time.Time `json:"emailBootstrapUsedAt"`
+	PhoneVerifiedAt       *time.Time `json:"phoneVerifiedAt"`
+	UsernameChangedAt     *time.Time `json:"usernameChangedAt"`
+	PasswordEnabled       bool       `json:"passwordEnabled"`
+	PasswordSetAt         *time.Time `json:"passwordSetAt"`
+	PasswordOrigin        string     `json:"passwordOrigin"`
+	MustResetPassword     bool       `json:"mustResetPassword"`
+	InitialUsernameReq    bool       `json:"initialUsernameRequired"`
+	InitialSecurityReq    bool       `json:"initialSecurityRequired"`
+	TwoFactorAvailable    bool       `json:"twoFactorAvailable"`
+	TwoFactorEnabled      bool       `json:"twoFactorEnabled"`
+	TwoFactorRequired     bool       `json:"twoFactorRequired"`
+	TwoFactorRecoveryCnt  int        `json:"twoFactorRecoveryCount"`
+	LastLoginAt           *time.Time `json:"lastLoginAt"`
+	LastActiveAt          *time.Time `json:"lastActiveAt"`
+	CreatedAt             time.Time  `json:"createdAt"`
+	UpdatedAt             time.Time  `json:"updatedAt"`
+	SubscriptionTier      string     `json:"subscriptionTier"`
+	SubscriptionPlanID    *uint      `json:"subscriptionPlanID"`
+	SubscriptionPlanName  string     `json:"subscriptionPlanName"`
+	SubscriptionStatus    string     `json:"subscriptionStatus"`
+	SubscriptionExpiresAt *time.Time `json:"subscriptionExpiresAt"`
+	IdentityProviders     []any      `json:"identityProviders"`
+}
+
+// bootstrapPasswordActive reports whether the account still uses the generated
+// administrator password.
+func bootstrapPasswordActive(u *User, c *Credential) bool {
+	return u.Role == RoleSuperAdmin && c != nil && c.PasswordEnabled && c.PasswordOrigin == PasswordOriginAdminCreated
+}
+
+func mustReset(u *User, c *Credential) bool {
+	return c != nil && (c.MustResetPassword || bootstrapPasswordActive(u, c))
+}
+
+func (s *Service) initialUsernameRequired(u *User) bool {
+	return u.Role == RoleSuperAdmin && u.UsernameChangedAt == nil &&
+		strings.EqualFold(u.Username, s.cfg().Admin.Username)
+}
+
+func recoveryCount(m *MFASettings) int {
+	if m == nil {
+		return 0
+	}
+	return len(decodeRecoveryHashes(m.RecoveryCodesHash))
+}
+
+func (s *Service) viewUser(ctx context.Context, u *User) (userView, error) {
+	cred, err := s.credentialOf(ctx, u.ID)
+	if err != nil {
+		return userView{}, err
+	}
+	mfa, err := s.mfaOf(ctx, u.ID)
+	if err != nil {
+		return userView{}, err
+	}
+	reset := mustReset(u, cred)
+	v := userView{
+		ID: u.ID, PublicID: u.PublicID, Username: u.Username, DisplayName: u.DisplayName,
+		AvatarURL: u.AvatarURL, Email: u.Email, Phone: u.Phone, Role: u.Role, Status: u.Status,
+		Timezone: u.Timezone, Locale: u.Locale, ProfilePreferences: u.ProfilePreferences,
+		AppearancePreferences: u.AppearancePreferences, OnboardingCompletedAt: u.OnboardingCompletedAt,
+		EmailVerifiedAt: u.EmailVerifiedAt, EmailSource: u.EmailSource,
+		EmailBootstrapUsedAt: u.EmailBootstrapUsedAt, PhoneVerifiedAt: u.PhoneVerifiedAt,
+		UsernameChangedAt:  u.UsernameChangedAt,
+		MustResetPassword:  reset,
+		InitialUsernameReq: s.initialUsernameRequired(u),
+		InitialSecurityReq: reset || u.OnboardingCompletedAt == nil,
+		TwoFactorAvailable: true, TwoFactorRequired: false,
+		TwoFactorEnabled:     totpActive(mfa),
+		TwoFactorRecoveryCnt: recoveryCount(mfa),
+		LastLoginAt:          u.LastLoginAt, LastActiveAt: u.LastLoginAt,
+		CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
+		SubscriptionTier: "free", SubscriptionPlanName: "free", SubscriptionStatus: "free",
+		IdentityProviders: []any{},
+	}
+	if cred != nil {
+		v.PasswordEnabled = cred.PasswordEnabled
+		v.PasswordSetAt = cred.PasswordSetAt
+		v.PasswordOrigin = cred.PasswordOrigin
+	}
+	if s.h.Subscriptions != nil {
+		if sub, ok := s.h.Subscriptions.SubscriptionFor(ctx, u.ID); ok {
+			if sub.Tier != "" {
+				v.SubscriptionTier = sub.Tier
+			}
+			v.SubscriptionPlanID = sub.PlanID
+			if sub.PlanName != "" {
+				v.SubscriptionPlanName = sub.PlanName
+			}
+			if sub.Status != "" {
+				v.SubscriptionStatus = sub.Status
+			}
+			v.SubscriptionExpiresAt = sub.ExpiresAt
+		}
+	}
+	return v, nil
+}
