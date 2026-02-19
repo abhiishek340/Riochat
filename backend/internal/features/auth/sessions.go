@@ -297,3 +297,310 @@ type refreshOutcome struct {
 	user  User
 	reuse bool
 }
+
+// Refresh rotates a refresh token and returns a new pair for the same session.
+func (s *Service) Refresh(ctx context.Context, raw string) (signIn, error) {
+	raw = strings.TrimSpace(raw)
+	fail := func(reason string, detail map[string]any, uid uint) (signIn, error) {
+		s.event(ctx, eventInput{Type: "token_refresh", Result: resultFailure, Reason: reason, UserID: uid, Detail: detail})
+		return signIn{}, ErrInvalidRefreshToken
+	}
+	if raw == "" {
+		return fail("missing token", nil, 0)
+	}
+	claims, err := s.d.Tokens.Parse(raw)
+	if err != nil {
+		return fail("invalid_refresh_token_parse", nil, 0)
+	}
+	if claims.TokenType != token.TypeRefresh || claims.SessionID == 0 || claims.UserID == 0 {
+		return fail("invalid claims", nil, claims.UserID)
+	}
+	digest := sha256Hex(raw)
+	now := s.now()
+	var o refreshOutcome
+	var failReason string
+	err = s.conn(ctx).Transaction(func(tx *gorm.DB) error {
+		var sess Session
+		q := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", claims.SessionID, claims.UserID)
+		if err := q.First(&sess).Error; err != nil {
+			if database.IsNotFound(err) {
+				failReason = "session_not_found"
+				return nil
+			}
+			return err
+		}
+		if sess.RevokedAt != nil || !sess.ExpiresAt.After(now) {
+			failReason = "session_revoked_or_expired"
+			return nil
+		}
+		var u User
+		if err := tx.First(&u, claims.UserID).Error; err != nil {
+			if database.IsNotFound(err) {
+				failReason = "user not found"
+				return nil
+			}
+			return err
+		}
+		if u.Status != StatusActive {
+			failReason = "user not active"
+			return nil
+		}
+		matchesCurrent := sess.RefreshTokenHash != "" && constEq(sess.RefreshTokenHash, digest)
+		matchesPrevious := sess.PreviousRefreshTokenHash != "" && constEq(sess.PreviousRefreshTokenHash, digest)
+		switch {
+		case matchesCurrent:
+		case matchesPrevious && sess.RefreshRotatedAt != nil && now.Sub(*sess.RefreshRotatedAt) <= refreshGrace:
+		case matchesPrevious:
+			// A rotated-out token came back after the grace window: someone is
+			// replaying a stolen token. Kill the session and keep that change.
+			if err := tx.Model(&Session{}).Where("id = ?", sess.ID).
+				Updates(map[string]any{"revoked_at": now, "revoke_reason": reasonReuse}).Error; err != nil {
+				return err
+			}
+			o.reuse, o.sess = true, sess
+			return nil
+		default:
+			failReason = "token digest mismatch"
+			return nil
+		}
+		access, refresh, jti, accessExp, refreshExp, err := s.issueTokens(&u, &sess)
+		if err != nil {
+			return err
+		}
+		_, refreshTTL := s.tokenTTLs()
+		upd := map[string]any{
+			"previous_refresh_token_hash": sess.RefreshTokenHash,
+			"refresh_token_hash":          sha256Hex(refresh),
+			"refresh_rotated_at":          now,
+			"access_jti":                  jti,
+			"issued_at":                   now,
+			"expires_at":                  now.Add(refreshTTL),
+			"revoked_at":                  nil,
+			"revoke_reason":               "",
+		}
+		if err := tx.Model(&Session{}).Where("id = ?", sess.ID).Updates(upd).Error; err != nil {
+			return err
+		}
+		sess.ExpiresAt = now.Add(refreshTTL)
+		o.sess, o.user = sess, u
+		o.in = signIn{Payload: authPayload{
+			AccessToken: access, SessionID: sess.SessionID, ExpiresAt: accessExp, RefreshExpiresAt: refreshExp,
+		}, Refresh: refresh}
+		return nil
+	})
+	if err != nil {
+		return signIn{}, err
+	}
+	if o.reuse {
+		s.event(ctx, eventInput{Type: "token_refresh", Result: resultFailure, Reason: "refresh token reuse detected",
+			UserID: o.sess.UserID, Detail: sessionDetail(&o.sess)})
+		return signIn{}, ErrInvalidRefreshToken
+	}
+	if failReason != "" {
+		return fail(failReason, nil, claims.UserID)
+	}
+	s.touchSession(ctx, &o.sess, clientFrom(ctx).AuditContext)
+	view, err := s.viewUser(ctx, &o.user)
+	if err != nil {
+		return signIn{}, err
+	}
+	o.in.Payload.User = view
+	s.event(ctx, eventInput{Type: "token_refresh", Result: resultSuccess, UserID: o.user.ID, Detail: sessionDetail(&o.sess)})
+	return o.in, nil
+}
+
+// ---- revocation and listing --------------------------------------------------------
+
+func (s *Service) revokeByRowID(ctx context.Context, userID, rowID uint, reason string) error {
+	return s.conn(ctx).Model(&Session{}).
+		Where("id = ? AND user_id = ? AND revoked_at IS NULL", rowID, userID).
+		Updates(map[string]any{"revoked_at": s.now(), "revoke_reason": reason}).Error
+}
+
+// RevokeUserSessions revokes every unrevoked session of a user. Other areas call
+// it when they suspend or deactivate an account.
+func RevokeUserSessions(ctx context.Context, db *gorm.DB, userID uint, reason string, at time.Time) error {
+	return db.WithContext(ctx).Model(&Session{}).
+		Where("user_id = ? AND revoked_at IS NULL", userID).
+		Updates(map[string]any{"revoked_at": at, "revoke_reason": reason}).Error
+}
+
+func (s *Service) revokeAll(ctx context.Context, userID uint, reason string) error {
+	return RevokeUserSessions(ctx, s.db, userID, reason, s.now())
+}
+
+// Logout revokes the caller's current session.
+func (s *Service) Logout(ctx context.Context, userID, rowID uint) error {
+	if userID == 0 || rowID == 0 {
+		return ErrUnauthorized
+	}
+	var sess Session
+	_ = s.conn(ctx).Where("id = ? AND user_id = ?", rowID, userID).First(&sess).Error
+	if err := s.revokeByRowID(ctx, userID, rowID, reasonLogout); err != nil {
+		s.event(ctx, eventInput{Type: "logout", Result: resultFailure, Reason: "revoke failed", UserID: userID})
+		return err
+	}
+	s.event(ctx, eventInput{Type: "logout", Result: resultSuccess, UserID: userID, Detail: sessionDetail(&sess)})
+	return nil
+}
+
+// LogoutAll revokes every session of the caller.
+func (s *Service) LogoutAll(ctx context.Context, userID uint) error {
+	if err := s.revokeAll(ctx, userID, reasonLogoutAll); err != nil {
+		s.event(ctx, eventInput{Type: "logout_all", Result: resultFailure, Reason: "revoke failed", UserID: userID})
+		return err
+	}
+	s.event(ctx, eventInput{Type: "logout_all", Result: resultSuccess, UserID: userID})
+	return nil
+}
+
+// LogoutSession revokes one of the caller's sessions by its public id. Unknown,
+// foreign and already revoked ids succeed without changing anything.
+func (s *Service) LogoutSession(ctx context.Context, userID uint, publicID string) error {
+	var sess Session
+	found := s.conn(ctx).Where("session_id = ? AND user_id = ?", publicID, userID).First(&sess).Error == nil
+	err := s.conn(ctx).Model(&Session{}).
+		Where("session_id = ? AND user_id = ? AND revoked_at IS NULL", publicID, userID).
+		Updates(map[string]any{"revoked_at": s.now(), "revoke_reason": reasonLogout}).Error
+	if err != nil {
+		return err
+	}
+	detail := map[string]any{"session_id": publicID}
+	if found {
+		detail = sessionDetail(&sess)
+	}
+	s.event(ctx, eventInput{Type: "logout", Result: resultSuccess, UserID: userID, Detail: detail})
+	return nil
+}
+
+type sessionView struct {
+	SessionID        string     `json:"sessionID"`
+	Current          bool       `json:"current"`
+	DeviceLabel      string     `json:"deviceLabel"`
+	DeviceName       string     `json:"deviceName"`
+	BrowserName      string     `json:"browserName"`
+	OSName           string     `json:"osName"`
+	DeviceType       string     `json:"deviceType"`
+	ClientIP         string     `json:"clientIP"`
+	LocationLabel    string     `json:"locationLabel"`
+	GeoSource        string     `json:"geoSource"`
+	GeoAccuracy      string     `json:"geoAccuracy"`
+	CountryCode      string     `json:"countryCode"`
+	RegionName       string     `json:"regionName"`
+	CityName         string     `json:"cityName"`
+	TimezoneName     string     `json:"timezoneName"`
+	IPLatitude       *float64   `json:"ipLatitude"`
+	IPLongitude      *float64   `json:"ipLongitude"`
+	PreciseLatitude  *float64   `json:"preciseLatitude"`
+	PreciseLongitude *float64   `json:"preciseLongitude"`
+	PreciseAccuracyM *float64   `json:"preciseAccuracyMeters"`
+	PreciseLocatedAt *time.Time `json:"preciseLocatedAt"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	UpdatedAt        time.Time  `json:"updatedAt"`
+	LastSeenAt       *time.Time `json:"lastSeenAt"`
+	ExpiresAt        time.Time  `json:"expiresAt"`
+}
+
+func toSessionView(sess *Session, currentRow uint) sessionView {
+	return sessionView{
+		SessionID: sess.SessionID, Current: sess.ID == currentRow,
+		DeviceLabel: sess.DeviceName, DeviceName: sess.DeviceName, BrowserName: sess.BrowserName,
+		OSName: sess.OSName, DeviceType: sess.DeviceType, ClientIP: sess.ClientIP,
+		LocationLabel: locationLabel(sess.CityName, sess.RegionName, sess.CountryCode),
+		GeoSource:     sess.GeoSource, GeoAccuracy: sess.GeoAccuracy, CountryCode: sess.CountryCode,
+		RegionName: sess.RegionName, CityName: sess.CityName, TimezoneName: sess.TimezoneName,
+		IPLatitude: sess.IPLatitude, IPLongitude: sess.IPLongitude,
+		PreciseLatitude: sess.PreciseLatitude, PreciseLongitude: sess.PreciseLongitude,
+		PreciseAccuracyM: sess.PreciseAccuracyM, PreciseLocatedAt: sess.PreciseLocatedAt,
+		CreatedAt: sess.CreatedAt, UpdatedAt: sess.UpdatedAt, LastSeenAt: sess.LastSeenAt,
+		ExpiresAt: sess.ExpiresAt,
+	}
+}
+
+// ListSessions returns the caller's live sessions, current first.
+func (s *Service) ListSessions(ctx context.Context, userID, currentRow uint) ([]sessionView, error) {
+	var rows []Session
+	err := s.conn(ctx).Where("user_id = ? AND revoked_at IS NULL AND expires_at > ?", userID, s.now()).
+		Order("updated_at DESC, id DESC").Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]sessionView, 0, len(rows))
+	for i := range rows {
+		sess := &rows[i]
+		if sess.CountryCode == "" && sess.RegionName == "" && sess.CityName == "" && s.h.GeoIP != nil && sess.ClientIP != "" {
+			if g, gerr := s.h.GeoIP.Lookup(ctx, sess.ClientIP); gerr == nil && (g.CountryCode != "" || g.Region != "" || g.City != "") {
+				sess.CountryCode, sess.RegionName, sess.CityName = clip(g.CountryCode, 32), clip(g.Region, 64), clip(g.City, 64)
+				if sess.TimezoneName == "" {
+					sess.TimezoneName = clip(g.TimeZone, 64)
+				}
+				if sess.GeoSource == "" {
+					sess.GeoSource, sess.GeoAccuracy = "geoip", "ip"
+				}
+				sess.IPLatitude, sess.IPLongitude = g.Latitude, g.Longitude
+				_ = s.conn(ctx).Model(&Session{}).Where("id = ?", sess.ID).Updates(map[string]any{
+					"country_code": sess.CountryCode, "region_name": sess.RegionName, "city_name": sess.CityName,
+					"timezone_name": sess.TimezoneName, "geo_source": sess.GeoSource, "geo_accuracy": sess.GeoAccuracy,
+					"ip_latitude": sess.IPLatitude, "ip_longitude": sess.IPLongitude,
+				}).Error
+			}
+		}
+		out = append(out, toSessionView(sess, currentRow))
+	}
+	// Current session first, the rest keep their recency order.
+	for i := range out {
+		if out[i].Current {
+			cur := out[i]
+			copy(out[1:i+1], out[:i])
+			out[0] = cur
+			break
+		}
+	}
+	return out, nil
+}
+
+type locationInput struct {
+	Latitude, Longitude float64
+	AccuracyMeters      *float64 // nil when the client sent none
+	Timezone            string
+}
+
+// UpdateLocation stores browser-reported coordinates on the current session.
+func (s *Service) UpdateLocation(ctx context.Context, userID, rowID uint, in locationInput) (sessionView, error) {
+	if in.Latitude < -90 || in.Latitude > 90 || in.Longitude < -180 || in.Longitude > 180 || (in.AccuracyMeters != nil && *in.AccuracyMeters < 0) {
+		return sessionView{}, ErrInvalidLocation
+	}
+	tz := strings.TrimSpace(in.Timezone)
+	if tz != "" && !validTimeZone(tz) {
+		return sessionView{}, ErrInvalidTimeZone
+	}
+	now := s.now()
+	upd := map[string]any{
+		"geo_source": "browser_geolocation", "geo_accuracy": "precise",
+		"precise_latitude": in.Latitude, "precise_longitude": in.Longitude,
+		"precise_accuracy_m": in.AccuracyMeters, "precise_located_at": now, "last_seen_at": now,
+	}
+	if tz != "" {
+		upd["timezone_name"] = tz
+	}
+	res := s.conn(ctx).Model(&Session{}).
+		Where("id = ? AND user_id = ? AND revoked_at IS NULL", rowID, userID).Updates(upd)
+	if res.Error != nil {
+		return sessionView{}, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return sessionView{}, ErrSessionInvalid
+	}
+	var sess Session
+	if err := s.conn(ctx).Where("id = ? AND user_id = ?", rowID, userID).First(&sess).Error; err != nil {
+		return sessionView{}, errors.Join(ErrInternal, err)
+	}
+	detail := sessionDetail(&sess)
+	detail["precise_latitude"] = in.Latitude
+	detail["precise_longitude"] = in.Longitude
+	if in.AccuracyMeters != nil {
+		detail["precise_accuracy_meters"] = *in.AccuracyMeters
+	}
+	s.event(ctx, eventInput{Type: "session_location_update", Result: resultSuccess, UserID: userID, Detail: detail})
+	return toSessionView(&sess, rowID), nil
+}
