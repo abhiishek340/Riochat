@@ -226,3 +226,226 @@ func alwaysForbidden(a netip.Addr) bool {
 	}
 	return false
 }
+
+func isLocalName(host string) bool {
+	return host == "localhost" || host == "localhost.localdomain" || host == "ip6-localhost" ||
+		strings.HasSuffix(host, ".localhost")
+}
+
+func (p *Policy) hostAllowed(host string) bool {
+	if p == nil {
+		return false
+	}
+	_, ok := p.hosts[host]
+	return ok
+}
+
+func (p *Policy) ipAllowlisted(a netip.Addr) bool {
+	for _, t := range p.trustIPs {
+		if t == a {
+			return true
+		}
+	}
+	for _, c := range p.cidrs {
+		if c.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func blocked(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrBlocked, fmt.Sprintf(format, args...))
+}
+
+// ValidateURL applies the textual rules to a destination URL.
+func (p *Policy) ValidateURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("%w: invalid url", ErrBlocked)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return blocked("url needs a scheme and host")
+	}
+	if s := strings.ToLower(u.Scheme); s != "http" && s != "https" {
+		return blocked("scheme %q is not allowed", u.Scheme)
+	}
+	if u.User != nil {
+		return blocked("url must not contain user info")
+	}
+	if !p.Enforced() {
+		return nil
+	}
+	host := normalizeHost(u.Hostname())
+	if host == "" || strings.Contains(host, "%") {
+		return blocked("invalid host")
+	}
+	if host == MetadataHost {
+		return blocked("metadata host")
+	}
+	if a, ok := parseLiteral(host); ok {
+		return p.checkIP(a, true)
+	}
+	if looksNumeric(host) {
+		// Short forms such as 127.1 or 0x7f000001 are read as IPv4 by lenient
+		// resolvers; never accept them as names.
+		return blocked("numeric host %q is not allowed", host)
+	}
+	if isLocalName(host) && !p.hostAllowed(host) {
+		return blocked("host %q is local", host)
+	}
+	return nil
+}
+
+// looksNumeric reports names a lenient IPv4 parser would accept.
+func looksNumeric(host string) bool {
+	if host == "" {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	for _, l := range labels {
+		if l == "" {
+			return false
+		}
+		if strings.HasPrefix(l, "0x") || strings.HasPrefix(l, "0X") {
+			for _, r := range l[2:] {
+				if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+					return false
+				}
+			}
+			continue
+		}
+		for _, r := range l {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// CheckIP validates one resolved address (a DNS result, not a typed literal).
+func (p *Policy) CheckIP(a netip.Addr) error { return p.checkIP(a, false) }
+
+func (p *Policy) checkIP(a netip.Addr, literal bool) error {
+	a = a.WithZone("").Unmap()
+	if alwaysForbidden(a) {
+		return blocked("address %s is never reachable", a)
+	}
+	if !p.Enforced() {
+		return nil
+	}
+	if p.publicOnly {
+		if !a.IsGlobalUnicast() || a.IsPrivate() || a.IsLoopback() {
+			return blocked("address %s is not public", a)
+		}
+		for _, r := range publicOnlyRanges {
+			if r.Contains(a) {
+				return blocked("address %s is in a reserved range", a)
+			}
+		}
+		if literal && fakeIPRange.Contains(a) {
+			return blocked("address %s is in a reserved range", a)
+		}
+		return nil
+	}
+	if a.IsPrivate() || a.IsLoopback() {
+		if p.ipAllowlisted(a) {
+			return nil
+		}
+		return blocked("address %s is private", a)
+	}
+	return nil
+}
+
+// CheckResolved validates the addresses a host name resolved to. Allowlisted
+// host names may resolve to private addresses (never to forbidden ones).
+func (p *Policy) CheckResolved(host string, addrs []netip.Addr) error {
+	host = normalizeHost(host)
+	if len(addrs) == 0 {
+		return blocked("host %q did not resolve", host)
+	}
+	for _, a := range addrs {
+		a = a.WithZone("").Unmap()
+		if p.Enforced() && !p.publicOnly && p.hostAllowed(host) {
+			if alwaysForbidden(a) {
+				return blocked("address %s is never reachable", a)
+			}
+			continue
+		}
+		if err := p.checkIP(a, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Origin returns lower-case scheme + host (+ port unless it is the scheme's
+// default) of a URL.
+func Origin(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return "", fmt.Errorf("invalid url %q", raw)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := normalizeHost(u.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := u.Port()
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + host, nil
+}
+
+// SameOrigin compares the origins of two URLs.
+func SameOrigin(a, b string) bool {
+	oa, err1 := Origin(a)
+	ob, err2 := Origin(b)
+	return err1 == nil && err2 == nil && oa == ob
+}
+
+// RedactHeadersJSON masks sensitive custom header values in a JSON object for
+// administrators. Invalid JSON yields "{}"; empty stays empty.
+func RedactHeadersJSON(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return raw
+	}
+	m := map[string]any{}
+	if err := jsonUnmarshal([]byte(raw), &m); err != nil {
+		return "{}"
+	}
+	for k := range m {
+		if sensitiveHeader(k) {
+			m[k] = "********"
+		}
+	}
+	b, _ := jsonMarshal(m)
+	return string(b)
+}
+
+func sensitiveHeader(name string) bool {
+	n := strings.ToLower(strings.ReplaceAll(name, "_", "-"))
+	if n == "cookie" || n == "set-cookie" {
+		return true
+	}
+	for _, s := range []string{"authorization", "api-key", "apikey", "token", "secret"} {
+		if strings.Contains(n, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostPortIP splits a dial address.
+func hostPort(addr string) (string, string) {
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, ""
+	}
+	return h, p
+}
