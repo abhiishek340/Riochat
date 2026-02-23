@@ -239,3 +239,241 @@ func (p *Pool) build(key string, ep Endpoint) *poolEntry {
 	}
 	return &poolEntry{key: key, client: client, transport: tr}
 }
+
+// proxyFunc validates destinations that will travel through a proxy, since the
+// dialer only ever sees the proxy's address in that case.
+func (p *Pool) proxyFunc(policy *Policy) func(*http.Request) (*url.URL, error) {
+	return func(r *http.Request) (*url.URL, error) {
+		pu, err := p.opts.Proxy(r)
+		if err != nil || pu == nil {
+			return pu, err
+		}
+		p.proxies.Store(canonicalAddr(pu), struct{}{})
+		if !policy.Enforced() {
+			return pu, nil
+		}
+		if err := policy.ValidateURL(r.URL.String()); err != nil {
+			return nil, err
+		}
+		host := normalizeHost(r.URL.Hostname())
+		if _, lit := parseLiteral(host); lit {
+			return pu, nil
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		addrs, lerr := p.opts.Resolver.LookupNetIP(ctx, "ip", host)
+		if lerr != nil {
+			return pu, nil // only the proxy may be able to resolve it
+		}
+		if err := policy.CheckResolved(host, addrs); err != nil {
+			return nil, err
+		}
+		return pu, nil
+	}
+}
+
+func canonicalAddr(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		default:
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+}
+
+func (p *Pool) redirectPolicy(ep Endpoint) func(*http.Request, []*http.Request) error {
+	name := ep.Integration
+	if name == "" {
+		name = "outbound request"
+	}
+	policy := p.policyFor(ep)
+	// Cross-origin hops are judged without the endpoint-specific trust.
+	var base *Policy
+	switch ep.Kind {
+	case KindUserSupplied:
+		base = PublicOnly()
+	case KindStrict:
+		base = p.opts.Strict
+	default:
+		base = p.opts.Trusted
+	}
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= MaxRedirects {
+			return fmt.Errorf("%s: stopped after %d redirects", name, MaxRedirects)
+		}
+		if ep.Kind == KindUserSupplied {
+			return fmt.Errorf("%w: redirects are not allowed for user-configured endpoints", ErrRedirectRefused)
+		}
+		if ep.Redirects == RedirectNone {
+			return fmt.Errorf("%w: redirects are not allowed for %s", ErrRedirectRefused, name)
+		}
+		from := ep.URL
+		if from == "" {
+			from = via[0].URL.String()
+		}
+		if SameOrigin(from, req.URL.String()) {
+			return policy.ValidateURL(req.URL.String())
+		}
+		if ep.Redirects == RedirectSameOrigin {
+			return fmt.Errorf("%w: %s does not follow cross-origin redirects", ErrRedirectRefused, name)
+		}
+		if err := base.ValidateURL(req.URL.String()); err != nil {
+			return err
+		}
+		for _, h := range []string{"Authorization", "X-Api-Key", "X-Goog-Api-Key", "Api-Key", "Cookie", "Proxy-Authorization"} {
+			req.Header.Del(h)
+		}
+		return nil
+	}
+}
+
+// Do executes req with the client for ep. When ep.URL is set the request's
+// origin must equal it.
+func (p *Pool) Do(ctx context.Context, ep Endpoint, req *http.Request) (*http.Response, error) {
+	if ep.URL != "" {
+		want, err := Origin(ep.URL)
+		if err != nil {
+			return nil, err
+		}
+		got, err := Origin(req.URL.String())
+		if err != nil {
+			return nil, err
+		}
+		if want != got {
+			return nil, fmt.Errorf("%w (target %s, configured %s)", ErrOriginMismatch, got, want)
+		}
+	}
+	if err := p.policyFor(ep).ValidateURL(req.URL.String()); err != nil {
+		return nil, err
+	}
+	c, err := p.Client(ep)
+	if err != nil {
+		return nil, err
+	}
+	if ctx != nil {
+		req = req.WithContext(ctx)
+	}
+	return c.Do(req)
+}
+
+// ---- dialer ---------------------------------------------------------------
+
+type guard struct {
+	policy   *Policy
+	resolver Resolver
+	dialer   *net.Dialer
+	proxies  *sync.Map
+}
+
+func (g *guard) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if _, ok := g.proxies.Load(strings.ToLower(addr)); ok || !g.policy.Enforced() {
+		return g.dialer.DialContext(ctx, network, addr)
+	}
+	host, port := hostPort(addr)
+	host = normalizeHost(host)
+	if a, ok := parseLiteral(host); ok {
+		if err := g.policy.checkIP(a, true); err != nil {
+			return nil, err
+		}
+		return g.dialer.DialContext(ctx, network, net.JoinHostPort(a.String(), port))
+	}
+	if host == MetadataHost {
+		return nil, blocked("metadata host")
+	}
+	if isLocalName(host) && !g.policy.hostAllowed(host) {
+		return nil, blocked("host %q is local", host)
+	}
+	lookup := "ip"
+	switch network {
+	case "tcp4":
+		lookup = "ip4"
+	case "tcp6":
+		lookup = "ip6"
+	}
+	addrs, err := g.resolver.LookupNetIP(ctx, lookup, host)
+	if err != nil {
+		return nil, err
+	}
+	var usable []netip.Addr
+	for _, a := range addrs {
+		a = a.WithZone("")
+		if lookup == "ip4" && !a.Unmap().Is4() || lookup == "ip6" && a.Unmap().Is4() {
+			continue
+		}
+		usable = append(usable, a)
+	}
+	if err := g.policy.CheckResolved(host, usable); err != nil {
+		return nil, err
+	}
+	var last error
+	for _, a := range usable {
+		conn, err := g.dialer.DialContext(ctx, network, net.JoinHostPort(a.Unmap().String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		last = err
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if last == nil {
+		last = errors.New("no usable address")
+	}
+	return nil, last
+}
+
+// ---- proxy reporting ------------------------------------------------------
+
+// ProxyReport describes the process-level proxy state for the startup log.
+type ProxyReport struct {
+	Event  string // outbound_proxy_enabled | outbound_proxy_disabled | outbound_proxy_ignored
+	Warn   bool
+	Fields map[string]string
+}
+
+// ReportProxy inspects the proxy environment. getenv is injectable.
+func ReportProxy(getenv func(string) string, ssrf bool) ProxyReport {
+	pick := func(names ...string) string {
+		for _, n := range names {
+			if v := strings.TrimSpace(getenv(n)); v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	hp := pick("HTTP_PROXY", "http_proxy")
+	sp := pick("HTTPS_PROXY", "https_proxy")
+	np := pick("NO_PROXY", "no_proxy")
+	all := pick("ALL_PROXY", "all_proxy")
+	ssrfText := fmt.Sprint(ssrf)
+	switch {
+	case hp != "" || sp != "":
+		return ProxyReport{Event: "outbound_proxy_enabled", Fields: map[string]string{
+			"http_proxy": redactProxy(hp), "https_proxy": redactProxy(sp), "no_proxy": np, "ssrf_protection": ssrfText}}
+	case all != "":
+		return ProxyReport{Event: "outbound_proxy_ignored", Warn: true, Fields: map[string]string{
+			"reason": "ALL_PROXY is not honored; set HTTP_PROXY and HTTPS_PROXY", "ssrf_protection": ssrfText}}
+	}
+	return ProxyReport{Event: "outbound_proxy_disabled", Fields: map[string]string{"ssrf_protection": ssrfText}}
+}
+
+// redactProxy keeps scheme://host:port and drops credentials and paths.
+func redactProxy(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "invalid"
+	}
+	return u.Scheme + "://" + u.Host
+}

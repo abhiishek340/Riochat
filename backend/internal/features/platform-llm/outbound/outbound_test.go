@@ -189,3 +189,209 @@ func TestRedactHeadersJSON(t *testing.T) {
 		t.Fatal("invalid JSON yields {} and empty stays empty")
 	}
 }
+
+func TestDialRejectsRebindingAndAllowsListedHost(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") }))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	res := fakeResolver{"evil.example": {"10.0.0.5"}, "ollama.internal": {"127.0.0.1"}, "mixed.example": {"8.8.8.8", "127.0.0.1"}}
+
+	pool := NewPool(PoolOptions{Trusted: mustPolicy(t, true, []string{"ollama.internal"}, nil), Resolver: res, Proxy: NoProxy})
+	do := func(host string) error {
+		req, _ := http.NewRequest("GET", "http://"+host+":"+u.Port()+"/", nil)
+		resp, err := pool.Do(context.Background(), Endpoint{}, req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err
+	}
+	if err := do("evil.example"); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("rebinding to a private address must be blocked at dial time, got %v", err)
+	}
+	if err := do("mixed.example"); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("any private answer taints the lookup, got %v", err)
+	}
+	if err := do("ollama.internal"); err != nil {
+		t.Fatalf("allowlisted name resolving privately: %v", err)
+	}
+}
+
+func TestTrustedEndpointOwnPrivateHost(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") }))
+	defer srv.Close()
+	pool := NewPool(PoolOptions{Trusted: mustPolicy(t, true, nil, nil), Proxy: NoProxy})
+	req, _ := http.NewRequest("GET", srv.URL+"/x", nil)
+	// Without a configured endpoint the strict base policy blocks loopback.
+	if _, err := pool.Do(context.Background(), Endpoint{}, req); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("want ErrBlocked, got %v", err)
+	}
+	resp, err := pool.Do(context.Background(), Endpoint{URL: srv.URL}, req)
+	if err != nil {
+		t.Fatalf("exact-origin trust: %v", err)
+	}
+	resp.Body.Close()
+}
+
+func TestOriginMismatchRefused(t *testing.T) {
+	pool := NewPool(PoolOptions{Proxy: NoProxy})
+	req, _ := http.NewRequest("GET", "http://other.example/x", nil)
+	_, err := pool.Do(context.Background(), Endpoint{URL: "http://configured.example"}, req)
+	if !errors.Is(err, ErrOriginMismatch) {
+		t.Fatalf("got %v", err)
+	}
+	if !strings.Contains(err.Error(), "differs from the configured origin") {
+		t.Fatalf("message: %v", err)
+	}
+}
+
+func TestPoolEvictsLeastRecentlyUsed(t *testing.T) {
+	pool := NewPool(PoolOptions{Proxy: NoProxy})
+	ep := func(i int) Endpoint { return Endpoint{URL: fmt.Sprintf("http://h%d.example", i)} }
+	for i := 0; i < 64; i++ {
+		if _, err := pool.Client(ep(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Client(ep(0)); err != nil { // touch the oldest
+		t.Fatal(err)
+	}
+	if _, err := pool.Client(ep(64)); err != nil { // 65th distinct origin
+		t.Fatal(err)
+	}
+	if pool.Len() != 64 {
+		t.Fatalf("len=%d", pool.Len())
+	}
+	if !pool.Has(ep(0)) || pool.Has(ep(1)) {
+		t.Fatal("the least recently used client (h1) should have been evicted")
+	}
+	// Same origin, different variant: separate clients.
+	a, _ := pool.Client(Endpoint{URL: "http://v.example", ConnectTimeout: time.Second})
+	b, _ := pool.Client(Endpoint{URL: "http://v.example", ConnectTimeout: 2 * time.Second})
+	if a == b {
+		t.Fatal("variants must not share a client")
+	}
+}
+
+func TestRedirects(t *testing.T) {
+	var target *httptest.Server
+	target = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "target") }))
+	defer target.Close()
+	var hops int
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/same":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/final":
+			fmt.Fprint(w, "final")
+		case "/cross":
+			http.Redirect(w, r, target.URL+"/", http.StatusFound)
+		case "/loop":
+			hops++
+			http.Redirect(w, r, "/loop", http.StatusFound)
+		}
+	}))
+	defer origin.Close()
+	pool := NewPool(PoolOptions{Trusted: mustPolicy(t, true, nil, nil), Proxy: NoProxy})
+	get := func(ep Endpoint, path string) error {
+		req, _ := http.NewRequest("GET", origin.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		resp, err := pool.Do(context.Background(), ep, req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err
+	}
+	ep := Endpoint{URL: origin.URL, Integration: "model endpoint"}
+	if err := get(ep, "/same"); err != nil {
+		t.Fatalf("same-origin redirect: %v", err)
+	}
+	if err := get(ep, "/cross"); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("cross-origin redirect to a private host must be refused, got %v", err)
+	}
+	err := get(ep, "/loop")
+	if err == nil || !strings.Contains(err.Error(), "model endpoint") || !strings.Contains(err.Error(), "10 redirects") {
+		t.Fatalf("loop error: %v", err)
+	}
+	ep.Redirects = RedirectNone
+	if err := get(ep, "/same"); !errors.Is(err, ErrRedirectRefused) {
+		t.Fatalf("RedirectNone: %v", err)
+	}
+	ep.Redirects = RedirectSameOrigin
+	if err := get(ep, "/same"); err != nil {
+		t.Fatalf("same-origin allowed: %v", err)
+	}
+}
+
+func TestUserSuppliedEndpointsRefuseRedirects(t *testing.T) {
+	pool := NewPool(PoolOptions{Proxy: NoProxy})
+	check := pool.redirectPolicy(Endpoint{URL: "https://user.example", Kind: KindUserSupplied})
+	req, _ := http.NewRequest("GET", "https://user.example/next", nil)
+	via, _ := http.NewRequest("GET", "https://user.example/", nil)
+	err := check(req, []*http.Request{via})
+	if !errors.Is(err, ErrRedirectRefused) || !strings.Contains(err.Error(), "user-configured") {
+		t.Fatalf("got %v", err)
+	}
+	// And user endpoints go through the public-only policy at request time.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	r2, _ := http.NewRequest("GET", srv.URL, nil)
+	if _, err := pool.Do(context.Background(), Endpoint{URL: srv.URL, Kind: KindUserSupplied}, r2); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("loopback user endpoint: %v", err)
+	}
+}
+
+func TestCrossOriginRedirectDropsCredentials(t *testing.T) {
+	pool := NewPool(PoolOptions{Proxy: NoProxy})
+	check := pool.redirectPolicy(Endpoint{URL: "https://a.example"})
+	req, _ := http.NewRequest("GET", "https://b.example/x", nil)
+	req.Header.Set("X-Goog-Api-Key", "k")
+	req.Header.Set("Authorization", "Bearer t")
+	via, _ := http.NewRequest("GET", "https://a.example/", nil)
+	if err := check(req, []*http.Request{via}); err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("X-Goog-Api-Key") != "" || req.Header.Get("Authorization") != "" {
+		t.Fatal("credentials must be dropped on cross-origin hops")
+	}
+}
+
+func TestProxyDestinationValidation(t *testing.T) {
+	proxyURL, _ := url.Parse("http://proxy.internal:3128")
+	res := fakeResolver{"evil.example": {"10.0.0.9"}, "good.example": {"93.184.216.34"}}
+	pool := NewPool(PoolOptions{
+		Trusted:  mustPolicy(t, true, nil, nil),
+		Resolver: res,
+		Proxy:    func(*http.Request) (*url.URL, error) { return proxyURL, nil },
+	})
+	pf := pool.proxyFunc(pool.opts.Trusted)
+	mk := func(raw string) *http.Request { r, _ := http.NewRequest("GET", raw, nil); return r }
+	if _, err := pf(mk("http://evil.example/")); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("pre-resolved private destination: %v", err)
+	}
+	if _, err := pf(mk("http://0x7f000001/")); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("lenient numeric host: %v", err)
+	}
+	if u, err := pf(mk("http://good.example/")); err != nil || u == nil {
+		t.Fatalf("public destination: %v", err)
+	}
+	if u, err := pf(mk("http://unresolvable.example/")); err != nil || u == nil {
+		t.Fatalf("local resolution failure must not block: %v", err)
+	}
+	if _, ok := pool.proxies.Load("proxy.internal:3128"); !ok {
+		t.Fatal("the configured proxy address must be dialable")
+	}
+}
+
+func TestReportProxy(t *testing.T) {
+	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	r := ReportProxy(env(map[string]string{"HTTP_PROXY": "http://user:pw@proxy:3128/path", "NO_PROXY": "localhost"}), true)
+	if r.Event != "outbound_proxy_enabled" || r.Fields["http_proxy"] != "http://proxy:3128" || r.Fields["ssrf_protection"] != "true" || r.Fields["no_proxy"] != "localhost" {
+		t.Fatalf("%+v", r)
+	}
+	if r := ReportProxy(env(nil), false); r.Event != "outbound_proxy_disabled" || r.Warn {
+		t.Fatalf("%+v", r)
+	}
+	if r := ReportProxy(env(map[string]string{"ALL_PROXY": "socks5://x"}), false); r.Event != "outbound_proxy_ignored" || !r.Warn {
+		t.Fatalf("%+v", r)
+	}
+}
