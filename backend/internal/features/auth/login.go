@@ -185,3 +185,161 @@ func (s *Service) Login(ctx context.Context, identifier, password string) (signI
 }
 
 // ---- second-factor challenge --------------------------------------------------------
+
+// parseChallenge validates a challenge token. expired is true when the token is
+// authentic but past its lifetime.
+func (s *Service) parseChallenge(raw string) (claims *token.Claims, expired bool) {
+	var c token.Claims
+	parsed, err := jwt.ParseWithClaims(raw, &c, func(t *jwt.Token) (any, error) {
+		return []byte(s.cfg().Security.JWTSecret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithTimeFunc(s.now), jwt.WithExpirationRequired())
+	if err != nil {
+		return nil, errors.Is(err, jwt.ErrTokenExpired) && c.TokenType == TypeTwoFactorChallenge
+	}
+	if !parsed.Valid || c.TokenType != TypeTwoFactorChallenge || c.UserID == 0 {
+		return nil, false
+	}
+	return &c, false
+}
+
+// challengeUser resolves the user behind a challenge token.
+func (s *Service) challengeUser(ctx context.Context, raw string) (*User, bool, error) {
+	claims, expired := s.parseChallenge(strings.TrimSpace(raw))
+	if expired {
+		return nil, true, nil
+	}
+	if claims == nil {
+		return nil, false, nil
+	}
+	u, err := s.userByID(ctx, claims.UserID)
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if u.Status != StatusActive {
+		return nil, false, nil
+	}
+	return u, false, nil
+}
+
+// TwoFactorEmailStart sends the login code of a pending challenge.
+func (s *Service) TwoFactorEmailStart(ctx context.Context, challenge string) (startResult, error) {
+	u, expired, err := s.challengeUser(ctx, challenge)
+	if err != nil {
+		return startResult{}, err
+	}
+	if expired {
+		s.event(ctx, eventInput{Type: "two_factor_email_send", Result: resultFailure, Reason: "challenge expired"})
+		return startResult{}, ErrTwoFactorExpired
+	}
+	if u == nil {
+		s.event(ctx, eventInput{Type: "two_factor_email_send", Result: resultFailure, Reason: "invalid challenge"})
+		return startResult{}, ErrInvalidTwoFactorChallenge
+	}
+	if !s.emailMethodAvailable(ctx, u) {
+		s.event(ctx, eventInput{Type: "two_factor_email_send", Result: resultFailure, Reason: "method unavailable", UserID: u.ID})
+		return startResult{}, ErrVerificationMethodUnavailable
+	}
+	target, err := normalizeEmail(u.Email)
+	if err != nil {
+		return startResult{}, err
+	}
+	exp, err := s.sendCode(ctx, u.ID, PurposeLogin, target)
+	if err != nil {
+		s.event(ctx, eventInput{Type: "two_factor_email_send", Result: resultFailure, Reason: reasonOf(err), UserID: u.ID})
+		return startResult{}, err
+	}
+	s.event(ctx, eventInput{Type: "two_factor_email_send", Result: resultSuccess, UserID: u.ID})
+	return startResult{Sent: true, ExpiresAt: exp, VerificationMethod: methodEmail, AvailableMethods: []string{methodEmail}}, nil
+}
+
+// reasonOf is a short event reason for an error.
+func reasonOf(err error) string {
+	var typed interface{ Error() string }
+	if errors.As(err, &typed) {
+		return clip(typed.Error(), 200)
+	}
+	return "error"
+}
+
+// TwoFactorVerify completes a sign-in with the second factor.
+func (s *Service) TwoFactorVerify(ctx context.Context, challenge, method, code string) (signIn, error) {
+	u, expired, err := s.challengeUser(ctx, challenge)
+	if err != nil {
+		return signIn{}, err
+	}
+	if expired {
+		s.event(ctx, eventInput{Type: "two_factor_verify", Result: resultFailure, Reason: "challenge expired"})
+		return signIn{}, ErrTwoFactorExpired
+	}
+	if u == nil {
+		s.event(ctx, eventInput{Type: "two_factor_verify", Result: resultFailure, Reason: "invalid challenge"})
+		return signIn{}, ErrInvalidTwoFactorCode
+	}
+	if method == "" {
+		method = methodTwoFactor
+	}
+	cred, err := s.credentialOf(ctx, u.ID)
+	if err != nil {
+		return signIn{}, err
+	}
+	// countFailure books a wrong attempt against the shared counter; a failure
+	// that locks the account is reported as 423 instead.
+	countFailure := func(reason string) (signIn, error) {
+		s.event(ctx, eventInput{Type: "two_factor_verify", Result: resultFailure, Reason: reason, UserID: u.ID})
+		if cred != nil {
+			newly, until, ferr := s.registerFailure(ctx, u, cred, s.settings(ctx))
+			if ferr != nil {
+				return signIn{}, ferr
+			}
+			if newly {
+				return signIn{}, &lockedError{retryAfter: retryAfterSeconds(until, s.now())}
+			}
+		}
+		return signIn{}, ErrInvalidTwoFactorCode
+	}
+
+	avail, err := s.availableMethods(ctx, u)
+	if err != nil {
+		return signIn{}, err
+	}
+	if method == methodNone || !containsString(avail, method) {
+		return countFailure("method unavailable")
+	}
+	switch method {
+	case methodTwoFactor:
+		ok, verr := s.VerifyUserSecondFactor(ctx, u.ID, code)
+		if verr != nil {
+			return signIn{}, verr
+		}
+		if !ok {
+			return countFailure("wrong code")
+		}
+	case methodEmail:
+		target, nerr := normalizeEmail(u.Email)
+		if nerr != nil {
+			return countFailure("invalid email")
+		}
+		if verr := s.verifyCode(ctx, u.ID, PurposeLogin, target, code); verr != nil {
+			if errors.Is(verr, ErrVerificationCodeInvalid) || errors.Is(verr, ErrVerificationAttemptsExceeded) {
+				return countFailure("wrong code")
+			}
+			return signIn{}, verr
+		}
+	}
+	if cred != nil && (cred.FailedLoginCount > 0 || cred.LockedUntil != nil) {
+		if err := s.resetFailures(ctx, s.conn(ctx), u, cred); err != nil {
+			return signIn{}, err
+		}
+	}
+	out, sess, err := s.newSession(ctx, u)
+	if err != nil {
+		return signIn{}, err
+	}
+	detail := sessionDetail(sess)
+	detail["method"] = method
+	s.event(ctx, eventInput{Type: "two_factor_verify", Result: resultSuccess, UserID: u.ID, Detail: detail})
+	return out, nil
+}
