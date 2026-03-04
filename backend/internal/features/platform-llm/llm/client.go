@@ -208,3 +208,208 @@ func rejectsStreamOptions(err error) bool {
 	t := strings.ToLower(e.Message + " " + e.Body)
 	return strings.Contains(t, "stream_options") || strings.Contains(t, "include_usage")
 }
+
+// exec runs one HTTP exchange for an adapter, buffered or streaming.
+func (c *Client) exec(ctx context.Context, x *exchange, ad adapter, sink Sink) (*Result, int, error) {
+	cl, err := ad.build(x)
+	if err != nil {
+		return nil, 0, err
+	}
+	if sink == nil {
+		st, body, hdr, dbg, err := c.doBuffered(ctx, x, cl, true)
+		if err != nil {
+			return nil, 0, err
+		}
+		res, perr := ad.parse(x, body)
+		if perr != nil {
+			if e, ok := AsError(perr); ok {
+				e.Accepted = true
+				e.Debug = dbg
+			}
+			return nil, 0, perr
+		}
+		_ = st
+		_ = hdr
+		res.Debug = dbg
+		return res, 0, nil
+	}
+	return c.execStream(ctx, x, ad, cl, sink)
+}
+
+func (c *Client) execStream(ctx context.Context, x *exchange, ad adapter, cl *call, sink Sink) (*Result, int, error) {
+	delivered := 0
+	emit := func(ev Event) error {
+		delivered++
+		return sink(ev)
+	}
+	ss, err := c.openStream(ctx, x, cl, true)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer ss.close()
+
+	// An upstream that ignores "stream" and answers with plain JSON.
+	if ct := strings.ToLower(ss.resp.Header.Get("Content-Type")); !strings.Contains(ct, "text/event-stream") && strings.Contains(ct, "json") {
+		body, err := c.readLimited(ss.body)
+		if err != nil {
+			return nil, 0, c.streamReadErr(err, ss)
+		}
+		res, perr := ad.parse(x, body)
+		if perr != nil {
+			if e, ok := AsError(perr); ok {
+				e.Accepted, e.Debug = true, ss.debug
+			}
+			return nil, 0, perr
+		}
+		if err := replayAsEvents(res, emit, x.proto.isImageProtocol()); err != nil {
+			return nil, delivered, err
+		}
+		res.Debug = ss.debug
+		return res, delivered, nil
+	}
+
+	st := ad.stream(x)
+	rd := newSSEReader(ss.body)
+	for {
+		f, err := rd.next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return partial(st), delivered, c.streamReadErr(err, ss)
+		}
+		data := strings.TrimSpace(f.Data)
+		if data == "[DONE]" {
+			break
+		}
+		if data == "" && f.Event == "" {
+			continue
+		}
+		if e := inStreamError(f); e != nil {
+			e.Debug = ss.debug
+			return partial(st), delivered, e
+		}
+		if err := st.frame(f, emit); err != nil {
+			if e, ok := AsError(err); ok {
+				e.Accepted = true
+				if e.Debug == nil {
+					e.Debug = ss.debug
+				}
+			}
+			return partial(st), delivered, err
+		}
+	}
+	if fl, ok := st.(flusher); ok {
+		if err := fl.flush(emit); err != nil {
+			if e, ok := AsError(err); ok {
+				e.Accepted, e.Debug = true, ss.debug
+			}
+			return partial(st), delivered, err
+		}
+	}
+	res, err := st.result()
+	if err != nil {
+		if e, ok := AsError(err); ok {
+			e.Accepted = true
+			e.Debug = ss.debug
+		}
+		return res, delivered, err
+	}
+	res.Debug = ss.debug
+	return res, delivered, nil
+}
+
+func partial(st streamer) *Result {
+	r, _ := st.result()
+	return r
+}
+
+// replayAsEvents turns a buffered result into streaming events.
+func replayAsEvents(r *Result, emit func(Event) error, alwaysUsage bool) error {
+	if r.ID != "" {
+		if err := emit(Event{Type: EventCreated, ResponseID: r.ID, ServiceTier: r.ServiceTier}); err != nil {
+			return err
+		}
+	}
+	if r.Reasoning != "" {
+		if err := emit(Event{Type: EventReasoning, Text: r.Reasoning}); err != nil {
+			return err
+		}
+	}
+	if r.Text != "" {
+		if err := emit(Event{Type: EventText, Text: r.Text}); err != nil {
+			return err
+		}
+	}
+	for i := range r.ToolCalls {
+		tc := r.ToolCalls[i]
+		if err := emit(Event{Type: EventToolCall, Index: i, ToolCall: &tc}); err != nil {
+			return err
+		}
+	}
+	for i := range r.Images {
+		im := r.Images[i]
+		if err := emit(Event{Type: EventImage, Index: im.Index, Image: &im}); err != nil {
+			return err
+		}
+	}
+	if alwaysUsage || !r.Usage.IsZero() {
+		u := r.Usage
+		return emit(Event{Type: EventUsage, Usage: &u})
+	}
+	return nil
+}
+
+func (c *Client) streamReadErr(err error, ss *streamState) error {
+	if ss.idle != nil && ss.idle.fired.Load() {
+		return &Error{Kind: KindTransport, Sentinel: ErrStreamIdle, Cause: err, Message: ErrStreamIdle.Error(), Accepted: true, Debug: ss.debug}
+	}
+	if errors.Is(err, ErrBodyTooLarge) {
+		return &Error{Kind: KindTransport, Sentinel: ErrBodyTooLarge, Message: err.Error(), Accepted: true, Debug: ss.debug}
+	}
+	e := transportErr(err, true)
+	e.Debug = ss.debug
+	return e
+}
+
+// ---- model listing and background responses ------------------------------
+
+// RetrieveResponse fetches an official OpenAI background response.
+func (c *Client) RetrieveResponse(ctx context.Context, route Route, id string) (*Result, error) {
+	return c.responseCall(ctx, route, http.MethodGet, id, "")
+}
+
+// CancelResponse cancels an official OpenAI background response.
+func (c *Client) CancelResponse(ctx context.Context, route Route, id string) (*Result, error) {
+	return c.responseCall(ctx, route, http.MethodPost, id, "/cancel")
+}
+
+func (c *Client) responseCall(ctx context.Context, route Route, method, id, suffix string) (*Result, error) {
+	id = strings.TrimSpace(id)
+	if id == "" || strings.ContainsAny(id, "/?# ") {
+		return nil, invalid(ErrInvalidRequest, "invalid response id")
+	}
+	route.Protocol = string(OpenAIResponses)
+	x, _, err := c.newExchange(route, &Request{}, false)
+	if err != nil {
+		return nil, err
+	}
+	u, err := buildURL(route.BaseURL, "v1", "/responses/"+id+suffix)
+	if err != nil {
+		return nil, err
+	}
+	cl := &call{method: method, url: u}
+	if method == http.MethodPost {
+		cl.body = []byte("{}")
+	}
+	_, body, _, dbg, err := c.doBuffered(ctx, x, cl, method == http.MethodPost)
+	if err != nil {
+		return nil, err
+	}
+	res, perr := responsesAdapter{}.parse(x, body)
+	if perr != nil {
+		return nil, perr
+	}
+	res.Debug = dbg
+	return res, nil
+}
