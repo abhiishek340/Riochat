@@ -204,3 +204,228 @@ func chatFormat(rf *responseFormat) map[string]any {
 	}
 	return out
 }
+
+func renderChatMessage(m Message, openrouter, explicit bool) []any {
+	role := string(m.Role)
+	switch m.Role {
+	case RoleDeveloper:
+		role = "system"
+	case RoleTool, RoleFunction:
+		role = "user"
+	}
+	var out []any
+	assistant := m.Role == RoleAssistant
+
+	parts := effectiveParts(m)
+	anyHint := m.CacheHint
+	allText := true
+	for _, p := range parts {
+		if _, ok := partAsText(p); !ok {
+			allText = false
+		}
+		if p.CacheHint {
+			anyHint = true
+		}
+	}
+	var content any
+	hasContent := false
+	if allText && !(explicit && anyHint) {
+		var sb []string
+		for _, p := range parts {
+			t, _ := partAsText(p)
+			sb = append(sb, t)
+		}
+		if len(sb) > 0 {
+			content, hasContent = strings.Join(sb, "\n\n"), true
+		}
+	} else {
+		var blocks []any
+		lastSupported := -1
+		for _, p := range parts {
+			var blk map[string]any
+			if t, ok := partAsText(p); ok {
+				blk = map[string]any{"type": "text", "text": t}
+			} else {
+				if assistant {
+					continue
+				}
+				switch p.Kind {
+				case PartImage:
+					if len(p.Data) == 0 {
+						continue
+					}
+					blk = map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL(imageMIME(p.MIME), p.Data)}}
+				case PartDocument:
+					if len(p.Data) == 0 {
+						continue
+					}
+					name := p.FileName
+					if strings.TrimSpace(name) == "" {
+						name = "document.pdf"
+					}
+					blk = map[string]any{"type": "file", "file": map[string]any{"filename": name, "file_data": dataURL("application/pdf", p.Data)}}
+				case PartAudio:
+					if len(p.Data) == 0 {
+						continue
+					}
+					blk = map[string]any{"type": "input_audio", "input_audio": map[string]any{"data": base64.StdEncoding.EncodeToString(p.Data), "format": audioFormat(p.MIME)}}
+				case PartVideo:
+					if len(p.Data) == 0 {
+						continue
+					}
+					blk = map[string]any{"type": "video_url", "video_url": map[string]any{"url": dataURL(p.MIME, p.Data)}}
+				default:
+					continue
+				}
+			}
+			blocks = append(blocks, blk)
+			if explicit && chatBreakpointTypes[blk["type"].(string)] {
+				lastSupported = len(blocks) - 1
+				if p.CacheHint && !p.Dynamic {
+					blk["prompt_cache_breakpoint"] = map[string]any{"mode": "explicit"}
+				}
+			}
+		}
+		if explicit && m.CacheHint && lastSupported >= 0 {
+			blocks[lastSupported].(map[string]any)["prompt_cache_breakpoint"] = map[string]any{"mode": "explicit"}
+		}
+		if len(blocks) > 0 {
+			content, hasContent = blocks, true
+		}
+	}
+
+	if hasContent || len(m.ToolCalls) > 0 || (assistant && m.Reasoning != "") {
+		msg := map[string]any{"role": role}
+		if hasContent {
+			msg["content"] = content
+		} else {
+			msg["content"] = ""
+		}
+		if assistant {
+			if m.Reasoning != "" {
+				if openrouter {
+					msg["reasoning"] = m.Reasoning
+				} else {
+					msg["reasoning_content"] = m.Reasoning
+				}
+			}
+			if len(m.ToolCalls) > 0 {
+				calls := make([]any, 0, len(m.ToolCalls))
+				for _, tc := range m.ToolCalls {
+					calls = append(calls, map[string]any{"id": tc.ID, "type": "function",
+						"function": map[string]any{"name": tc.Name, "arguments": argsOrEmpty(tc.Arguments)}})
+				}
+				msg["tool_calls"] = calls
+			}
+		}
+		out = append(out, msg)
+	}
+	for _, tr := range m.ToolResults {
+		out = append(out, map[string]any{"role": "tool", "tool_call_id": tr.CallID, "content": toolResultOutput(tr)})
+	}
+	return out
+}
+
+// ---- parsing --------------------------------------------------------------
+
+func (chatAdapter) parse(x *exchange, body []byte) (*Result, error) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, &Error{Kind: KindParse, Message: "upstream returned an invalid JSON body", Cause: err, Accepted: true}
+	}
+	if e, ok := m["error"].(map[string]any); ok && e != nil {
+		return nil, upstreamFromObject(m, m)
+	}
+	res := &Result{ID: strOf(m["id"]), ServiceTier: strOf(m["service_tier"])}
+	choices := asList(m["choices"])
+	if len(choices) > 0 {
+		ch, _ := choices[0].(map[string]any)
+		msg, _ := ch["message"].(map[string]any)
+		res.FinishReason = strOf(ch["finish_reason"])
+		var text, think strings.Builder
+		switch c := msg["content"].(type) {
+		case string:
+			text.WriteString(c)
+		case []any:
+			for _, p := range c {
+				pm, _ := p.(map[string]any)
+				switch pt := strOf(pm["type"]); {
+				case pt == "text" || pt == "output_text":
+					text.WriteString(strOf(pm["text"]))
+				case strings.Contains(pt, "reason") || strings.Contains(pt, "think"):
+					think.WriteString(firstNonEmpty(strOf(pm["text"]), strOf(pm["reasoning"]), strOf(pm["thinking"])))
+				}
+			}
+		}
+		if r := firstNonEmpty(strOf(msg["reasoning_content"]), strOf(msg["reasoning"])); r != "" {
+			if think.Len() > 0 {
+				think.WriteString("\n\n")
+			}
+			think.WriteString(r)
+		}
+		if think.Len() == 0 {
+			var parts []string
+			for _, d := range asList(msg["reasoning_details"]) {
+				if dm, ok := d.(map[string]any); ok {
+					if t := firstNonEmpty(strOf(dm["text"]), strOf(dm["summary"])); t != "" {
+						parts = append(parts, t)
+					}
+				}
+			}
+			think.WriteString(strings.Join(parts, "\n\n"))
+		}
+		res.Text, res.Reasoning = text.String(), think.String()
+		if r := strOf(msg["refusal"]); r != "" && res.Text == "" {
+			res.Text = r
+		}
+		for _, t := range asList(msg["tool_calls"]) {
+			tm, _ := t.(map[string]any)
+			if tm == nil {
+				continue
+			}
+			tc := ToolCall{ID: strOf(tm["id"])}
+			if fn, ok := tm["function"].(map[string]any); ok {
+				tc.Name, tc.Arguments = strOf(fn["name"]), argsOrEmpty(strOf(fn["arguments"]))
+			} else if cu, ok := tm["custom"].(map[string]any); ok {
+				b, _ := json.Marshal(map[string]any{"input": strOf(cu["input"])})
+				tc.Name, tc.Arguments = strOf(cu["name"]), string(b)
+			}
+			res.ToolCalls = append(res.ToolCalls, tc)
+		}
+		for _, a := range asList(msg["annotations"]) {
+			am, _ := a.(map[string]any)
+			uc, _ := am["url_citation"].(map[string]any)
+			if uc == nil {
+				uc = am
+			}
+			res.Citations = addCitation(res.Citations, Citation{URL: strOf(uc["url"]), Title: strOf(uc["title"])})
+		}
+	}
+	for _, c := range asList(m["citations"]) {
+		switch cv := c.(type) {
+		case string:
+			res.Citations = addCitation(res.Citations, Citation{URL: cv})
+		case map[string]any:
+			res.Citations = addCitation(res.Citations, Citation{URL: strOf(cv["url"]), Title: strOf(cv["title"])})
+		}
+	}
+	usage, _ := m["usage"].(map[string]any)
+	res.Usage = openAIUsage(usage, false)
+	if res.Usage.ServiceTier == "" {
+		res.Usage.ServiceTier = res.ServiceTier
+	}
+	if isDeepSeek(x) && res.Text != "" {
+		visible, calls, err := extractDSML(res.Text)
+		if err != nil {
+			return nil, err
+		}
+		res.Text = visible
+		res.ToolCalls = append(res.ToolCalls, calls...)
+	}
+	if len(res.ToolCalls) > 0 && (res.FinishReason == "" || res.FinishReason == "stop") {
+		res.FinishReason = "tool_calls"
+	}
+	return res, nil
+}
+
+// ---- streaming ------------------------------------------------------------
