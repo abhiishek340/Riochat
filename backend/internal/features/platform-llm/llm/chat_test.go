@@ -198,3 +198,226 @@ func TestProtectedOptionsCannotOverride(t *testing.T) {
 	}
 	mustEq(t, at(b, "messages.0.content"), "hello", "messages")
 }
+
+func TestNumericOptionRules(t *testing.T) {
+	if n, ok := toInt(float64(5)); !ok || n != 5 {
+		t.Fatal("integral float")
+	}
+	if _, ok := toInt(5.5); ok {
+		t.Fatal("fractional floats are not integers")
+	}
+	o := options{"a": 3.0, "b": "3", "c": -1.0}
+	if n, ok := o.positiveInt("a"); !ok || n != 3 {
+		t.Fatal("a")
+	}
+	if _, ok := o.int("b"); ok {
+		t.Fatal("strings are not integers")
+	}
+	if _, ok := o.positiveInt("c"); ok {
+		t.Fatal("negative")
+	}
+	f := newUpstream(t, jsonReply(okChat))
+	req := &Request{Messages: userMsg("x"), Options: map[string]any{"seed": float64(0), "max_output_tokens": 1.5, "thinking_budget": float64(-1)}}
+	if _, err := testClient(t).Generate(context.Background(), chatRoute(f), req); err != nil {
+		t.Fatal(err)
+	}
+	b := chatBody(t, f)
+	for _, k := range []string{"seed", "max_completion_tokens", "thinking_budget"} {
+		if _, ok := b[k]; ok {
+			t.Errorf("%s should have been dropped", k)
+		}
+	}
+}
+
+// ---- streaming ------------------------------------------------------------
+
+func TestChatStreamTextReasoningUsage(t *testing.T) {
+	f := newUpstream(t, sseReply(
+		ev("", `{"id":"c9","service_tier":"auto","choices":[{"delta":{"role":"assistant","reasoning_content":"hm"}}]}`),
+		": keep-alive comment\n\n",
+		ev("", `{"choices":[{"delta":{"content":"Hel"}}]}`),
+		ev("", `{"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}`),
+		ev("", `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"completion_tokens_details":{"reasoning_tokens":1}}}`),
+		"data: [DONE]\n\n",
+	))
+	sink, evs := collect()
+	res, err := testClient(t).Stream(context.Background(), chatRoute(f), &Request{Messages: userMsg("x")}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "Hello" || res.Reasoning != "hm" || res.ID != "c9" || res.FinishReason != "stop" || res.Usage.InputTokens != 10 || res.Usage.OutputTokens != 3 {
+		t.Fatalf("%+v", res)
+	}
+	if len(eventsOf(*evs, EventText)) != 2 || len(eventsOf(*evs, EventReasoning)) != 1 || len(eventsOf(*evs, EventUsage)) != 1 || len(eventsOf(*evs, EventCreated)) != 1 {
+		t.Fatalf("%+v", *evs)
+	}
+	b := chatBody(t, f)
+	mustEq(t, b["stream"], true, "stream flag")
+	mustEq(t, at(b, "stream_options.include_usage"), true, "include_usage default")
+	if f.last(t).Header.Get("Accept") != "text/event-stream" {
+		t.Fatal("streaming Accept header")
+	}
+	if res.Debug == nil || res.Debug.ResponseBody != "" || res.Debug.Status != 200 {
+		t.Fatalf("stream debug carries no body: %+v", res.Debug)
+	}
+}
+
+func TestChatStreamToolCallFragmentsMergeByIndex(t *testing.T) {
+	f := newUpstream(t, sseReply(
+		ev("", `{"id":"c","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_w","arguments":""}},{"index":1,"id":"call_b","function":{"name":"get_t","arguments":"{\"x\""}}]}}]}`),
+		ev("", `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"eather","arguments":"{\"city\":"}}]}}]}`),
+		ev("", `{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":":1}"}},{"index":0,"function":{"arguments":"\"Paris\"}"}}]}}]}`),
+		ev("", `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`),
+	))
+	sink, evs := collect()
+	res, err := testClient(t).Stream(context.Background(), chatRoute(f), &Request{Messages: userMsg("x")}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.ToolCalls) != 2 {
+		t.Fatalf("%+v", res.ToolCalls)
+	}
+	a, b := res.ToolCalls[0], res.ToolCalls[1]
+	if a.ID != "call_a" || a.Name != "get_weather" || a.Arguments != `{"city":"Paris"}` {
+		t.Fatalf("%+v", a)
+	}
+	if b.ID != "call_b" || b.Name != "get_t" || b.Arguments != `{"x":1}` {
+		t.Fatalf("%+v", b)
+	}
+	if res.FinishReason != "tool_calls" || len(eventsOf(*evs, EventToolCall)) < 5 {
+		t.Fatalf("%v %d", res.FinishReason, len(eventsOf(*evs, EventToolCall)))
+	}
+}
+
+func TestChatStreamHugeToolIndexFallsBackToPosition(t *testing.T) {
+	f := newUpstream(t, sseReply(
+		ev("", `{"id":"c","choices":[{"delta":{"tool_calls":[{"index":5000,"id":"x","function":{"name":"f","arguments":"{}"}}]}}]}`),
+	))
+	sink, _ := collect()
+	res, err := testClient(t).Stream(context.Background(), chatRoute(f), &Request{Messages: userMsg("x")}, sink)
+	if err != nil || len(res.ToolCalls) != 1 || res.ToolCalls[0].Name != "f" {
+		t.Fatalf("%v %+v", err, res)
+	}
+}
+
+func TestChatIncludeUsageRetry(t *testing.T) {
+	calls := 0
+	f := newUpstream(t, func(w http.ResponseWriter, r *http.Request, rec recorded) {
+		calls++
+		if strings.Contains(string(rec.Body), `"include_usage":true`) {
+			w.WriteHeader(400)
+			io.WriteString(w, `{"error":{"message":"Unknown parameter: stream_options.include_usage"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, ev("", `{"id":"c","choices":[{"delta":{"content":"ok"}}]}`))
+	})
+	sink, _ := collect()
+	res, err := testClient(t).Stream(context.Background(), chatRoute(f), &Request{Messages: userMsg("x")}, sink)
+	if err != nil || res.Text != "ok" || calls != 2 {
+		t.Fatalf("err=%v calls=%d res=%+v", err, calls, res)
+	}
+	reqs := f.all()
+	mustEq(t, at(reqs[1].JSON(t), "stream_options.include_usage"), false, "retry sends include_usage:false")
+}
+
+func TestChatIncludeUsageRetryNotWhenUserSetOrAfterEvents(t *testing.T) {
+	// User explicitly set include_usage: no transparent retry.
+	calls := 0
+	f := newUpstream(t, func(w http.ResponseWriter, r *http.Request, rec recorded) {
+		calls++
+		w.WriteHeader(422)
+		io.WriteString(w, `{"error":{"message":"include_usage not supported"}}`)
+	})
+	sink, _ := collect()
+	req := &Request{Messages: userMsg("x"), Options: map[string]any{"stream_options": map[string]any{"include_usage": true}}}
+	_, err := testClient(t).Stream(context.Background(), chatRoute(f), req, sink)
+	if err == nil || calls != 1 {
+		t.Fatalf("explicit setting: calls=%d err=%v", calls, err)
+	}
+	// Unrelated 400 mentions nothing: no retry.
+	calls = 0
+	f2 := newUpstream(t, func(w http.ResponseWriter, r *http.Request, rec recorded) {
+		calls++
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"bad model"}}`)
+	})
+	if _, err := testClient(t).Stream(context.Background(), chatRoute(f2), &Request{Messages: userMsg("x")}, sink); err == nil || calls != 1 {
+		t.Fatalf("calls=%d", calls)
+	}
+	// After the first event, a failure is returned without retry.
+	calls = 0
+	f3 := newUpstream(t, func(w http.ResponseWriter, r *http.Request, rec recorded) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, ev("", `{"id":"c","choices":[{"delta":{"content":"a"}}]}`))
+		io.WriteString(w, ev("", `{"error":{"message":"stream_options exploded","code":400}}`))
+	})
+	_, err = testClient(t).Stream(context.Background(), chatRoute(f3), &Request{Messages: userMsg("x")}, sink)
+	if err == nil || calls != 1 {
+		t.Fatalf("no retry once events were delivered: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestStreamFallsBackWhenUpstreamIgnoresStreaming(t *testing.T) {
+	f := newUpstream(t, jsonReply(okChat))
+	sink, evs := collect()
+	res, err := testClient(t).Stream(context.Background(), chatRoute(f), &Request{Messages: userMsg("x")}, sink)
+	if err != nil || res.Text != "hi" {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if len(eventsOf(*evs, EventText)) != 1 || len(eventsOf(*evs, EventUsage)) != 1 {
+		t.Fatalf("%+v", *evs)
+	}
+}
+
+func TestChatCitationsAndAnnotations(t *testing.T) {
+	f := newUpstream(t, jsonReply(`{"id":"c","citations":["https://a.example","https://b.example"],"choices":[{"message":{"content":"x","annotations":[{"type":"url_citation","url_citation":{"url":"https://a.example","title":"A"}},{"type":"url_citation","url_citation":{"url":"https://c.example"}}]}}]}`))
+	res, err := testClient(t).Generate(context.Background(), chatRoute(f), &Request{Messages: userMsg("x")})
+	if err != nil || len(res.Citations) != 3 || res.Citations[0].Title != "A" {
+		t.Fatalf("%v %+v", err, res.Citations)
+	}
+}
+
+func TestChatParseVariants(t *testing.T) {
+	f := newUpstream(t, jsonReply(`{"id":"c","choices":[{"message":{"content":[{"type":"text","text":"vis"},{"type":"reasoning","text":"hid"}],"reasoning":"extra","tool_calls":[{"id":"t1","type":"custom","custom":{"name":"raw","input":"free text"}},{"id":"t2","type":"function","function":{"name":"f"}}]},"finish_reason":"stop"}]}`))
+	res, err := testClient(t).Generate(context.Background(), chatRoute(f), &Request{Messages: userMsg("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "vis" || !strings.Contains(res.Reasoning, "hid") || !strings.Contains(res.Reasoning, "extra") {
+		t.Fatalf("reasoning-typed parts are excluded from visible text: %+v", res)
+	}
+	if len(res.ToolCalls) != 2 || res.ToolCalls[0].Arguments != `{"input":"free text"}` || res.ToolCalls[1].Arguments != "{}" || res.FinishReason != "tool_calls" {
+		t.Fatalf("%+v", res.ToolCalls)
+	}
+}
+
+func TestChatExplicitPromptCaching(t *testing.T) {
+	f := newUpstream(t, jsonReply(okChat))
+	req := &Request{Messages: []Message{
+		{Role: RoleSystem, Content: "s1"}, {Role: RoleSystem, Content: "s2", CacheHint: true},
+		{Role: RoleUser, Parts: []Part{{Kind: PartText, Text: "a", CacheHint: true}, {Kind: PartText, Text: "b"}}},
+	}, Options: map[string]any{"prompt_cache_options": map[string]any{"mode": "explicit", "ttl": "30m"}}}
+	if _, err := testClient(t).Generate(context.Background(), chatRoute(f), req); err != nil {
+		t.Fatal(err)
+	}
+	b := chatBody(t, f)
+	// Explicit caching disables the leading-system merge.
+	mustEq(t, at(b, "messages.0.content"), "s1", "system 1 stays separate")
+	mustEq(t, at(b, "messages.1.content.0.prompt_cache_breakpoint.mode"), "explicit", "message hint lands on last part")
+	mustEq(t, at(b, "messages.2.content.0.prompt_cache_breakpoint.mode"), "explicit", "part hint")
+	if at(b, "messages.2.content.1.prompt_cache_breakpoint") != nil {
+		t.Fatal("only hinted parts are marked")
+	}
+	if b["prompt_cache_options"] != nil {
+		t.Fatal("prompt_cache_options is interpreted, not forwarded")
+	}
+	// A different ttl is not honored.
+	f2 := newUpstream(t, jsonReply(okChat))
+	req.Options = map[string]any{"prompt_cache_options": map[string]any{"mode": "explicit", "ttl": "1h"}}
+	if _, err := testClient(t).Generate(context.Background(), chatRoute(f2), req); err != nil {
+		t.Fatal(err)
+	}
+	mustEq(t, at(chatBody(t, f2), "messages.0.content"), "s1\n\ns2", "unsupported ttl: ordinary behaviour")
+}

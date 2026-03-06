@@ -429,3 +429,229 @@ func (chatAdapter) parse(x *exchange, body []byte) (*Result, error) {
 }
 
 // ---- streaming ------------------------------------------------------------
+
+type chatStream struct {
+	x       *exchange
+	frames  int
+	parsed  int
+	res     Result
+	text    strings.Builder
+	think   strings.Builder
+	tools   map[int]*toolAcc
+	order   []int
+	dsml    *dsmlFilter
+	cites   []Citation
+	usage   Usage
+	haveUse bool
+	flushed bool
+	tail    string
+	dsmlErr error
+}
+
+func (chatAdapter) stream(x *exchange) streamer {
+	s := &chatStream{x: x, tools: map[int]*toolAcc{}}
+	if isDeepSeek(x) {
+		s.dsml = &dsmlFilter{}
+	}
+	return s
+}
+
+func (s *chatStream) frame(f sseFrame, emit func(Event) error) error {
+	s.frames++
+	data := strings.TrimSpace(f.Data)
+	if data == "" || data[0] != '{' {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return nil
+	}
+	s.parsed++
+	if id := strOf(m["id"]); id != "" && s.res.ID == "" {
+		s.res.ID = id
+		s.res.ServiceTier = strOf(m["service_tier"])
+		if err := emit(Event{Type: EventCreated, ResponseID: id, ServiceTier: s.res.ServiceTier}); err != nil {
+			return err
+		}
+	} else if t := strOf(m["service_tier"]); t != "" {
+		s.res.ServiceTier = t
+	}
+	if u, ok := m["usage"].(map[string]any); ok && u != nil {
+		nu := openAIUsage(u, false)
+		if nu.ServiceTier == "" {
+			nu.ServiceTier = s.res.ServiceTier
+		}
+		mergeUsage(&s.usage, nu)
+		s.haveUse = true
+		cp := s.usage
+		if err := emit(Event{Type: EventUsage, Usage: &cp}); err != nil {
+			return err
+		}
+	}
+	for _, c := range asList(m["citations"]) {
+		if str, ok := c.(string); ok {
+			before := len(s.cites)
+			s.cites = addCitation(s.cites, Citation{URL: str})
+			if len(s.cites) > before {
+				cc := Citation{URL: str}
+				if err := emit(Event{Type: EventCitation, Citation: &cc}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	choices := asList(m["choices"])
+	if len(choices) == 0 {
+		return nil
+	}
+	ch, _ := choices[0].(map[string]any)
+	if fr := strOf(ch["finish_reason"]); fr != "" {
+		s.res.FinishReason = fr
+	}
+	delta, _ := ch["delta"].(map[string]any)
+	if delta == nil {
+		return nil
+	}
+	switch c := delta["content"].(type) {
+	case string:
+		if err := s.pushText(c, emit); err != nil {
+			return err
+		}
+	case []any:
+		for _, p := range c {
+			pm, _ := p.(map[string]any)
+			pt := strOf(pm["type"])
+			t := firstNonEmpty(strOf(pm["text"]), strOf(pm["reasoning"]), strOf(pm["thinking"]))
+			switch {
+			case t == "":
+			case strings.Contains(pt, "reason") || strings.Contains(pt, "think"):
+				s.think.WriteString(t)
+				if err := emit(Event{Type: EventReasoning, Text: t}); err != nil {
+					return err
+				}
+			default:
+				if err := s.pushText(t, emit); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if r := firstNonEmpty(strOf(delta["reasoning_content"]), strOf(delta["reasoning"])); r != "" {
+		s.think.WriteString(r)
+		if err := emit(Event{Type: EventReasoning, Text: r}); err != nil {
+			return err
+		}
+	}
+	for pos, t := range asList(delta["tool_calls"]) {
+		tm, _ := t.(map[string]any)
+		if tm == nil {
+			continue
+		}
+		idx := pos
+		if n, ok := toInt(tm["index"]); ok && n >= 0 && n <= 1024 {
+			idx = int(n)
+		}
+		acc, ok := s.tools[idx]
+		if !ok {
+			acc = &toolAcc{index: idx}
+			s.tools[idx] = acc
+			s.order = append(s.order, idx)
+		}
+		if id := strOf(tm["id"]); id != "" {
+			acc.callID = id
+		}
+		frag := ToolCall{ID: acc.callID}
+		if fn, ok := tm["function"].(map[string]any); ok {
+			if n := strOf(fn["name"]); n != "" {
+				acc.name += n
+				frag.Name = n
+			}
+			if a := strOf(fn["arguments"]); a != "" {
+				acc.args.WriteString(a)
+				frag.Arguments = a
+			}
+		} else if cu, ok := tm["custom"].(map[string]any); ok {
+			acc.custom = true
+			if n := strOf(cu["name"]); n != "" {
+				acc.name += n
+				frag.Name = n
+			}
+			if a := strOf(cu["input"]); a != "" {
+				acc.args.WriteString(a)
+				frag.Arguments = a
+			}
+		}
+		if err := emit(Event{Type: EventToolCall, Index: idx, ToolCall: &frag}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *chatStream) pushText(t string, emit func(Event) error) error {
+	if t == "" {
+		return nil
+	}
+	if s.dsml != nil {
+		t = s.dsml.push(t)
+		if t == "" {
+			return nil
+		}
+	}
+	s.text.WriteString(t)
+	return emit(Event{Type: EventText, Text: t})
+}
+
+// flush releases withheld text and converts completed text-encoded tool calls.
+func (s *chatStream) flush(emit func(Event) error) error {
+	if s.flushed || s.dsml == nil {
+		return nil
+	}
+	s.flushed = true
+	s.tail, s.dsmlErr = s.dsml.finish()
+	if s.dsmlErr != nil {
+		return s.dsmlErr
+	}
+	if s.tail != "" {
+		if err := emit(Event{Type: EventText, Text: s.tail}); err != nil {
+			return err
+		}
+	}
+	for i := range s.dsml.calls {
+		tc := s.dsml.calls[i]
+		if err := emit(Event{Type: EventToolCall, Index: len(s.order) + i, ToolCall: &tc}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *chatStream) result() (*Result, error) {
+	if s.frames == 0 {
+		return &Result{}, &Error{Kind: KindParse, Message: "upstream stream ended before any event", Accepted: true}
+	}
+	if s.parsed == 0 {
+		return &Result{}, &Error{Kind: KindParse, Message: "upstream stream carried no readable event", Accepted: true}
+	}
+	res := s.res
+	res.Text = s.text.String() + s.tail
+	res.Reasoning = s.think.String()
+	for _, idx := range s.order {
+		t := s.tools[idx]
+		args := t.args.String()
+		if t.custom {
+			b, _ := json.Marshal(map[string]any{"input": args})
+			args = string(b)
+		}
+		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: t.callID, Name: t.name, Arguments: argsOrEmpty(args)})
+	}
+	if s.dsml != nil && s.flushed && s.dsmlErr == nil {
+		res.ToolCalls = append(res.ToolCalls, s.dsml.calls...)
+	}
+	res.Citations = s.cites
+	res.Usage = s.usage
+	if len(res.ToolCalls) > 0 && (res.FinishReason == "" || res.FinishReason == "stop") {
+		res.FinishReason = "tool_calls"
+	}
+	return &res, s.dsmlErr
+}
