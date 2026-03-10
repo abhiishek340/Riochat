@@ -1,0 +1,20 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "build": {
+      "inputs": ["**/*.go", "go.mod", "go.sum", "$TURBO_ROOT$/VERSION"],
+      "outputs": [],
+      "cache": false
+    },
+    "lint": {
+      "inputs": ["**/*.go", "go.mod", "go.sum"]
+    },
+    "typecheck": {
+      "inputs": ["**/*.go", "go.mod", "go.sum"]
+    },
+    "test": {
+      "inputs": ["**/*.go", "go.mod", "go.sum", "**/testdata/**"]
+    }
+  }
+}
