@@ -1,0 +1,12 @@
+{
+  "name": "@riochat/backend",
+  "version": "0.4.5",
+  "private": true,
+  "description": "Thin wrapper so the task runner can drive the Go module; the real build lives in Go tooling.",
+  "scripts": {
+    "build": "node ../scripts/build-api.mjs",
+    "lint": "go vet ./...",
+    "typecheck": "go build ./...",
+    "test": "go test ./..."
+  }
+}
