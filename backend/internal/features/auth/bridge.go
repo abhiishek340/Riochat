@@ -243,3 +243,264 @@ func (p *Provider) configuredURLs() []string {
 }
 
 type endpoints struct{ Auth, Token, UserInfo string }
+
+// resolveEndpoints returns the provider's endpoints, consulting the OIDC
+// discovery document for any that are not configured.
+func (s *Service) resolveEndpoints(ctx context.Context, p *Provider) (endpoints, error) {
+	ep := endpoints{Auth: p.AuthURL, Token: p.TokenURL, UserInfo: p.UserInfoURL}
+	if ep.Auth != "" && ep.Token != "" && ep.UserInfo != "" {
+		return ep, nil
+	}
+	if p.Type != "oidc" {
+		return ep, nil
+	}
+	disco := strings.TrimSpace(p.DiscoveryURL)
+	if disco == "" {
+		if strings.TrimSpace(p.IssuerURL) == "" {
+			return ep, nil
+		}
+		disco = strings.TrimRight(strings.TrimSpace(p.IssuerURL), "/") + "/.well-known/openid-configuration"
+	}
+	if err := validateEndpointURL(disco); err != nil {
+		return ep, err
+	}
+	req, err := newGet(ctx, disco)
+	if err != nil {
+		return ep, ErrProviderUpstreamFailed.WithCause(err)
+	}
+	status, body, err := doCapped(s.httpClient(append(p.configuredURLs(), disco)...), req)
+	if err != nil || status < 200 || status > 299 {
+		return ep, ErrProviderUpstreamFailed.WithCause(errOrStatus(err, status))
+	}
+	var doc struct {
+		Auth     string `json:"authorization_endpoint"`
+		Token    string `json:"token_endpoint"`
+		UserInfo string `json:"userinfo_endpoint"`
+	}
+	if json.Unmarshal(body, &doc) != nil {
+		return ep, ErrProviderUpstreamFailed
+	}
+	if ep.Auth == "" {
+		ep.Auth = doc.Auth
+	}
+	if ep.Token == "" {
+		ep.Token = doc.Token
+	}
+	if ep.UserInfo == "" {
+		ep.UserInfo = doc.UserInfo
+	}
+	for _, u := range []string{ep.Auth, ep.Token, ep.UserInfo} {
+		if u != "" {
+			if err := validateEndpointURL(u); err != nil {
+				return ep, err
+			}
+		}
+	}
+	return ep, nil
+}
+
+// ---- authorize ------------------------------------------------------------------------------------
+
+type authorizeInput struct {
+	ClientID      string
+	RedirectURI   string
+	CodeChallenge string
+	ClientState   string
+	Intent        string
+	Next          string
+}
+
+type authorizeResult struct {
+	AuthorizationURL string    `json:"authorizationURL"`
+	ExpiresAt        time.Time `json:"expiresAt"`
+}
+
+func safeNext(next string) string {
+	next = strings.TrimSpace(next)
+	if strings.HasPrefix(next, "/") && !strings.HasPrefix(next, "//") && !strings.Contains(next, "\\") {
+		return next
+	}
+	return "/chat"
+}
+
+// ProviderAuthorize starts a provider sign-in (userID 0) or a bind (userID set).
+func (s *Service) ProviderAuthorize(ctx context.Context, slug string, in authorizeInput, bindUser uint) (authorizeResult, error) {
+	if s.d.Cache == nil {
+		return authorizeResult{}, ErrProviderInvalid.WithMessage("provider auth bridge is not configured")
+	}
+	st := s.settings(ctx)
+	if !st.ThirdPartyLoginEnabled {
+		return authorizeResult{}, ErrProviderLoginDisabled
+	}
+	if err := s.validateClientRedirect(in.ClientID, in.RedirectURI, slug); err != nil {
+		return authorizeResult{}, err
+	}
+	if !pkcePattern.MatchString(in.CodeChallenge) || !pkcePattern.MatchString(in.ClientState) {
+		return authorizeResult{}, ErrInvalidPKCE
+	}
+	p, err := s.providerBySlug(ctx, slug)
+	if err != nil {
+		return authorizeResult{}, err
+	}
+	intent := in.Intent
+	if bindUser != 0 {
+		intent = intentBind
+	}
+	switch intent {
+	case "", intentLogin:
+		intent = intentLogin
+		if !p.LoginEnabled {
+			return authorizeResult{}, ErrProviderLoginDisabled
+		}
+	case intentRegister:
+		if !p.LoginEnabled {
+			return authorizeResult{}, ErrProviderLoginDisabled
+		}
+		if !p.RegistrationEnabled {
+			return authorizeResult{}, ErrProviderRegistrationOff
+		}
+	case intentBind:
+	default:
+		return authorizeResult{}, ErrBadRequest
+	}
+	ep, err := s.resolveEndpoints(ctx, p)
+	if err != nil {
+		return authorizeResult{}, err
+	}
+	base, ok := apiBaseURL(s.cfg())
+	if !ok {
+		return authorizeResult{}, ErrProviderCallbackMisconf
+	}
+	if ep.Auth == "" {
+		return authorizeResult{}, ErrProviderAuthURLMissing
+	}
+	callback := base + "/api/v1/auth/providers/" + slug + "/callback"
+
+	now := s.now()
+	exp := now.Add(bridgeTxTTL)
+	verifier := randomURLToken(48)
+	txID := randomURLToken(32)
+	tx := bridgeTx{
+		Slug: slug, ClientID: in.ClientID, Redirect: in.RedirectURI, ClientState: in.ClientState,
+		ClientChallenge: in.CodeChallenge, Verifier: verifier, Intent: intent, UserID: bindUser,
+		Next: safeNext(in.Next), ExpiresAt: exp,
+	}
+	if err := cache.SetJSON(ctx, s.d.Cache, txKey(txID), tx, bridgeTxTTL); err != nil {
+		return authorizeResult{}, ErrProviderInvalid.WithMessage("provider auth bridge is not configured").WithCause(err)
+	}
+
+	authURL, err := url.Parse(ep.Auth)
+	if err != nil {
+		return authorizeResult{}, ErrProviderAuthURLMissing.WithCause(err)
+	}
+	q := authURL.Query()
+	q.Set("client_id", p.ClientID)
+	q.Set("redirect_uri", callback)
+	q.Set("response_type", "code")
+	q.Set("scope", p.Scopes)
+	q.Set("state", s.signState(slug, txID, exp))
+	q.Set("code_challenge", pkceChallenge(verifier))
+	q.Set("code_challenge_method", "S256")
+	authURL.RawQuery = q.Encode()
+	return authorizeResult{AuthorizationURL: authURL.String(), ExpiresAt: exp}, nil
+}
+
+// ---- callback -------------------------------------------------------------------------------------------
+
+// ProviderCallback finishes the provider leg and returns the URL to send the
+// client to. An error means no safe redirect target exists.
+func (s *Service) ProviderCallback(ctx context.Context, slug, code, state, providerErr string) (string, error) {
+	payload, err := s.openState(state, slug)
+	if err != nil {
+		return "", err
+	}
+	if s.d.Cache == nil {
+		return "", ErrOAuthStateExpired
+	}
+	tx, found, err := cache.ConsumeJSON[bridgeTx](ctx, s.d.Cache, txKey(payload.Tx))
+	if err != nil {
+		return "", ErrOAuthStateExpired.WithCause(err)
+	}
+	if !found {
+		return "", ErrOAuthStateExpired
+	}
+	if tx.Slug != slug || !tx.ExpiresAt.After(s.now()) {
+		return "", ErrOAuthStateInvalid
+	}
+
+	grant := bridgeGrant{Slug: slug, ClientID: tx.ClientID, Intent: tx.Intent, ExpiresAt: s.now().Add(bridgeGrantTTL)}
+	switch {
+	case strings.TrimSpace(providerErr) != "":
+		grant.ErrCode = grantErrProvider
+	case strings.TrimSpace(code) == "":
+		grant.ErrCode = grantErrProvider
+	default:
+		s.completeProviderLeg(ctx, &tx, strings.TrimSpace(code), &grant)
+	}
+
+	id := randomURLToken(32)
+	if err := cache.SetJSON(ctx, s.d.Cache, grantKey(id, tx.ClientChallenge), grant, bridgeGrantTTL); err != nil {
+		return "", ErrOAuthStateExpired.WithCause(err)
+	}
+	target, err := url.Parse(tx.Redirect)
+	if err != nil {
+		return "", ErrInvalidRedirectURI
+	}
+	q := target.Query()
+	q.Set("provider", slug)
+	q.Set("grant", id)
+	q.Set("state", tx.ClientState)
+	q.Set("intent", tx.Intent)
+	q.Set("next", tx.Next)
+	target.RawQuery = q.Encode()
+	return target.String(), nil
+}
+
+// completeProviderLeg exchanges the code, reads the profile and resolves the
+// user. Failures are recorded in the grant instead of failing the callback.
+func (s *Service) completeProviderLeg(ctx context.Context, tx *bridgeTx, code string, grant *bridgeGrant) {
+	fail := func(err error, detail string) {
+		grant.ErrCode = grantErrProvider
+		switch {
+		case isErr(err, ErrProviderSubjectMissing):
+			grant.ErrCode = grantErrNoSubject
+		case isErr(err, ErrInvalidEmail):
+			grant.ErrCode = grantErrInvalidEmail
+		case isErr(err, ErrProviderLoginDisabled):
+			grant.ErrCode = grantErrLoginDisabled
+		case isErr(err, ErrProviderAccountNotReg):
+			grant.ErrCode = grantErrNotRegistered
+		}
+		if grant.ErrCode == grantErrProvider {
+			s.log.Warn("provider_callback_failed", logx.F("provider", tx.Slug), logx.F("stage", detail), logx.Err(err))
+		}
+	}
+	p, err := s.providerBySlug(ctx, tx.Slug)
+	if err != nil {
+		fail(err, "provider")
+		return
+	}
+	claims, err := s.fetchProviderClaims(ctx, p, code, tx.Verifier)
+	if err != nil {
+		fail(err, "claims")
+		return
+	}
+	grant.Subject = claims.Subject
+	switch tx.Intent {
+	case intentBind:
+		grant.UserID = tx.UserID
+		grant.Profile = &bridgeProfile{DisplayName: claims.DisplayName, Email: claims.Email,
+			EmailVerified: claims.EmailVerified, Raw: claims.Raw}
+	default:
+		uid, err := s.resolveProviderUser(ctx, p, claims)
+		if err != nil {
+			if isErr(err, ErrProviderEmailConflict) {
+				grant.ErrCode, grant.ErrEmail = grantErrEmailConflict, claims.Email
+				return
+			}
+			fail(err, "resolve")
+			return
+		}
+		grant.UserID = uid
+	}
+}
