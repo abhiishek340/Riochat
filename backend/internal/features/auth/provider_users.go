@@ -211,3 +211,223 @@ func grantError(g *bridgeGrant, withDetails bool) error {
 	}
 	return ErrProviderInvalid
 }
+
+// ProviderExchange redeems a login or register grant for a session.
+func (s *Service) ProviderExchange(ctx context.Context, slug string, in exchangeInput) (signIn, error) {
+	g, err := s.consumeGrant(ctx, slug, in)
+	if err != nil {
+		return signIn{}, err
+	}
+	if gerr := grantError(g, true); gerr != nil {
+		s.event(ctx, eventInput{Type: "provider_login", Result: resultFailure, Reason: g.ErrCode,
+			Detail: map[string]any{"provider": slug}})
+		return signIn{}, gerr
+	}
+	if g.Intent == intentBind {
+		return signIn{}, ErrOAuthStateInvalid
+	}
+	u, err := s.userByID(ctx, g.UserID)
+	if err != nil {
+		if database.IsNotFound(err) {
+			return signIn{}, ErrInvalidCredentials.WithStatus(400)
+		}
+		return signIn{}, err
+	}
+	detail := map[string]any{"provider": slug, "subject": g.Subject}
+	switch {
+	case u.Status == StatusLocked:
+		cred, _ := s.credentialOf(ctx, u.ID)
+		var until *time.Time
+		if cred != nil {
+			until = cred.LockedUntil
+		}
+		s.event(ctx, eventInput{Type: "provider_login", Result: resultFailure, Reason: reasonAccountLocked, UserID: u.ID, Detail: detail})
+		return signIn{}, &lockedError{retryAfter: retryAfterSeconds(until, s.now())}
+	case u.Status != StatusActive:
+		s.event(ctx, eventInput{Type: "provider_login", Result: resultFailure, Reason: "account not active", UserID: u.ID, Detail: detail})
+		return signIn{}, ErrInvalidCredentials.WithStatus(400)
+	}
+	mfa, err := s.mfaOf(ctx, u.ID)
+	if err != nil {
+		return signIn{}, err
+	}
+	if totpActive(mfa) {
+		out, err := s.buildChallenge(ctx, u)
+		if err != nil {
+			return signIn{}, err
+		}
+		s.event(ctx, eventInput{Type: "provider_login", Result: resultChallenge, UserID: u.ID, Detail: detail})
+		return out, nil
+	}
+	out, sess, err := s.newSession(ctx, u)
+	if err != nil {
+		return signIn{}, err
+	}
+	for k, v := range sessionDetail(sess) {
+		detail[k] = v
+	}
+	s.event(ctx, eventInput{Type: "provider_login", Result: resultSuccess, UserID: u.ID, Detail: detail})
+	return out, nil
+}
+
+// identityView is one bound external identity.
+type identityView struct {
+	ID                  uint       `json:"id"`
+	ProviderID          string     `json:"providerID"`
+	ProviderType        string     `json:"providerType"`
+	ProviderName        string     `json:"providerName"`
+	ProviderSlug        string     `json:"providerSlug"`
+	ProviderLogoURL     string     `json:"providerLogoURL"`
+	ProviderDisplayName string     `json:"providerDisplayName"`
+	Email               string     `json:"email"`
+	EmailVerified       bool       `json:"emailVerified"`
+	LinkedAt            time.Time  `json:"linkedAt"`
+	LastLoginAt         *time.Time `json:"lastLoginAt"`
+}
+
+func (s *Service) identityViews(ctx context.Context, links []UserLink) ([]identityView, error) {
+	out := make([]identityView, 0, len(links))
+	provs := map[uint]*Provider{}
+	for i := range links {
+		l := &links[i]
+		p, ok := provs[l.ProviderID]
+		if !ok {
+			var row Provider
+			if err := s.conn(ctx).Unscoped().First(&row, l.ProviderID).Error; err == nil {
+				p = &row
+			}
+			provs[l.ProviderID] = p
+		}
+		v := identityView{
+			ID: l.ID, ProviderType: l.ProviderType, ProviderDisplayName: l.ProviderDisplayName,
+			Email: l.Email, EmailVerified: l.EmailVerified, LinkedAt: l.LinkedAt, LastLoginAt: l.LastLoginAt,
+		}
+		if p != nil {
+			v.ProviderID, v.ProviderName, v.ProviderSlug, v.ProviderLogoURL = p.PublicID, p.Name, p.Slug, p.LogoURL
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// ListIdentities returns the caller's bound identities.
+func (s *Service) ListIdentities(ctx context.Context, userID uint) ([]identityView, error) {
+	var links []UserLink
+	if err := s.conn(ctx).Where("user_id = ?", userID).Order("id ASC").Find(&links).Error; err != nil {
+		return nil, err
+	}
+	return s.identityViews(ctx, links)
+}
+
+// BindExchange redeems a bind grant for the signed-in user.
+func (s *Service) BindExchange(ctx context.Context, userID uint, slug string, in exchangeInput) (identityView, error) {
+	g, err := s.consumeGrant(ctx, slug, in)
+	if err != nil {
+		return identityView{}, err
+	}
+	if gerr := grantError(g, false); gerr != nil {
+		return identityView{}, gerr
+	}
+	if g.Intent != intentBind || g.UserID != userID || g.Profile == nil {
+		return identityView{}, ErrOAuthStateInvalid
+	}
+	p, err := s.providerBySlug(ctx, slug)
+	if err != nil {
+		return identityView{}, err
+	}
+	now := s.now()
+	claims := providerClaims{Subject: g.Subject, Email: g.Profile.Email, EmailVerified: g.Profile.EmailVerified,
+		DisplayName: g.Profile.DisplayName, Raw: g.Profile.Raw}
+	var link UserLink
+	err = s.conn(ctx).Transaction(func(tx *gorm.DB) error {
+		// A soft-deleted link for the same identity would trip the unique index.
+		if err := tx.Unscoped().Where("provider_id = ? AND provider_subject = ? AND deleted_at IS NOT NULL",
+			p.ID, claims.Subject).Delete(&UserLink{}).Error; err != nil {
+			return err
+		}
+		existing, err := s.linkFor(ctx, tx, p.ID, claims.Subject)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			if existing.UserID != userID {
+				return ErrProviderIdentityConflict
+			}
+			if err := s.refreshLink(ctx, tx, existing, claims, now); err != nil {
+				return err
+			}
+			return tx.First(&link, existing.ID).Error
+		}
+		if claims.Email != "" {
+			var n int64
+			if err := tx.Model(&User{}).Where("email = ? AND id <> ?", claims.Email, userID).Count(&n).Error; err != nil {
+				return err
+			}
+			if n > 0 {
+				return ErrProviderEmailConflict.WithStatus(400)
+			}
+		}
+		var mine int64
+		if err := tx.Model(&UserLink{}).Where("user_id = ? AND provider_id = ?", userID, p.ID).Count(&mine).Error; err != nil {
+			return err
+		}
+		if mine > 0 {
+			return ErrProviderAlreadyBound
+		}
+		link = linkFromClaims(p, claims, now)
+		link.UserID = userID
+		if err := tx.Create(&link).Error; err != nil {
+			if database.IsDuplicate(err) {
+				return ErrProviderIdentityConflict
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		s.event(ctx, eventInput{Type: "provider_bind", Result: resultFailure, Reason: reasonOf(err), UserID: userID,
+			Detail: map[string]any{"provider": slug}})
+		return identityView{}, err
+	}
+	s.event(ctx, eventInput{Type: "provider_bind", Result: resultSuccess, UserID: userID,
+		Detail: map[string]any{"provider": slug, "subject": claims.Subject}})
+	views, err := s.identityViews(ctx, []UserLink{link})
+	if err != nil {
+		return identityView{}, err
+	}
+	return views[0], nil
+}
+
+// UnbindIdentity removes one of the caller's identities unless it is their
+// only way to sign in.
+func (s *Service) UnbindIdentity(ctx context.Context, userID, identityID uint) error {
+	return s.conn(ctx).Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&user, userID).Error; err != nil {
+			return database.Translate(err)
+		}
+		var link UserLink
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND user_id = ?", identityID, userID).First(&link).Error; err != nil {
+			if database.IsNotFound(err) {
+				return ErrIdentityNotFound
+			}
+			return err
+		}
+		var cred Credential
+		passwordOn := false
+		if err := tx.Where("user_id = ?", userID).First(&cred).Error; err == nil {
+			passwordOn = cred.PasswordEnabled
+		}
+		if !passwordOn {
+			var n int64
+			if err := tx.Model(&UserLink{}).Where("user_id = ?", userID).Count(&n).Error; err != nil {
+				return err
+			}
+			if n <= 1 {
+				return ErrLastLoginMethod
+			}
+		}
+		return tx.Unscoped().Delete(&UserLink{}, link.ID).Error
+	})
+}
