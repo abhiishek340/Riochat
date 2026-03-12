@@ -123,3 +123,154 @@ type SendResult struct {
 	AssistantMessage    *MessageDTO `json:"assistantMessage"`
 	MetadataRefreshHint string      `json:"metadataRefreshHint,omitempty"`
 }
+
+// RunDTO is the run object returned to clients.
+type RunDTO struct {
+	ID                  uint       `json:"id"`
+	RunID               string     `json:"runID"`
+	RequestID           string     `json:"requestID"`
+	UserID              uint       `json:"userID"`
+	ConversationID      uint       `json:"conversationID"`
+	TaskType            string     `json:"taskType"`
+	Endpoint            string     `json:"endpoint"`
+	Provider            string     `json:"provider"`
+	ProviderProtocol    string     `json:"providerProtocol"`
+	UpstreamID          uint       `json:"upstreamID"`
+	UpstreamModelID     uint       `json:"upstreamModelID"`
+	RequestedModelName  string     `json:"requestedModelName"`
+	PlatformModelName   string     `json:"platformModelName"`
+	RoutedBindingCode   string     `json:"routedBindingCode"`
+	ModelVendor         string     `json:"modelVendor"`
+	ModelIcon           string     `json:"modelIcon"`
+	UpstreamModelName   string     `json:"upstreamModelName"`
+	InputTokens         int64      `json:"inputTokens"`
+	OutputTokens        int64      `json:"outputTokens"`
+	CacheReadTokens     int64      `json:"cacheReadTokens"`
+	CacheWriteTokens    int64      `json:"cacheWriteTokens"`
+	ReasoningTokens     int64      `json:"reasoningTokens"`
+	ReasoningEffort     *string    `json:"reasoningEffort"`
+	ToolCallsCount      int        `json:"toolCallsCount"`
+	FirstTokenLatencyMS int64      `json:"firstTokenLatencyMS"`
+	TotalLatencyMS      int64      `json:"totalLatencyMS"`
+	Status              string     `json:"status"`
+	ErrorCode           string     `json:"errorCode"`
+	ErrorMessage        string     `json:"errorMessage"`
+	StartedAt           time.Time  `json:"startedAt"`
+	EndedAt             *time.Time `json:"endedAt"`
+	CreatedAt           time.Time  `json:"createdAt"`
+	UpdatedAt           time.Time  `json:"updatedAt"`
+}
+
+func toRunDTO(r Run) RunDTO {
+	return RunDTO{
+		ID: r.ID, RunID: r.RunID, RequestID: r.RequestID, UserID: r.UserID, ConversationID: r.ConversationID,
+		TaskType: r.TaskType, Endpoint: r.Endpoint, Provider: r.Provider, ProviderProtocol: r.ProviderProtocol,
+		UpstreamID: r.UpstreamID, UpstreamModelID: r.UpstreamModelID, RequestedModelName: r.RequestedModelName,
+		PlatformModelName: r.PlatformModelName, RoutedBindingCode: r.RoutedBindingCode, ModelVendor: r.ModelVendor,
+		ModelIcon: r.ModelIcon, UpstreamModelName: r.UpstreamModelName, InputTokens: r.InputTokens,
+		OutputTokens: r.OutputTokens, CacheReadTokens: r.CacheReadTokens, CacheWriteTokens: r.CacheWriteTokens,
+		ReasoningTokens: r.ReasoningTokens, ReasoningEffort: r.ReasoningEffort, ToolCallsCount: r.ToolCallsCount,
+		FirstTokenLatencyMS: r.FirstTokenLatencyMS, TotalLatencyMS: r.TotalLatencyMS, Status: r.Status,
+		ErrorCode: r.ErrorCode, ErrorMessage: r.ErrorMessage, StartedAt: r.StartedAt, EndedAt: r.EndedAt,
+		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	}
+}
+
+// ProjectDTO is the project object returned to clients.
+type ProjectDTO struct {
+	PublicID                string    `json:"publicID"`
+	Name                    string    `json:"name"`
+	Description             string    `json:"description"`
+	SystemPrompt            string    `json:"systemPrompt"`
+	DefaultModel            string    `json:"defaultModel"`
+	MCPDefaultMode          string    `json:"mcpDefaultMode"`
+	DefaultMCPToolIDs       []uint    `json:"defaultMCPToolIDs"`
+	DefaultSkillIDs         []uint    `json:"defaultSkillIDs"`
+	DefaultKnowledgeBaseIDs []string  `json:"defaultKnowledgeBaseIDs"`
+	Color                   string    `json:"color"`
+	Icon                    string    `json:"icon"`
+	SortOrder               int       `json:"sortOrder"`
+	Status                  string    `json:"status"`
+	CreatedAt               time.Time `json:"createdAt"`
+	UpdatedAt               time.Time `json:"updatedAt"`
+}
+
+// ShareDTO is the share object returned to the owner.
+type ShareDTO struct {
+	ShareID        string     `json:"shareID"`
+	Status         string     `json:"status"`
+	TitleSnapshot  string     `json:"titleSnapshot"`
+	ModelSnapshot  string     `json:"modelSnapshot"`
+	MessageCount   int        `json:"messageCount"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	UpdatedAt      time.Time  `json:"updatedAt"`
+	RevokedAt      *time.Time `json:"revokedAt"`
+	LastAccessedAt *time.Time `json:"lastAccessedAt"`
+}
+
+// DeleteResult is the result of deleting a conversation or a project.
+type DeleteResult struct {
+	Deleted          bool      `json:"deleted"`
+	DeletedFileCount int       `json:"deletedFileCount,omitempty"`
+	Quota            *QuotaDTO `json:"quota,omitempty"`
+}
+
+// QuotaDTO is the storage quota object.
+type QuotaDTO struct {
+	ID            uint      `json:"id"`
+	UserID        uint      `json:"userID"`
+	QuotaBytes    int64     `json:"quotaBytes"`
+	UsedBytes     int64     `json:"usedBytes"`
+	ReservedBytes int64     `json:"reservedBytes"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+// ----- shared helpers -----
+
+func ptrStr(s string) *string { return &s }
+
+// collapseSpaces replaces every whitespace run by one space and trims.
+func collapseSpaces(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// trimQuotes removes surrounding quote characters and spaces.
+func trimQuotes(s string) string {
+	return strings.Trim(strings.TrimSpace(s), "\"'`“”‘’\u300c\u300d\u300e\u300f ")
+}
+
+func labelsOrEmpty(raw string) string {
+	t := strings.TrimSpace(raw)
+	if t == "" || t == "null" {
+		return "[]"
+	}
+	return raw
+}
+
+func parseStringList(raw string) []string {
+	var out []string
+	if strings.TrimSpace(raw) == "" {
+		return []string{}
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil || out == nil {
+		return []string{}
+	}
+	return out
+}
+
+func parseUintList(raw string) []uint {
+	var out []uint
+	if err := json.Unmarshal([]byte(raw), &out); err != nil || out == nil {
+		return []uint{}
+	}
+	return out
+}
+
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(b)
+}
+
+func uintPtr(v uint) *uint { return &v }
