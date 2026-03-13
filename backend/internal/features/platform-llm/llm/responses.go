@@ -279,3 +279,360 @@ func responsesFormat(rf *responseFormat) map[string]any {
 	}
 	return f
 }
+
+// renderResponsesMessage converts one message to Responses input items.
+func renderResponsesMessage(m Message, idx int, openrouter, explicit bool) []any {
+	var items []any
+	role := m.Role
+	assistant := role == RoleAssistant
+	textType := "input_text"
+	if assistant {
+		textType = "output_text"
+	}
+	rolename := string(role)
+	if role == RoleTool || role == RoleFunction {
+		rolename = "user"
+	}
+
+	var blocks []any
+	var lastSupported = -1
+	for _, p := range effectiveParts(m) {
+		var blk map[string]any
+		if t, ok := partAsText(p); ok {
+			blk = map[string]any{"type": textType, "text": t}
+		} else {
+			switch p.Kind {
+			case PartImage:
+				if assistant || len(p.Data) == 0 {
+					continue
+				}
+				blk = map[string]any{"type": "input_image", "image_url": dataURL(imageMIME(p.MIME), p.Data)}
+			case PartDocument:
+				if len(p.Data) == 0 {
+					continue
+				}
+				name := p.FileName
+				if strings.TrimSpace(name) == "" {
+					name = "document.pdf"
+				}
+				blk = map[string]any{"type": "input_file", "filename": name, "file_data": dataURL("application/pdf", p.Data)}
+			default:
+				continue
+			}
+		}
+		blocks = append(blocks, blk)
+		if explicit && cacheBreakpointTypes[blk["type"].(string)] {
+			lastSupported = len(blocks) - 1
+			if p.CacheHint && !p.Dynamic {
+				blk["prompt_cache_breakpoint"] = map[string]any{"mode": "explicit"}
+			}
+		}
+	}
+	if explicit && m.CacheHint && lastSupported >= 0 {
+		blocks[lastSupported].(map[string]any)["prompt_cache_breakpoint"] = map[string]any{"mode": "explicit"}
+	}
+	if len(blocks) > 0 {
+		item := map[string]any{"role": rolename, "content": blocks}
+		if openrouter {
+			item["type"] = "message"
+			if assistant {
+				item["id"] = "msg_riochat_" + sanitizeID(fmt.Sprint(idx))
+				item["status"] = "completed"
+			}
+		}
+		items = append(items, item)
+	}
+	for _, tc := range m.ToolCalls {
+		it := map[string]any{"type": "function_call", "call_id": tc.ID, "name": tc.Name, "arguments": argsOrEmpty(tc.Arguments)}
+		if openrouter {
+			it["id"] = "fc_" + sanitizeID(tc.ID)
+			it["status"] = "completed"
+		}
+		items = append(items, it)
+	}
+	for _, tr := range m.ToolResults {
+		it := map[string]any{"type": "function_call_output", "call_id": tr.CallID, "output": toolResultOutput(tr)}
+		if openrouter {
+			it["id"] = "fc_output_" + sanitizeID(tr.CallID)
+		}
+		items = append(items, it)
+	}
+	return items
+}
+
+func imageMIME(m string) string {
+	m = strings.ToLower(strings.TrimSpace(m))
+	switch m {
+	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
+		if m == "image/jpg" {
+			return "image/jpeg"
+		}
+		return m
+	}
+	if strings.HasPrefix(m, "image/") {
+		return m
+	}
+	return "image/jpeg"
+}
+
+// ---- parsing --------------------------------------------------------------
+
+func (responsesAdapter) parse(x *exchange, body []byte) (*Result, error) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, &Error{Kind: KindParse, Message: "upstream returned an invalid JSON body", Cause: err, Accepted: true}
+	}
+	return parseResponsesDoc(m, x.proto)
+}
+
+func upstreamFromObject(m map[string]any, holder map[string]any) *Error {
+	f := sseFrame{Event: "error"}
+	b, _ := json.Marshal(holder)
+	f.Data = string(b)
+	if e := inStreamError(f); e != nil {
+		return e
+	}
+	msg, code := errorFromMap(m)
+	if msg == "" {
+		msg = "upstream reported a failure"
+	}
+	return &Error{Kind: KindUpstream, Status: 502, Code: code, Message: msg, Accepted: true}
+}
+
+func parseResponsesDoc(m map[string]any, proto Protocol) (*Result, error) {
+	if e, ok := m["error"].(map[string]any); ok && e != nil {
+		return nil, upstreamFromObject(m, m)
+	}
+	if st, _ := m["status"].(string); st == "failed" {
+		return nil, upstreamFromObject(m, map[string]any{"type": "response.failed", "error": firstObj(m["error"], map[string]any{"message": "response failed"})})
+	}
+	res := &Result{}
+	res.ID, _ = m["id"].(string)
+	res.ServiceTier, _ = m["service_tier"].(string)
+	xai := proto == XAIResponses
+
+	var text, reasoning strings.Builder
+	serverCounts := map[string]int{}
+	items, _ := m["output"].([]any)
+	for _, it := range items {
+		item, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _ := item["type"].(string)
+		switch {
+		case typ == "message":
+			content, _ := item["content"].([]any)
+			for _, c := range content {
+				cm, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				switch ct, _ := cm["type"].(string); ct {
+				case "output_text", "text":
+					if s, ok := cm["text"].(string); ok {
+						text.WriteString(s)
+					}
+					for _, a := range asList(cm["annotations"]) {
+						am, _ := a.(map[string]any)
+						if at, _ := am["type"].(string); at == "url_citation" || am["url"] != nil {
+							res.Citations = addCitation(res.Citations, Citation{URL: strOf(am["url"]), Title: strOf(am["title"])})
+						}
+					}
+				case "refusal":
+					if s, ok := cm["refusal"].(string); ok {
+						text.WriteString(s)
+					}
+				}
+			}
+		case typ == "reasoning":
+			var parts []string
+			for _, s := range asList(item["summary"]) {
+				if sm, ok := s.(map[string]any); ok {
+					if t := strOf(sm["text"]); t != "" {
+						parts = append(parts, t)
+					}
+				}
+			}
+			if len(parts) == 0 {
+				for _, s := range asList(item["content"]) {
+					if sm, ok := s.(map[string]any); ok {
+						if t := strOf(sm["text"]); t != "" {
+							parts = append(parts, t)
+						}
+					}
+				}
+			}
+			if len(parts) > 0 {
+				if reasoning.Len() > 0 {
+					reasoning.WriteString("\n\n")
+				}
+				reasoning.WriteString(strings.Join(parts, "\n\n"))
+			}
+			if enc := strOf(item["encrypted_content"]); enc != "" {
+				res.ReasoningSignature = enc
+			}
+		case typ == "function_call":
+			res.ToolCalls = append(res.ToolCalls, ToolCall{
+				ID: firstNonEmpty(strOf(item["call_id"]), strOf(item["id"])), Name: strOf(item["name"]),
+				Arguments: argsOrEmpty(strOf(item["arguments"]))})
+		case typ == "custom_tool_call":
+			in := strOf(item["input"])
+			b, _ := json.Marshal(map[string]any{"input": in})
+			res.ToolCalls = append(res.ToolCalls, ToolCall{
+				ID: firstNonEmpty(strOf(item["call_id"]), strOf(item["id"])), Name: strOf(item["name"]), Arguments: string(b)})
+		case strings.HasSuffix(typ, "_call") || strings.HasSuffix(typ, "_calls"):
+			name := normalizeServerToolName(typ)
+			sc := ServerToolCall{ID: strOf(item["id"]), Type: name, Status: strOf(item["status"]), Detail: rawJSON(stripEncrypted(item))}
+			if action, ok := item["action"].(map[string]any); ok {
+				if q := strOf(action["query"]); q != "" {
+					sc.Queries = append(sc.Queries, q)
+				}
+				for _, q := range asList(action["queries"]) {
+					sc.Queries = uniqueAppend(sc.Queries, strOf(q))
+				}
+				for _, s := range asList(action["sources"]) {
+					if sm, ok := s.(map[string]any); ok {
+						c := Citation{URL: strOf(sm["url"]), Title: strOf(sm["title"])}
+						sc.Sources = addCitation(sc.Sources, c)
+						res.Citations = addCitation(res.Citations, c)
+					}
+				}
+			}
+			if name == "image_generation" {
+				if b64s := strOf(item["result"]); b64s != "" {
+					if data, err := base64.StdEncoding.DecodeString(b64s); err == nil {
+						mime := "image/png"
+						if f := strOf(item["output_format"]); f != "" {
+							mime = "image/" + strings.ToLower(f)
+						}
+						res.Images = append(res.Images, Image{Index: len(res.Images), Data: data, MIME: mime, RevisedPrompt: strOf(item["revised_prompt"])})
+					}
+				}
+			}
+			serverCounts[name]++
+			res.ServerToolCalls = append(res.ServerToolCalls, sc)
+		}
+	}
+	res.Text = text.String()
+	res.Reasoning = reasoning.String()
+	if res.Text == "" {
+		if s, ok := m["output_text"].(string); ok {
+			res.Text = s
+		}
+	}
+	if len(res.ToolCalls) == 0 {
+		for _, t := range asList(m["tool_calls"]) {
+			tm, _ := t.(map[string]any)
+			if tm == nil {
+				continue
+			}
+			fn, _ := tm["function"].(map[string]any)
+			if fn == nil {
+				fn = tm
+			}
+			res.ToolCalls = append(res.ToolCalls, ToolCall{
+				ID: firstNonEmpty(strOf(tm["call_id"]), strOf(tm["id"])), Name: strOf(fn["name"]), Arguments: argsOrEmpty(strOf(fn["arguments"]))})
+		}
+	}
+	for _, c := range asList(m["citations"]) {
+		switch cv := c.(type) {
+		case string:
+			res.Citations = addCitation(res.Citations, Citation{URL: cv})
+		case map[string]any:
+			res.Citations = addCitation(res.Citations, Citation{URL: strOf(cv["url"]), Title: strOf(cv["title"])})
+		}
+	}
+	usage, _ := m["usage"].(map[string]any)
+	res.Usage = openAIUsage(usage, xai)
+	if res.Usage.ServiceTier == "" {
+		res.Usage.ServiceTier = res.ServiceTier
+	}
+	res.ServerToolUsage = serverToolUsage(usage, serverCounts)
+	if inc, ok := m["incomplete_details"].(map[string]any); ok {
+		res.FinishReason = strOf(inc["reason"])
+	} else if len(res.ToolCalls) > 0 {
+		res.FinishReason = "tool_calls"
+	} else if m["status"] != nil || len(items) > 0 {
+		res.FinishReason = "stop"
+	}
+	return res, nil
+}
+
+func firstObj(v any, def map[string]any) map[string]any {
+	if m, ok := v.(map[string]any); ok && m != nil {
+		return m
+	}
+	return def
+}
+
+func asList(v any) []any {
+	l, _ := v.([]any)
+	return l
+}
+
+func strOf(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case json.Number:
+		return x.String()
+	case float64:
+		return fmt.Sprint(x)
+	}
+	return ""
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// normalizeServerToolName strips a trailing _call / _calls.
+func normalizeServerToolName(s string) string {
+	s = strings.TrimSuffix(s, "_calls")
+	s = strings.TrimSuffix(s, "_call")
+	s = strings.TrimSuffix(s, "_requests")
+	return s
+}
+
+func stripEncrypted(item map[string]any) map[string]any {
+	out := make(map[string]any, len(item))
+	for k, v := range item {
+		if strings.Contains(strings.ToLower(k), "encrypted") {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// serverToolUsage derives counts of provider-hosted tool invocations. Counts
+// reported by the provider win over counts derived from output items.
+func serverToolUsage(usage map[string]any, derived map[string]int) map[string]int {
+	out := map[string]int{}
+	for k, v := range derived {
+		out[k] = v
+	}
+	reported := map[string]int{}
+	for _, key := range []string{"server_side_tool_usage_details", "server_tool_use", "num_server_side_tools_used"} {
+		if det, ok := usage[key].(map[string]any); ok {
+			for name, v := range det {
+				if n, ok := toInt(v); ok && n > 0 {
+					reported[normalizeServerToolName(name)] += int(n)
+				}
+			}
+		}
+	}
+	if len(reported) > 0 {
+		out = reported
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
