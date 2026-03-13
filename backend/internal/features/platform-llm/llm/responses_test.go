@@ -184,3 +184,173 @@ func TestResponsesXAIAndOpenRouterSpecifics(t *testing.T) {
 		t.Fatal(sanitizeID("a b/c-d_e"))
 	}
 }
+
+func TestResponsesExplicitPromptCaching(t *testing.T) {
+	f := newUpstream(t, jsonReply(okResponses))
+	req := &Request{Messages: []Message{
+		{Role: RoleSystem, Content: "s", CacheHint: true},
+		{Role: RoleUser, Parts: []Part{{Kind: PartText, Text: "a"}, {Kind: PartImage, Data: []byte("x"), CacheHint: true}}},
+		{Role: RoleAssistant, Content: "answer", CacheHint: true},
+	}, Options: map[string]any{"prompt_cache_options": map[string]any{"mode": "explicit"}}}
+	if _, err := testClient(t).Generate(context.Background(), respRoute(f), req); err != nil {
+		t.Fatal(err)
+	}
+	b := f.last(t).JSON(t)
+	mustEq(t, at(b, "input.0.content.0.prompt_cache_breakpoint.mode"), "explicit", "system hint")
+	mustEq(t, at(b, "input.1.content.1.prompt_cache_breakpoint.mode"), "explicit", "image part hint")
+	if at(b, "input.1.content.0.prompt_cache_breakpoint") != nil {
+		t.Fatal("unhinted part")
+	}
+	if at(b, "input.2.content.0.prompt_cache_breakpoint") != nil {
+		t.Fatal("output_text is not a supported breakpoint type")
+	}
+}
+
+func TestResponsesParseErrorsAndFallbacks(t *testing.T) {
+	f := newUpstream(t, jsonReply(`{"id":"r","status":"failed","error":{"message":"boom","code":"server_error"}}`))
+	_, err := testClient(t).Generate(context.Background(), respRoute(f), &Request{Messages: userMsg("x")})
+	e, ok := AsError(err)
+	if !ok || e.Message != "boom" || !e.Accepted || e.Status != 502 {
+		t.Fatalf("%+v", e)
+	}
+	f2 := newUpstream(t, jsonReply(`{"id":"r","output_text":"flat","tool_calls":[{"id":"t","function":{"name":"n","arguments":"{}"}}],"citations":["https://x.example"],"usage":{"input_tokens":1,"output_tokens":2,"server_side_tool_usage_details":{"x_search_calls":3,"web_search_calls":1}}}`))
+	res, err := testClient(t).Generate(context.Background(), routeFor(XAIResponses, f2, "g"), &Request{Messages: userMsg("x")})
+	if err != nil || res.Text != "flat" || len(res.ToolCalls) != 1 || res.Citations[0].URL != "https://x.example" ||
+		res.ServerToolUsage["x_search"] != 3 || res.ServerToolUsage["web_search"] != 1 {
+		t.Fatalf("%v %+v %v", err, res, res.ServerToolUsage)
+	}
+	if res.Usage.OutputTokens != 2 {
+		t.Fatal("xai output stays as reported")
+	}
+}
+
+func TestResponsesRefusalAndImageGenerationCall(t *testing.T) {
+	f := newUpstream(t, jsonReply(`{"id":"r","output":[{"type":"message","content":[{"type":"refusal","refusal":"I can't"}]},{"type":"image_generation_call","id":"ig","status":"completed","result":"SU1H","output_format":"webp","revised_prompt":"rp"},{"type":"custom_tool_call","call_id":"cc","name":"raw","input":"txt"}]}`))
+	res, err := testClient(t).Generate(context.Background(), respRoute(f), &Request{Messages: userMsg("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "I can't" || len(res.Images) != 1 || string(res.Images[0].Data) != "IMG" || res.Images[0].MIME != "image/webp" || res.Images[0].RevisedPrompt != "rp" {
+		t.Fatalf("%+v", res)
+	}
+	if res.ToolCalls[0].Arguments != `{"input":"txt"}` {
+		t.Fatalf("%+v", res.ToolCalls)
+	}
+	if res.ServerToolUsage["image_generation"] != 1 {
+		t.Fatalf("%v", res.ServerToolUsage)
+	}
+}
+
+// ---- streaming ------------------------------------------------------------
+
+func TestResponsesStreamEvents(t *testing.T) {
+	completed := strings.ReplaceAll(okResponses, "\n", "")
+	f := newUpstream(t, sseReply(
+		ev("response.created", `{"type":"response.created","response":{"id":"resp_1","service_tier":"default"}}`),
+		ev("response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs1"}}`),
+		ev("response.reasoning_summary_text.delta", `{"type":"response.reasoning_summary_text.delta","delta":"I consid"}`),
+		ev("response.reasoning_summary_text.delta", `{"type":"response.reasoning_summary_text.delta","delta":"ered"}`),
+		ev("response.output_item.added", `{"type":"response.output_item.added","item":{"type":"message","id":"m1"}}`),
+		ev("response.output_text.delta", `{"type":"response.output_text.delta","delta":"Ans"}`),
+		ev("response.output_text.delta", `{"type":"response.output_text.delta","delta":"wer"}`),
+		ev("response.output_text.done", `{"type":"response.output_text.done","text":"Answer"}`),
+		ev("response.output_item.added", `{"type":"response.output_item.added","item":{"type":"function_call","id":"fc1","call_id":"call_1","name":"lookup","arguments":""}}`),
+		ev("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","item_id":"fc1","delta":"{\"q\""}`),
+		ev("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","item_id":"fc1","delta":":1}"}`),
+		ev("response.output_item.done", `{"type":"response.output_item.done","item":{"type":"function_call","id":"fc1","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}}`),
+		ev("response.web_search_call.searching", `{"type":"response.web_search_call.searching","item_id":"ws1"}`),
+		ev("response.image_generation_call.partial_image", `{"type":"response.image_generation_call.partial_image","partial_image_b64":"SU1H","partial_image_index":2}`),
+		ev("response.completed", `{"type":"response.completed","response":`+completed+`}`),
+	))
+	sink, evs := collect()
+	res, err := testClient(t).Stream(context.Background(), respRoute(f), &Request{Messages: userMsg("x")}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "Answer" || res.Reasoning != "I considered" || res.ID != "resp_1" || res.Usage.InputTokens != 60 {
+		t.Fatalf("%+v", res)
+	}
+	if len(res.ToolCalls) != 1 || res.ToolCalls[0].Arguments != `{"q":1}` {
+		t.Fatalf("%+v", res.ToolCalls)
+	}
+	if len(eventsOf(*evs, EventText)) != 2 || len(eventsOf(*evs, EventReasoning)) != 2 {
+		t.Fatalf("text/reasoning events: %d/%d", len(eventsOf(*evs, EventText)), len(eventsOf(*evs, EventReasoning)))
+	}
+	imgs := eventsOf(*evs, EventImage)
+	if len(imgs) != 1 || !imgs[0].Image.Partial || imgs[0].Image.Index != 2 || string(imgs[0].Image.Data) != "IMG" {
+		t.Fatalf("%+v", imgs)
+	}
+	srv := eventsOf(*evs, EventServerTool)
+	if len(srv) != 1 || srv[0].ServerTool.Type != "web_search" || srv[0].ServerTool.Status != "searching" {
+		t.Fatalf("%+v", srv)
+	}
+	if len(eventsOf(*evs, EventUsage)) != 1 || len(eventsOf(*evs, EventCreated)) != 1 {
+		t.Fatal("usage/created events")
+	}
+	tc := eventsOf(*evs, EventToolCall)
+	if len(tc) != 3 || tc[0].ToolCall.Name != "lookup" || tc[1].ToolCall.Arguments != `{"q"` {
+		t.Fatalf("%+v", tc)
+	}
+}
+
+func TestResponsesStreamWithoutCompletedEvent(t *testing.T) {
+	f := newUpstream(t, sseReply(
+		ev("", `{"type":"response.created","response":{"id":"r"}}`),
+		ev("", `{"type":"response.refusal.delta","delta":"No."}`),
+		ev("", `{"type":"response.custom_tool_call_input.delta","item_id":"c1","delta":"abc"}`),
+		ev("", `{"type":"response.output_item.done","item":{"type":"custom_tool_call","id":"c1","call_id":"cc","name":"raw","input":"abc"}}`),
+	))
+	sink, _ := collect()
+	res, err := testClient(t).Stream(context.Background(), respRoute(f), &Request{Messages: userMsg("x")}, sink)
+	if err != nil || res.Text != "No." || len(res.ToolCalls) != 1 || res.ToolCalls[0].Arguments != `{"input":"abc"}` || res.ToolCalls[0].ID != "cc" {
+		t.Fatalf("%v %+v", err, res)
+	}
+}
+
+func TestResponsesStreamFailed(t *testing.T) {
+	f := newUpstream(t, sseReply(
+		ev("", `{"type":"response.created","response":{"id":"r"}}`),
+		ev("", `{"type":"response.failed","response":{"error":{"message":"quota","code":429}}}`),
+	))
+	sink, _ := collect()
+	_, err := testClient(t).Stream(context.Background(), respRoute(f), &Request{Messages: userMsg("x")}, sink)
+	e, ok := AsError(err)
+	if !ok || e.Status != 429 || e.Message != "quota" || !e.Accepted {
+		t.Fatalf("%+v", e)
+	}
+}
+
+func TestStreamEmptyBody(t *testing.T) {
+	f := newUpstream(t, func(w http.ResponseWriter, r *http.Request, rec recorded) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "")
+	})
+	sink, _ := collect()
+	_, err := testClient(t).Stream(context.Background(), respRoute(f), &Request{Messages: userMsg("x")}, sink)
+	if err == nil || !IsAccepted(err) {
+		t.Fatalf("a stream with no events is an accepted failure: %v", err)
+	}
+}
+
+func TestBackgroundRetrieveAndCancel(t *testing.T) {
+	f := newUpstream(t, jsonReply(okResponses))
+	c := testClient(t)
+	res, err := c.RetrieveResponse(context.Background(), respRoute(f), "resp_1")
+	if err != nil || res.Text != "Answer" {
+		t.Fatalf("%v", err)
+	}
+	r := f.last(t)
+	if r.Method != "GET" || r.Path != "/v1/responses/resp_1" {
+		t.Fatalf("%+v", r)
+	}
+	if _, err := c.CancelResponse(context.Background(), respRoute(f), "resp_1"); err != nil {
+		t.Fatal(err)
+	}
+	r = f.last(t)
+	if r.Method != "POST" || r.Path != "/v1/responses/resp_1/cancel" {
+		t.Fatalf("%+v", r)
+	}
+	if _, err := c.RetrieveResponse(context.Background(), respRoute(f), "../x"); err == nil {
+		t.Fatal("invalid ids are rejected")
+	}
+}
