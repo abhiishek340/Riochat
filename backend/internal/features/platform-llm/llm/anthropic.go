@@ -544,3 +544,268 @@ func anthropicStop(s string) string {
 	}
 	return s
 }
+
+func anthropicServerUsage(usage map[string]any) map[string]int {
+	su, ok := usage["server_tool_use"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := map[string]int{}
+	for k, v := range su {
+		if n, ok := toInt(v); ok && n > 0 {
+			out[normalizeServerToolName(k)] += int(n)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func declaredToolNames(x *exchange) map[string]bool {
+	out := map[string]bool{}
+	if x.req.DisableTools {
+		return out
+	}
+	for _, t := range x.req.Tools {
+		out[t.Name] = true
+	}
+	return out
+}
+
+func undeclaredNative(name string) *Error {
+	return &Error{Kind: KindUpstream, Status: http.StatusBadGateway, Accepted: true,
+		Message: fmt.Sprintf("upstream requested the native tool %q, which was not declared as a client tool; disable this tool for the model", name)}
+}
+
+// scrubEncrypted removes provider-encrypted payloads recursively.
+func scrubEncrypted(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, e := range x {
+			if strings.Contains(strings.ToLower(k), "encrypted") {
+				continue
+			}
+			out[k] = scrubEncrypted(e)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = scrubEncrypted(e)
+		}
+		return out
+	}
+	return v
+}
+
+// ---- streaming ------------------------------------------------------------
+
+type anthropicBlock struct {
+	typ, id, name string
+	input         strings.Builder
+	server        bool
+}
+
+type anthropicStream struct {
+	x        *exchange
+	frames   int
+	res      Result
+	text     strings.Builder
+	think    strings.Builder
+	blocks   map[int]*anthropicBlock
+	order    []int
+	usage    Usage
+	sused    map[string]int
+	srvs     []ServerToolCall
+	cites    []Citation
+	declared map[string]bool
+}
+
+func (anthropicAdapter) stream(x *exchange) streamer {
+	return &anthropicStream{x: x, blocks: map[int]*anthropicBlock{}, declared: declaredToolNames(x)}
+}
+
+func (s *anthropicStream) frame(f sseFrame, emit func(Event) error) error {
+	s.frames++
+	data := strings.TrimSpace(f.Data)
+	if data == "" || data[0] != '{' {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return nil
+	}
+	typ := strOf(m["type"])
+	if typ == "" {
+		typ = f.Event
+	}
+	switch typ {
+	case "message_start":
+		msg, _ := m["message"].(map[string]any)
+		s.res.ID = strOf(msg["id"])
+		if u, ok := msg["usage"].(map[string]any); ok {
+			nu := anthropicUsage(u)
+			mergeUsage(&s.usage, nu)
+			s.mergeServerUsage(u)
+		}
+		return emit(Event{Type: EventCreated, ResponseID: s.res.ID})
+	case "content_block_start":
+		idx64, _ := toInt(m["index"])
+		idx := int(idx64)
+		cb, _ := m["content_block"].(map[string]any)
+		blk := &anthropicBlock{typ: strOf(cb["type"]), id: strOf(cb["id"]), name: strOf(cb["name"])}
+		s.blocks[idx] = blk
+		s.order = append(s.order, idx)
+		switch {
+		case blk.typ == "tool_use":
+			if anthropicServerToolNames[blk.name] && !s.declared[blk.name] {
+				return undeclaredNative(blk.name)
+			}
+			if in, ok := cb["input"].(map[string]any); ok && len(in) > 0 {
+				b, _ := json.Marshal(in)
+				blk.input.WriteString(string(b))
+			}
+			return emit(Event{Type: EventToolCall, Index: idx, ToolCall: &ToolCall{ID: blk.id, Name: blk.name}})
+		case blk.typ == "server_tool_use":
+			blk.server = true
+			sc := ServerToolCall{ID: blk.id, Type: blk.name, Status: "in_progress"}
+			return emit(Event{Type: EventServerTool, ServerTool: &sc})
+		case strings.HasSuffix(blk.typ, "_tool_result"):
+			sc := ServerToolCall{ID: strOf(cb["tool_use_id"]), Type: strings.TrimSuffix(blk.typ, "_tool_result"), Status: "completed"}
+			for _, r := range asList(cb["content"]) {
+				if rm, ok := r.(map[string]any); ok && strOf(rm["url"]) != "" {
+					cit := Citation{URL: strOf(rm["url"]), Title: strOf(rm["title"])}
+					sc.Sources = addCitation(sc.Sources, cit)
+					s.cites = addCitation(s.cites, cit)
+				}
+			}
+			sc.Detail = rawJSON(scrubEncrypted(cb))
+			s.srvs = append(s.srvs, sc)
+			c := sc
+			return emit(Event{Type: EventServerTool, ServerTool: &c})
+		case blk.typ == "text":
+			if t := strOf(cb["text"]); t != "" {
+				s.text.WriteString(t)
+				return emit(Event{Type: EventText, Text: t})
+			}
+		}
+	case "content_block_delta":
+		idx64, _ := toInt(m["index"])
+		idx := int(idx64)
+		d, _ := m["delta"].(map[string]any)
+		blk := s.blocks[idx]
+		switch strOf(d["type"]) {
+		case "text_delta":
+			t := strOf(d["text"])
+			s.text.WriteString(t)
+			if t != "" {
+				return emit(Event{Type: EventText, Text: t})
+			}
+		case "input_json_delta":
+			if blk == nil {
+				return nil
+			}
+			p := strOf(d["partial_json"])
+			blk.input.WriteString(p)
+			if blk.typ == "tool_use" && p != "" {
+				return emit(Event{Type: EventToolCall, Index: idx, ToolCall: &ToolCall{ID: blk.id, Name: blk.name, Arguments: p}})
+			}
+		case "thinking_delta":
+			t := strOf(d["thinking"])
+			s.think.WriteString(t)
+			if t != "" {
+				return emit(Event{Type: EventReasoning, Text: t})
+			}
+		case "signature_delta":
+			s.res.ReasoningSignature = strOf(d["signature"])
+		case "citations_delta":
+			if c, ok := d["citation"].(map[string]any); ok {
+				cit := Citation{URL: strOf(c["url"]), Title: strOf(c["title"])}
+				before := len(s.cites)
+				s.cites = addCitation(s.cites, cit)
+				if len(s.cites) > before {
+					return emit(Event{Type: EventCitation, Citation: &cit})
+				}
+			}
+		default:
+			// Other thinking-type deltas carry their text under "thinking".
+			if t := strOf(d["thinking"]); t != "" {
+				s.think.WriteString(t)
+				return emit(Event{Type: EventReasoning, Text: t})
+			}
+		}
+	case "content_block_stop":
+		idx64, _ := toInt(m["index"])
+		if blk := s.blocks[int(idx64)]; blk != nil && blk.server {
+			sc := ServerToolCall{ID: blk.id, Type: blk.name, Status: "completed"}
+			if in := blk.input.String(); in != "" {
+				sc.Detail = json.RawMessage(in)
+				var im map[string]any
+				if json.Unmarshal([]byte(in), &im) == nil {
+					if q := strOf(im["query"]); q != "" {
+						sc.Queries = []string{q}
+					}
+				}
+			}
+			s.srvs = append(s.srvs, sc)
+			c := sc
+			return emit(Event{Type: EventServerTool, ServerTool: &c})
+		}
+	case "message_delta":
+		if d, ok := m["delta"].(map[string]any); ok {
+			if sr := strOf(d["stop_reason"]); sr != "" {
+				s.res.FinishReason = anthropicStop(sr)
+			}
+		}
+		if u, ok := m["usage"].(map[string]any); ok {
+			mergeUsage(&s.usage, anthropicUsage(u))
+			s.mergeServerUsage(u)
+			cp := s.usage
+			return emit(Event{Type: EventUsage, Usage: &cp})
+		}
+	}
+	return nil
+}
+
+func (s *anthropicStream) mergeServerUsage(u map[string]any) {
+	if su := anthropicServerUsage(u); su != nil {
+		if s.sused == nil {
+			s.sused = map[string]int{}
+		}
+		for k, v := range su {
+			if v > s.sused[k] {
+				s.sused[k] = v
+			}
+		}
+	}
+}
+
+func (s *anthropicStream) result() (*Result, error) {
+	if s.frames == 0 {
+		return &Result{}, &Error{Kind: KindParse, Message: "upstream stream ended before any event", Accepted: true}
+	}
+	res := s.res
+	res.Text = strings.TrimSpace(s.text.String())
+	res.Reasoning = s.think.String()
+	for _, idx := range s.order {
+		blk := s.blocks[idx]
+		if blk.typ != "tool_use" {
+			continue
+		}
+		args := strings.TrimSpace(blk.input.String())
+		if args == "" {
+			args = "{}"
+		}
+		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: blk.id, Name: blk.name, Arguments: args})
+	}
+	res.ServerToolCalls = s.srvs
+	res.Citations = s.cites
+	res.Usage = s.usage
+	res.ServerToolUsage = s.sused
+	if res.FinishReason == "" && len(res.ToolCalls) > 0 {
+		res.FinishReason = "tool_calls"
+	}
+	return &res, nil
+}
