@@ -269,3 +269,278 @@ func (anthropicAdapter) build(x *exchange) (*call, error) {
 	}
 	return cl, nil
 }
+
+func nativeHasPrefix(tools []map[string]any, prefix string) bool {
+	for _, t := range tools {
+		if strings.HasPrefix(nativeToolType(t), prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasHint(m Message) bool {
+	if m.CacheHint {
+		return true
+	}
+	for _, p := range effectiveParts(m) {
+		if p.CacheHint {
+			return true
+		}
+	}
+	return false
+}
+
+// anthropicBlocks renders a message's content blocks, tool results first for
+// user turns and tool calls last for assistant turns, applying cache hints.
+func anthropicBlocks(m Message, b *anthropicBuild, assistant bool) []map[string]any {
+	var blocks []map[string]any
+	type slot struct {
+		blk     map[string]any
+		dynamic bool
+	}
+	var slots []slot
+	add := func(blk map[string]any, dynamic bool) {
+		blocks = append(blocks, blk)
+		slots = append(slots, slot{blk, dynamic})
+	}
+	if !assistant {
+		for _, tr := range m.ToolResults {
+			blk := map[string]any{"type": "tool_result", "tool_use_id": tr.CallID, "content": toolResultOutput(tr)}
+			if tr.IsError {
+				blk["is_error"] = true
+			}
+			add(blk, false)
+		}
+	}
+	for _, p := range effectiveParts(m) {
+		var blk map[string]any
+		if t, ok := partAsText(p); ok {
+			blk = map[string]any{"type": "text", "text": t}
+		} else if assistant {
+			continue
+		} else {
+			switch p.Kind {
+			case PartImage:
+				if len(p.Data) == 0 {
+					continue
+				}
+				blk = map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": imageMIME(p.MIME), "data": b64(p.Data)}}
+			case PartDocument:
+				if len(p.Data) == 0 {
+					continue
+				}
+				blk = map[string]any{"type": "document", "source": map[string]any{"type": "base64", "media_type": "application/pdf", "data": b64(p.Data)}}
+				if strings.TrimSpace(p.FileName) != "" {
+					blk["title"] = p.FileName
+				}
+			default:
+				continue
+			}
+		}
+		add(blk, p.Dynamic)
+		if p.CacheHint && !p.Dynamic {
+			b.mark(blk)
+		}
+	}
+	if assistant {
+		for _, tc := range m.ToolCalls {
+			add(map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": parseArgsObject(tc.Arguments)}, false)
+		}
+	}
+	if m.CacheHint {
+		for i := len(slots) - 1; i >= 0; i-- {
+			if !slots[i].dynamic {
+				if _, done := slots[i].blk["cache_control"]; !done {
+					b.mark(slots[i].blk)
+				}
+				break
+			}
+		}
+	}
+	return blocks
+}
+
+func normalizeAnthropicNative(t map[string]any) map[string]any {
+	nt := cloneJSON(t).(map[string]any)
+	tt := nativeToolType(nt)
+	if def, ok := anthropicNativeNames[tt]; ok {
+		if n, _ := nt["name"].(string); strings.TrimSpace(n) == "" {
+			nt["name"] = def
+		}
+		if strings.HasSuffix(tt, "_20260209") && (strings.HasPrefix(tt, "web_search") || strings.HasPrefix(tt, "web_fetch")) {
+			if _, ok := nt["allowed_callers"]; !ok {
+				nt["allowed_callers"] = []any{"direct"}
+			}
+		}
+	}
+	return nt
+}
+
+func thinkingBudget(budget int64, has bool, maxTokens int64) int64 {
+	b := budget
+	if !has || b < 1024 {
+		b = 1024
+		if maxTokens > 2048 {
+			b = maxTokens / 4
+		}
+	}
+	if b >= maxTokens && maxTokens > 1 {
+		b = maxTokens - 1
+	}
+	return b
+}
+
+func anthropicThinking(o options, maxTokens int64) (map[string]any, error) {
+	budget, hasBudget := o.int("budget_tokens")
+	var th map[string]any
+	if v, ok := o["thinking"]; ok && v != nil {
+		switch t := v.(type) {
+		case map[string]any:
+			th = cloneJSON(t).(map[string]any)
+		case string:
+			typ := strings.ToLower(strings.TrimSpace(t))
+			switch typ {
+			case "enabled":
+				th = map[string]any{"type": "enabled", "budget_tokens": thinkingBudget(budget, hasBudget, maxTokens)}
+			case "":
+			default:
+				th = map[string]any{"type": typ}
+			}
+		case bool:
+			if t {
+				th = map[string]any{"type": "enabled", "budget_tokens": thinkingBudget(budget, hasBudget, maxTokens)}
+			} else {
+				th = map[string]any{"type": "disabled"}
+			}
+		default:
+			return nil, optionError("thinking", "must be an object, a string or a boolean")
+		}
+	} else if en, ok := o.boolean("enable_thinking"); ok {
+		switch {
+		case !en:
+			th = map[string]any{"type": "disabled"}
+		case hasBudget && budget >= 1024:
+			th = map[string]any{"type": "enabled", "budget_tokens": budget}
+		default:
+			th = map[string]any{"type": "adaptive"}
+		}
+	} else if hasBudget && budget >= 1024 {
+		th = map[string]any{"type": "enabled", "budget_tokens": budget}
+	}
+	if th != nil {
+		if d, ok := o.str("thinking_display"); ok && th["type"] != "disabled" {
+			th["display"] = d
+		}
+	}
+	return th, nil
+}
+
+func anthropicToolChoice(v any) (any, bool) {
+	switch t := v.(type) {
+	case string:
+		s := strings.TrimSpace(t)
+		switch strings.ToLower(s) {
+		case "":
+			return nil, false
+		case "auto", "any", "none":
+			return map[string]any{"type": strings.ToLower(s)}, true
+		case "required":
+			return map[string]any{"type": "any"}, true
+		}
+		return map[string]any{"type": "tool", "name": s}, true
+	case map[string]any:
+		return cloneJSON(t), true
+	}
+	return nil, false
+}
+
+// ---- parsing --------------------------------------------------------------
+
+func (anthropicAdapter) parse(x *exchange, body []byte) (*Result, error) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, &Error{Kind: KindParse, Message: "upstream returned an invalid JSON body", Cause: err, Accepted: true}
+	}
+	if t, _ := m["type"].(string); t == "error" {
+		return nil, upstreamFromObject(m, m)
+	}
+	res := &Result{ID: strOf(m["id"])}
+	declared := declaredToolNames(x)
+	var text strings.Builder
+	var think strings.Builder
+	for _, c := range asList(m["content"]) {
+		blk, _ := c.(map[string]any)
+		if blk == nil {
+			continue
+		}
+		typ := strOf(blk["type"])
+		switch {
+		case typ == "text":
+			text.WriteString(strOf(blk["text"]))
+			for _, ct := range asList(blk["citations"]) {
+				if cm, ok := ct.(map[string]any); ok {
+					res.Citations = addCitation(res.Citations, Citation{URL: strOf(cm["url"]), Title: strOf(cm["title"])})
+				}
+			}
+		case typ == "thinking":
+			think.WriteString(strOf(blk["thinking"]))
+			if sig := strOf(blk["signature"]); sig != "" {
+				res.ReasoningSignature = sig
+			}
+		case typ == "tool_use":
+			name := strOf(blk["name"])
+			if anthropicServerToolNames[name] && !declared[name] {
+				return nil, undeclaredNative(name)
+			}
+			args, _ := json.Marshal(blk["input"])
+			if blk["input"] == nil {
+				args = []byte("{}")
+			}
+			res.ToolCalls = append(res.ToolCalls, ToolCall{ID: strOf(blk["id"]), Name: name, Arguments: string(args)})
+		case typ == "server_tool_use":
+			sc := ServerToolCall{ID: strOf(blk["id"]), Type: strOf(blk["name"]), Status: "completed", Detail: rawJSON(stripEncrypted(blk))}
+			if in, ok := blk["input"].(map[string]any); ok {
+				if q := strOf(in["query"]); q != "" {
+					sc.Queries = append(sc.Queries, q)
+				}
+			}
+			res.ServerToolCalls = append(res.ServerToolCalls, sc)
+		case strings.HasSuffix(typ, "_tool_result"):
+			sc := ServerToolCall{ID: strOf(blk["tool_use_id"]), Type: strings.TrimSuffix(typ, "_tool_result"), Status: "completed"}
+			if cm, ok := blk["content"].(map[string]any); ok {
+				if et := strOf(cm["type"]); strings.HasSuffix(et, "_error") {
+					sc.Status = "error"
+				}
+			}
+			for _, r := range asList(blk["content"]) {
+				if rm, ok := r.(map[string]any); ok && strOf(rm["url"]) != "" {
+					cit := Citation{URL: strOf(rm["url"]), Title: strOf(rm["title"])}
+					sc.Sources = addCitation(sc.Sources, cit)
+					res.Citations = addCitation(res.Citations, cit)
+				}
+			}
+			sc.Detail = rawJSON(scrubEncrypted(blk))
+			res.ServerToolCalls = append(res.ServerToolCalls, sc)
+		}
+	}
+	res.Text = strings.TrimSpace(text.String())
+	res.Reasoning = think.String()
+	usage, _ := m["usage"].(map[string]any)
+	res.Usage = anthropicUsage(usage)
+	res.ServerToolUsage = anthropicServerUsage(usage)
+	res.FinishReason = anthropicStop(strOf(m["stop_reason"]))
+	return res, nil
+}
+
+func anthropicStop(s string) string {
+	switch s {
+	case "end_turn", "stop_sequence":
+		return "stop"
+	case "max_tokens":
+		return "length"
+	case "tool_use":
+		return "tool_calls"
+	}
+	return s
+}
