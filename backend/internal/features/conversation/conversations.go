@@ -448,3 +448,220 @@ func (s *service) setConversationProject(ctx context.Context, userID uint, publi
 	c.ProjectID = target
 	return s.conversationDTO(ctx, c)
 }
+
+func (s *service) batchSetProject(ctx context.Context, userID uint, ids []string, projectPublicID string) (int64, error) {
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		clean = append(clean, strings.TrimSpace(id))
+	}
+	uniq := dedupeStrings(clean)
+	if len(clean) == 0 || len(uniq) != len(clean) {
+		return 0, ErrInvalidProject
+	}
+	for _, id := range uniq {
+		if id == "" {
+			return 0, ErrInvalidProject
+		}
+	}
+	var target *uint
+	pid := strings.TrimSpace(projectPublicID)
+	if pid != "" && !strings.EqualFold(pid, "unassigned") {
+		p, err := s.findProject(ctx, userID, pid)
+		if err != nil {
+			return 0, err
+		}
+		target = &p.ID
+	}
+	var updated int64
+	for _, part := range chunk(uniq, 200) {
+		res := s.db.WithContext(ctx).Model(&Conversation{}).Where("user_id = ? AND public_id IN ?", userID, part).
+			UpdateColumns(map[string]any{"project_id": target})
+		if res.Error != nil {
+			return 0, res.Error
+		}
+		updated += res.RowsAffected
+	}
+	if updated != int64(len(uniq)) {
+		return 0, ErrConversationNotFound
+	}
+	return updated, nil
+}
+
+// defaultModelCandidate returns the administrator-chosen default model.
+func (s *service) defaultModelCandidate(ctx context.Context) map[string]any {
+	name := strings.TrimSpace(s.settings(ctx).DefaultNewConversationModel)
+	if name == "" {
+		return map[string]any{"platformModelName": "", "source": "", "usedAt": nil}
+	}
+	return map[string]any{"platformModelName": name, "source": "system_default", "usedAt": nil}
+}
+
+// ----- titles -----
+
+// fallbackTitle derives a short title from message content.
+func fallbackTitle(content string) string {
+	t := trimQuotes(collapseSpaces(content))
+	return strings.TrimSpace(truncateRunes(t, fallbackTitleLen))
+}
+
+func isPlaceholderTitle(title string) bool {
+	t := strings.ToLower(strings.TrimSpace(title))
+	return t == "new chat" || t == "untitled chat" || t == strings.ToLower(placeholderTitle)
+}
+
+var (
+	titleKeyRe = regexp.MustCompile(`(?is)["'\x{201c}\x{2018}]?title["'\x{201d}\x{2019}]?\s*[:=]\s*["'\x{201c}\x{2018}]([^"'\x{201d}\x{2019}\n}]+)`)
+	fenceRe    = regexp.MustCompile("(?s)```[a-zA-Z]*\\s*(.*?)```")
+)
+
+// parseGeneratedTitle extracts a title from a model reply.
+func parseGeneratedTitle(reply string) string {
+	text := strings.TrimSpace(reply)
+	if m := fenceRe.FindStringSubmatch(text); m != nil {
+		text = strings.TrimSpace(m[1])
+	}
+	text = strings.TrimSpace(strings.Trim(text, "`"))
+	var obj struct {
+		Title string `json:"title"`
+	}
+	if json.Unmarshal([]byte(text), &obj) == nil && strings.TrimSpace(obj.Title) != "" {
+		return cleanGeneratedTitle(obj.Title)
+	}
+	if m := titleKeyRe.FindStringSubmatch(text); m != nil {
+		return cleanGeneratedTitle(m[1])
+	}
+	return ""
+}
+
+func cleanGeneratedTitle(t string) string {
+	t = trimQuotes(collapseSpaces(t))
+	return truncateRunes(t, generatedTitleMax)
+}
+
+const truncatedMarker = "...[truncated]"
+
+// titleTranscript renders recent messages for the title prompt, newest first
+// within a token budget, returned oldest to newest.
+func titleTranscript(msgs []Message, budget int) string {
+	var parts []string
+	used := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		line := m.Role + ": " + collapseSpaces(m.Content)
+		cost := estimateTokens(line)
+		if used+cost > budget {
+			remaining := budget - used
+			if remaining > 0 {
+				parts = append(parts, truncateRunes(line, remaining*3)+truncatedMarker)
+			} else if len(parts) == 0 {
+				parts = append(parts, truncateRunes(line, budget*3)+truncatedMarker)
+			}
+			break
+		}
+		used += cost
+		parts = append(parts, line)
+	}
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return strings.Join(parts, "\n")
+}
+
+const builtinTitlePrompt = "Write a short title for the conversation below, in the language the user writes in " +
+	"(at most 15 Chinese characters or 8 English words). Reply with a JSON object only: {\"title\": \"...\"}.\n\n"
+
+func buildTitlePrompt(template, transcript string) string {
+	if strings.TrimSpace(template) == "" {
+		return builtinTitlePrompt + transcript
+	}
+	if strings.Contains(template, "{{MESSAGES}}") {
+		return strings.ReplaceAll(template, "{{MESSAGES}}", transcript)
+	}
+	return template + "\n\n" + transcript
+}
+
+// taskModel picks the model for auxiliary text tasks.
+func (s *service) taskModel(ctx context.Context, conv *Conversation) string {
+	m := strings.TrimSpace(s.settings(ctx).TaskModel)
+	if m == "" || strings.EqualFold(m, "follow") {
+		return conv.ModelName
+	}
+	return m
+}
+
+func (s *service) regenerateTitle(ctx context.Context, userID uint, publicID string) (*ConversationDTO, error) {
+	c, err := s.getConversation(ctx, userID, publicID)
+	if err != nil {
+		return nil, err
+	}
+	var msgs []Message
+	if err := s.db.WithContext(ctx).Where("conversation_id = ? AND role IN ? AND status <> ? AND content <> ''", c.ID, []string{roleUser, roleAssistant}, msgPending).
+		Order("id DESC").Limit(200).Find(&msgs).Error; err != nil {
+		return nil, err
+	}
+	// Restore ascending order for the transcript helper.
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	usable := msgs[:0]
+	for _, m := range msgs {
+		if strings.TrimSpace(m.Content) != "" {
+			usable = append(usable, m)
+		}
+	}
+	if len(usable) == 0 {
+		return nil, ErrNoTitleableContent
+	}
+	title := s.generateTitle(ctx, userID, c, usable)
+	if title == "" {
+		title = fallbackTitleFromMessages(usable)
+	}
+	if title == "" {
+		return nil, ErrNoTitleableContent
+	}
+	if err := s.db.WithContext(ctx).Model(c).Update("title", title).Error; err != nil {
+		return nil, err
+	}
+	c.Title = title
+	return s.conversationDTO(ctx, c)
+}
+
+// fallbackTitleFromMessages implements the documented fallback: the latest user
+// message, else the latest message with content.
+func fallbackTitleFromMessages(msgs []Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == roleUser {
+			if t := fallbackTitle(msgs[i].Content); t != "" {
+				return t
+			}
+		}
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if t := fallbackTitle(msgs[i].Content); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+func (s *service) generateTitle(ctx context.Context, userID uint, c *Conversation, msgs []Message) string {
+	model := s.taskModel(ctx, c)
+	rs := s.settings(ctx)
+	prompt := buildTitlePrompt(rs.TitlePrompt, titleTranscript(msgs, 5000))
+	runID := newRunID()
+	res, err := s.ports.Generator.Generate(ctx, GenerateRequest{
+		Task: taskTitle, UserID: userID, ConversationPublicID: c.PublicID, RunID: runID, Model: model,
+		Messages: []PromptMessage{{Role: roleUser, Content: prompt}},
+	}, func(GenerateEvent) {})
+	if res.Usage.Total() > 0 || res.Billable {
+		_ = s.ports.Billing.ChargeBasicService(ctx, BasicServiceCharge{UserID: userID, ConversationID: c.ID, Service: "title", Usage: res.Usage, Route: res.Route, RunID: runID, LatencyMS: res.TotalLatencyMS})
+	}
+	if err != nil {
+		return ""
+	}
+	return parseGeneratedTitle(res.Content)
+}
+
+func logErr(err error) logx.Field { return logx.Err(err) }
+
+var _ = time.Second
