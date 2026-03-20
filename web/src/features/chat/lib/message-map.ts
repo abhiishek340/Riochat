@@ -138,3 +138,141 @@ export function debugWeight(d: DebugSnapshot): number {
     (Object.keys(d.responseHeaders).length ? 1 : 0)
   );
 }
+
+function findDebugIn(value: unknown, depth = 0): DebugSnapshot[] {
+  if (depth > 6 || !isRecord(value)) return [];
+  const found: DebugSnapshot[] = [];
+  for (const key of ["debug", "upstream_debug", "upstreamDebug"]) {
+    const snap = readDebug(value[key]);
+    if (snap) found.push(snap);
+  }
+  for (const child of Object.values(value)) {
+    if (isRecord(child)) found.push(...findDebugIn(child, depth + 1));
+    else if (Array.isArray(child)) for (const item of child.slice(0, 50)) found.push(...findDebugIn(item, depth + 1));
+  }
+  return found;
+}
+
+function parsePayload(text: string | undefined): unknown {
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Best upstream debug snapshot found in the payloads of a trace. */
+export function bestDebug(trace: ProcessTraceDTO | null | undefined): DebugSnapshot | null {
+  if (!trace) return null;
+  const payloads = [trace.process, trace.tools, trace.upstreamThink, ...(trace.events ?? [])].map((b) => parsePayload(b?.payloadJSON));
+  let best: DebugSnapshot | null = null;
+  for (const p of payloads) {
+    for (const snap of findDebugIn(p)) {
+      if (!best || debugWeight(snap) > debugWeight(best)) best = snap;
+    }
+  }
+  return best;
+}
+
+// --- alerts --------------------------------------------------------------------
+
+export const BLOCKED_BILLED_REASON = "moderation_blocked_upstream_usage";
+
+function billedReason(billing: MessageDTO["billingCost"]): string {
+  if (!billing?.pricingSnapshotJSON) return "";
+  const parsed = parsePayload(billing.pricingSnapshotJSON);
+  return isRecord(parsed) && typeof parsed.billed_reason === "string" ? parsed.billed_reason : "";
+}
+
+export function buildAlert(dto: Pick<MessageDTO, "status" | "errorCode" | "errorMessage" | "errorRequestID" | "moderation" | "billingCost" | "processTrace">): MessageAlert | null {
+  const status = mapStatus(dto.status);
+  if (status === "blocked" || dto.errorCode === "content_moderation.blocked") {
+    const lines: MessageAlert["lines"] = [{ key: "description" }];
+    if (dto.moderation?.eventID) lines.push({ key: "eventId", value: dto.moderation.eventID });
+    if (dto.moderation?.categories?.length) lines.push({ key: "categories", value: dto.moderation.categories.join(", ") });
+    if (billedReason(dto.billingCost) === BLOCKED_BILLED_REASON) lines.push({ key: "billed" });
+    return { kind: "blocked", title: "blocked", lines };
+  }
+  if ((status === "error" || status === "interrupted") && dto.errorMessage.trim()) {
+    return {
+      kind: "interrupted",
+      title: "interrupted",
+      lines: [],
+      message: dto.errorMessage.trim(),
+      errorCode: dto.errorCode || undefined,
+      errorId: dto.errorRequestID || undefined,
+      debug: bestDebug(dto.processTrace),
+    };
+  }
+  return null;
+}
+
+// --- main mapping --------------------------------------------------------------
+
+export function mapMessage(dto: MessageDTO): ChatMessage {
+  const role = mapRole(dto.role);
+  const parentId = dto.parentPublicID?.trim() || null;
+  const sourceId = dto.sourcePublicID?.trim() || null;
+  const branch = dto.branchReason === "retry" || dto.branchReason === "edit" ? (dto.branchReason as BranchReason) : "default";
+  const status = mapStatus(dto.status);
+  const feedback = dto.myFeedback === "up" || dto.myFeedback === "down" ? dto.myFeedback : "";
+  return {
+    key: messageKey(role, dto.runID, dto.publicID),
+    id: dto.publicID,
+    numericId: typeof dto.id === "number" && dto.id > 0 ? dto.id : null,
+    persisted: true,
+    role,
+    parentId,
+    sourceId,
+    branchReason: branch,
+    runId: dto.runID ?? "",
+    content: dto.content ?? "",
+    contentType: dto.contentType || "text",
+    status,
+    attachments: parseAttachments(dto.attachments),
+    usage: {
+      input: numberOr(dto.inputTokens),
+      output: numberOr(dto.outputTokens),
+      cacheRead: numberOr(dto.cacheReadTokens),
+      cacheWrite: numberOr(dto.cacheWriteTokens),
+      reasoning: numberOr(dto.reasoningTokens),
+    },
+    reasoningEffort: normalizeEffort(dto.reasoningEffort),
+    latencyMs: numberOr(dto.latencyMS),
+    model: dto.platformModelName ?? "",
+    errorCode: dto.errorCode ?? "",
+    errorMessage: dto.errorMessage ?? "",
+    errorRequestId: dto.errorRequestID ?? "",
+    feedback,
+    editedAt: dto.editedAt ?? null,
+    createdAt: dto.createdAt,
+    updatedAt: dto.updatedAt,
+    billing: dto.billingCost ?? null,
+    sources: mapSources(dto.knowledgeSources),
+    trace: dto.processTrace ?? null,
+    moderation: dto.moderation ?? null,
+    uiState: sanitizeUiState(dto.uiState),
+    alert: buildAlert(dto),
+  };
+}
+
+/**
+ * Identity key: non-system messages that have a run share a key between the
+ * optimistic and persisted copy of a turn; everything else keys on the id.
+ */
+export function messageKey(role: MessageRole, runId: string | undefined, id: string): string {
+  if (role !== "system" && runId) return `${role}:${runId}`;
+  return `id:${id}`;
+}
+
+export function isSettled(message: ChatMessage): boolean {
+  return message.status !== "pending";
+}
+
+/** A message usable as a parent/source id: persisted, settled and successful. */
+export function isUsableParent(message: ChatMessage): boolean {
+  if (!message.persisted) return false;
+  if (message.status === "success") return true;
+  return message.role === "assistant" && message.status === "interrupted";
+}
