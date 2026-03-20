@@ -293,3 +293,305 @@ func (a *api) listProjects(c *gin.Context) {
 	}
 	httpx.OK(c, items)
 }
+
+func (a *api) createProject(c *gin.Context) {
+	var req createProjectRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	d, err := a.s.createProject(c.Request.Context(), uid(c), req)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "create_conversation_project", "conversation_project", d.PublicID, nil)
+	httpx.OK(c, d)
+}
+
+func (a *api) updateProject(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		a.fail(c, ErrProjectInvalidID)
+		return
+	}
+	var req updateProjectRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	d, err := a.s.updateProject(c.Request.Context(), uid(c), id, req)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "update_conversation_project", "conversation_project", d.PublicID, nil)
+	httpx.OK(c, d)
+}
+
+func (a *api) deleteProject(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		a.fail(c, ErrProjectInvalidID)
+		return
+	}
+	delConvs := queryFlag(c, "delete_conversations")
+	delFiles := delConvs && queryFlag(c, "delete_files")
+	res, err := a.s.deleteProject(c.Request.Context(), uid(c), id, delConvs, delFiles)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "delete_conversation_project", "conversation_project", id,
+		map[string]any{"delete_conversations": delConvs, "delete_files": delFiles, "deleted_file_count": res.DeletedFileCount})
+	httpx.OK(c, res)
+}
+
+type reorderReq struct {
+	ProjectIDs []string `json:"projectIDs" binding:"required,max=200"`
+}
+
+func (a *api) reorderProjects(c *gin.Context) {
+	var req reorderReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	items, err := a.s.reorderProjects(c.Request.Context(), uid(c), req.ProjectIDs)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "reorder_conversation_projects", "conversation_project", "", map[string]any{"count": len(req.ProjectIDs)})
+	httpx.OK(c, items)
+}
+
+// ----- messages -----
+
+func (a *api) listMessages(c *gin.Context) {
+	q := messageListQuery{Page: pagination.FromRequest(c.Request), Tail: c.Query("tail") == "true", Summary: c.Query("trace") == "summary"}
+	if raw, ok := c.GetQuery("before_id"); ok && strings.TrimSpace(raw) != "" {
+		n, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+		if err != nil || n == 0 {
+			a.fail(c, ErrBeforeMessageID)
+			return
+		}
+		id := uint(n)
+		q.BeforeID = &id
+	}
+	total, items, err := a.s.listMessages(c.Request.Context(), uid(c), c.Param("id"), q)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, items)
+}
+
+func (a *api) previewMessages(c *gin.Context) {
+	items, err := a.s.previewMessages(c.Request.Context(), uid(c), c.Param("id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, items)
+}
+
+func (a *api) listRuns(c *gin.Context) {
+	items, total, err := a.s.listRuns(c.Request.Context(), uid(c), c.Param("id"), pagination.FromRequest(c.Request))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, items)
+}
+
+type statusesReq struct {
+	RunIDs []string `json:"runIDs" binding:"required,min=1,max=100,dive,required,max=64"`
+}
+
+func (a *api) runStatuses(c *gin.Context) {
+	raw, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, httpx.DefaultBodyLimit))
+	var req statusesReq
+	if err != nil || json.Unmarshal(raw, &req) != nil || len(httpx.ValidateStruct(&req)) > 0 {
+		a.fail(c, ErrInvalidRunIDs)
+		return
+	}
+	items, err := a.s.runStatuses(c.Request.Context(), uid(c), req.RunIDs)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, items)
+}
+
+type editReq struct {
+	Content string `json:"content" binding:"required"`
+}
+
+func (a *api) editMessage(c *gin.Context) {
+	var req editReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	d, err := a.s.editMessage(c.Request.Context(), uid(c), c.Param("id"), req.Content)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "update_message", "message", d.PublicID, nil)
+	httpx.OK(c, d)
+}
+
+func (a *api) messageTrace(c *gin.Context) {
+	t, err := a.s.messageTrace(c.Request.Context(), uid(c), c.Param("id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"processTrace": t})
+}
+
+type feedbackReq struct {
+	Feedback string `json:"feedback"`
+}
+
+// validFeedbackValue accepts up, down or empty in any letter case.
+func validFeedbackValue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "up", "down":
+		return true
+	}
+	return false
+}
+
+func (a *api) feedback(c *gin.Context) {
+	var req feedbackReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	if !validFeedbackValue(req.Feedback) {
+		httpx.Fail(c, http.StatusBadRequest, apperr.ErrInvalidBody.WithMessage("invalid request body: feedback must be one of: up down").
+			WithDetails(map[string]any{"reason": "validation", "fieldErrors": []httpx.FieldError{
+				{Field: "feedback", Rule: "oneof", Param: "up down", Message: "feedback must be one of: up down"}}}))
+		return
+	}
+	res, err := a.s.setFeedback(c.Request.Context(), uid(c), c.Param("id"), req.Feedback)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "set_message_feedback", "message", res.MessagePublicID, map[string]any{"feedback": res.MyFeedback})
+	httpx.OK(c, res)
+}
+
+func (a *api) deleteMessage(c *gin.Context) {
+	res, err := a.s.deleteMessage(c.Request.Context(), uid(c), c.Param("id"), c.Param("message_id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "delete_message", "message", strings.TrimSpace(c.Param("message_id")),
+		map[string]any{"conversation_id": c.Param("id"), "reparented": res.ReparentedMessageCount})
+	httpx.OK(c, res)
+}
+
+func (a *api) fork(c *gin.Context) {
+	res, err := a.s.forkConversation(c.Request.Context(), uid(c), c.Param("id"), c.Param("message_id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "fork_conversation", "conversation", res.Conversation.PublicID,
+		map[string]any{"source_conversation_id": res.SourceID, "source_message_id": res.MessageID, "message_count": res.CopiedCount})
+	httpx.OK(c, res.Conversation)
+}
+
+// dupBlockKey marks a request that named one block twice. It is never a valid
+// block id, so the service rejects the request as an invalid UI state.
+const dupBlockKey = "\x00duplicate"
+
+// uiBlocks is the blocks object of a UI-state request. Decoding keeps the raw
+// value of every block and records repeated names, which a plain map would
+// silently collapse.
+type uiBlocks map[string]json.RawMessage
+
+func (b *uiBlocks) UnmarshalJSON(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok == nil {
+		*b = nil
+		return nil
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return &json.UnmarshalTypeError{Value: "non-object", Type: reflect.TypeOf(map[string]json.RawMessage{})}
+	}
+	out := uiBlocks{}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, _ := kt.(string)
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return err
+		}
+		if _, seen := out[key]; seen {
+			out[dupBlockKey] = json.RawMessage("{}")
+			continue
+		}
+		out[key] = val
+	}
+	*b = out
+	return nil
+}
+
+type uiStateReq struct {
+	Blocks uiBlocks `json:"blocks" binding:"required,min=1,max=32"`
+}
+
+func (a *api) putUIState(c *gin.Context) {
+	var req uiStateReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	res, err := a.s.putUIState(c.Request.Context(), uid(c), c.Param("id"), c.Param("message_id"), req.Blocks)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, res)
+}
+
+func (a *api) artifact(c *gin.Context) {
+	n, err := strconv.ParseUint(strings.TrimSpace(c.Param("id")), 10, 64)
+	if err != nil || n == 0 {
+		a.fail(c, ErrArtifactInvalidID)
+		return
+	}
+	d, err := a.s.getArtifact(c.Request.Context(), uid(c), uint(n))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, d)
+}
+
+func (a *api) toolCall(c *gin.Context) {
+	runID, ok := validRunParam(c.Param("run_id"))
+	if !ok {
+		a.fail(c, ErrRunInvalidID)
+		return
+	}
+	callID := strings.TrimSpace(c.Param("tool_call_id"))
+	if callID == "" || len(callID) > 255 {
+		a.fail(c, ErrToolCallInvalidID)
+		return
+	}
+	d, err := a.s.toolCallDetail(c.Request.Context(), uid(c), runID, callID)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, d)
+}
