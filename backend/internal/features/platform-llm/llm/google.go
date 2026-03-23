@@ -462,3 +462,238 @@ type googleAcc struct {
 	blocked   string
 	frames    int
 }
+
+func (a *googleAcc) add(m map[string]any, emit func(Event) error) error {
+	a.frames++
+	if id := strOf(m["responseId"]); id != "" && a.id == "" {
+		a.id = id
+		if emit != nil {
+			if err := emit(Event{Type: EventCreated, ResponseID: id}); err != nil {
+				return err
+			}
+		}
+	}
+	if pf, ok := m["promptFeedback"].(map[string]any); ok {
+		if br := strOf(pf["blockReason"]); br != "" {
+			a.blocked = br
+		}
+	}
+	if um, ok := m["usageMetadata"].(map[string]any); ok {
+		mergeUsage(&a.usage, geminiUsage(um))
+		if emit != nil {
+			cp := a.usage
+			if err := emit(Event{Type: EventUsage, Usage: &cp}); err != nil {
+				return err
+			}
+		}
+	}
+	cands := asList(m["candidates"])
+	if len(cands) == 0 {
+		return nil
+	}
+	cand, _ := cands[0].(map[string]any)
+	if fr := strOf(cand["finishReason"]); fr != "" {
+		a.finish = fr
+	}
+	content, _ := cand["content"].(map[string]any)
+	for _, p := range asList(content["parts"]) {
+		part, _ := p.(map[string]any)
+		if part == nil {
+			continue
+		}
+		switch {
+		case part["functionCall"] != nil:
+			fc, _ := part["functionCall"].(map[string]any)
+			args, _ := json.Marshal(fc["args"])
+			if fc["args"] == nil {
+				args = []byte("{}")
+			}
+			tc := ToolCall{ID: firstNonEmpty(strOf(fc["id"]), fmt.Sprintf("call_%d", len(a.tools)+1)),
+				Name: strOf(fc["name"]), Arguments: string(args), ThoughtSignature: strOf(part["thoughtSignature"])}
+			a.tools = append(a.tools, tc)
+			if emit != nil {
+				c := tc
+				if err := emit(Event{Type: EventToolCall, Index: len(a.tools) - 1, ToolCall: &c}); err != nil {
+					return err
+				}
+			}
+		case part["inlineData"] != nil:
+			id, _ := part["inlineData"].(map[string]any)
+			data, err := base64.StdEncoding.DecodeString(strOf(id["data"]))
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			img := Image{Index: len(a.images), Data: data, MIME: firstNonEmpty(strOf(id["mimeType"]), "image/png")}
+			if strings.HasPrefix(strings.ToLower(img.MIME), "image/") {
+				a.images = append(a.images, img)
+				if emit != nil {
+					c := img
+					if err := emit(Event{Type: EventImage, Index: img.Index, Image: &c}); err != nil {
+						return err
+					}
+				}
+			}
+		case part["executableCode"] != nil:
+			a.codeRuns++
+			sc := ServerToolCall{ID: fmt.Sprintf("code_%d", a.codeRuns), Type: "code_execution", Status: "completed", Detail: rawJSON(part["executableCode"])}
+			a.codeCalls = append(a.codeCalls, sc)
+		case part["codeExecutionResult"] != nil:
+			if n := len(a.codeCalls); n > 0 {
+				a.codeCalls[n-1].Detail = rawJSON(map[string]any{"code": json.RawMessage(a.codeCalls[n-1].Detail), "result": part["codeExecutionResult"]})
+			}
+		default:
+			t, hasText := part["text"].(string)
+			if !hasText {
+				continue
+			}
+			if th, _ := part["thought"].(bool); th {
+				a.thought.WriteString(t)
+				if sg := strOf(part["thoughtSignature"]); sg != "" {
+					a.sig = sg
+				}
+				if emit != nil && t != "" {
+					if err := emit(Event{Type: EventReasoning, Text: t}); err != nil {
+						return err
+					}
+				}
+			} else {
+				a.text.WriteString(t)
+				if sg := strOf(part["thoughtSignature"]); sg != "" {
+					a.sig = sg
+				}
+				if emit != nil && t != "" {
+					if err := emit(Event{Type: EventText, Text: t}); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	if gm, ok := cand["groundingMetadata"].(map[string]any); ok {
+		if a.search == nil {
+			a.search = &ServerToolCall{ID: "google_search_1", Type: "google_search", Status: "completed"}
+		}
+		for _, q := range asList(gm["webSearchQueries"]) {
+			a.search.Queries = uniqueAppend(a.search.Queries, strOf(q))
+		}
+		for _, c := range asList(gm["groundingChunks"]) {
+			cm, _ := c.(map[string]any)
+			w, _ := cm["web"].(map[string]any)
+			if w == nil {
+				continue
+			}
+			cit := Citation{URL: strOf(w["uri"]), Title: strOf(w["title"])}
+			a.search.Sources = addCitation(a.search.Sources, cit)
+			before := len(a.cites)
+			a.cites = addCitation(a.cites, cit)
+			if emit != nil && len(a.cites) > before {
+				c := cit
+				if err := emit(Event{Type: EventCitation, Citation: &c}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if um, ok := cand["urlContextMetadata"].(map[string]any); ok {
+		if a.urlCtx == nil {
+			a.urlCtx = &ServerToolCall{ID: "url_context_1", Type: "url_context", Status: "completed"}
+		}
+		for _, u := range asList(um["urlMetadata"]) {
+			if mm, ok := u.(map[string]any); ok {
+				a.urlCtx.Sources = addCitation(a.urlCtx.Sources, Citation{URL: strOf(mm["retrievedUrl"])})
+			}
+		}
+	}
+	return nil
+}
+
+func (a *googleAcc) result(image bool) (*Result, error) {
+	if a.blocked != "" && a.text.Len() == 0 && len(a.tools) == 0 && len(a.images) == 0 {
+		return nil, &Error{Kind: KindUpstream, Status: http.StatusBadRequest, Accepted: true,
+			Message: "the provider blocked the request: " + a.blocked}
+	}
+	res := &Result{ID: a.id, Text: a.text.String(), Reasoning: a.thought.String(), ReasoningSignature: a.sig,
+		ToolCalls: a.tools, Images: a.images, Citations: a.cites, Usage: a.usage}
+	usage := map[string]int{}
+	if a.search != nil {
+		res.ServerToolCalls = append(res.ServerToolCalls, *a.search)
+		n := len(a.search.Queries)
+		if n == 0 {
+			n = 1
+		}
+		usage["google_search"] = n
+	}
+	if a.urlCtx != nil {
+		res.ServerToolCalls = append(res.ServerToolCalls, *a.urlCtx)
+		usage["url_context"] = len(a.urlCtx.Sources)
+		if usage["url_context"] == 0 {
+			usage["url_context"] = 1
+		}
+	}
+	if a.codeRuns > 0 {
+		res.ServerToolCalls = append(res.ServerToolCalls, a.codeCalls...)
+		usage["code_execution"] = a.codeRuns
+	}
+	if len(usage) > 0 {
+		res.ServerToolUsage = usage
+	}
+	switch strings.ToUpper(a.finish) {
+	case "STOP", "":
+		res.FinishReason = "stop"
+	case "MAX_TOKENS":
+		res.FinishReason = "length"
+	default:
+		res.FinishReason = strings.ToLower(a.finish)
+	}
+	if len(res.ToolCalls) > 0 {
+		res.FinishReason = "tool_calls"
+	}
+	if image && res.Text != "" {
+		for i := range res.Images {
+			res.Images[i].RevisedPrompt = strings.TrimSpace(res.Text)
+		}
+		res.RevisedPrompt = strings.TrimSpace(res.Text)
+	}
+	return res, nil
+}
+
+func (googleAdapter) parse(x *exchange, body []byte) (*Result, error) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, &Error{Kind: KindParse, Message: "upstream returned an invalid JSON body", Cause: err, Accepted: true}
+	}
+	if e, ok := m["error"].(map[string]any); ok && e != nil {
+		return nil, upstreamFromObject(m, m)
+	}
+	var acc googleAcc
+	if err := acc.add(m, nil); err != nil {
+		return nil, err
+	}
+	return acc.result(x.proto == GoogleImageGeneration)
+}
+
+type googleStream struct {
+	x   *exchange
+	acc googleAcc
+}
+
+func (googleAdapter) stream(x *exchange) streamer { return &googleStream{x: x} }
+
+func (s *googleStream) frame(f sseFrame, emit func(Event) error) error {
+	data := strings.TrimSpace(f.Data)
+	if data == "" || data[0] != '{' {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return nil
+	}
+	return s.acc.add(m, emit)
+}
+
+func (s *googleStream) result() (*Result, error) {
+	if s.acc.frames == 0 {
+		return &Result{}, &Error{Kind: KindParse, Message: "upstream stream ended before any event", Accepted: true}
+	}
+	return s.acc.result(s.x.proto == GoogleImageGeneration)
+}
