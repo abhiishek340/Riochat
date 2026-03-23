@@ -241,3 +241,266 @@ func TestPreviewMessages(t *testing.T) {
 	}
 	e.expectErr("GET", "/conversations/"+id+"/messages/preview", e.u2, nil, 404, "conversation.not_found")
 }
+
+func TestEditMessage(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	u, a := pair(e.send(e.u1, id, "orig", nil))
+	m := e.ok("PATCH", "/messages/"+str(u, "publicID"), e.u1, map[string]string{"content": "  edited  "})
+	if str(m, "content") != "edited" || m["editedAt"] == nil || str(m, "status") != "success" {
+		t.Fatalf("edit: %v", m)
+	}
+	if got := e.convRow(id).MessageCount; got != 2 {
+		t.Fatalf("no tree change: %d", got)
+	}
+	e.ok("PATCH", "/messages/"+str(a, "publicID"), e.u1, map[string]string{"content": "assistant edit"})
+	e.expectErr("PATCH", "/messages/"+str(u, "publicID"), e.u1, map[string]string{"content": "   "}, 400, "message.invalid_content")
+	e.expectErr("PATCH", "/messages/"+str(u, "publicID"), e.u1, map[string]string{}, 400, "request.invalid_body")
+	e.expectErr("PATCH", "/messages/"+str(u, "publicID"), e.u2, map[string]string{"content": "x"}, 404, "message.not_found")
+	e.expectErr("PATCH", "/messages/zzz", e.u1, map[string]string{"content": "x"}, 404, "message.not_found")
+	conv := e.convRow(id)
+	pend := e.seedMsg(conv, roleAssistant, "", msgPending, nil)
+	e.expectErr("PATCH", "/messages/"+pend.PublicID, e.u1, map[string]string{"content": "x"}, 400, "message.edit_state_invalid")
+	sys := e.seedMsg(conv, roleSystem, "s", msgSuccess, nil)
+	e.expectErr("PATCH", "/messages/"+sys.PublicID, e.u1, map[string]string{"content": "x"}, 400, "message.edit_target_invalid")
+	if e.audit.find("update_message") == nil {
+		t.Fatal("audit")
+	}
+	// a deleted conversation hides its messages
+	e.ok("DELETE", "/conversations/"+id, e.u1, nil)
+	e.expectErr("PATCH", "/messages/"+str(u, "publicID"), e.u1, map[string]string{"content": "x"}, 404, "message.not_found")
+}
+
+func TestFeedback(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	u, a := pair(e.send(e.u1, id, "q", nil))
+	p := "/messages/" + str(a, "publicID") + "/feedback"
+	m := e.ok("PUT", p, e.u1, map[string]string{"feedback": "up"})
+	if str(m, "myFeedback") != "up" || num(m, "thumbsUpCount") != 1 || num(m, "thumbsDownCount") != 0 || str(m, "messagePublicID") != str(a, "publicID") || num(m, "messageID") != num(a, "id") {
+		t.Fatalf("up: %v", m)
+	}
+	m = e.ok("PUT", p, e.u1, map[string]string{"feedback": "DOWN"})
+	if str(m, "myFeedback") != "down" || num(m, "thumbsUpCount") != 0 || num(m, "thumbsDownCount") != 1 {
+		t.Fatalf("down: %v", m)
+	}
+	var n int64
+	e.DB.Model(&Feedback{}).Count(&n)
+	if n != 1 {
+		t.Fatalf("one row per user and message: %d", n)
+	}
+	// another user can read the message? only the owner can access; counts are across users
+	rows := e.list(id)
+	if str(rows[1], "myFeedback") != "down" || num(rows[1], "thumbsDownCount") != 1 {
+		t.Fatalf("enriched feedback: %v", rows[1])
+	}
+	m = e.ok("PUT", p, e.u1, map[string]string{"feedback": ""})
+	if str(m, "myFeedback") != "" || num(m, "thumbsDownCount") != 0 {
+		t.Fatalf("remove: %v", m)
+	}
+	e.DB.Model(&Feedback{}).Count(&n)
+	if n != 0 {
+		t.Fatalf("row removed: %d", n)
+	}
+	e.expectErr("PUT", p, e.u1, map[string]string{"feedback": "meh"}, 400, "request.invalid_body")
+	e.expectErr("PUT", "/messages/"+str(u, "publicID")+"/feedback", e.u1, map[string]string{"feedback": "up"}, 400, "message.feedback_target_invalid")
+	e.expectErr("PUT", p, e.u2, map[string]string{"feedback": "up"}, 404, "message.not_found")
+	if e.audit.find("set_message_feedback") == nil {
+		t.Fatal("audit")
+	}
+}
+
+func TestDeleteMessageSplice(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	conv := e.convRow(id)
+	var prev *Message
+	var chain []*Message
+	for i := 0; i < 5; i++ {
+		role := roleUser
+		if i%2 == 1 {
+			role = roleAssistant
+		}
+		m := e.seedMsg(conv, role, fmt.Sprintf("m%d", i), msgSuccess, prev)
+		chain = append(chain, m)
+		prev = m
+	}
+	// UI state on the target is removed with it
+	e.DB.Create(&UIState{UserID: 1, ConversationID: conv.ID, MessageID: chain[2].ID, BlockID: "b", StateJSON: "{}"})
+	// compaction snapshot covering the deleted message's subtree is dropped; an earlier one is kept
+	e.DB.Create(&ContextRecord{UserID: 1, ConversationID: conv.ID, RecordType: recordSnapshot, CoveredUntilMessageID: chain[3].ID, CoveredUntilPublicID: chain[3].PublicID})
+	e.DB.Create(&ContextRecord{UserID: 1, ConversationID: conv.ID, RecordType: recordSnapshot, CoveredUntilMessageID: chain[0].ID, CoveredUntilPublicID: chain[0].PublicID})
+
+	m := e.ok("DELETE", "/conversations/"+id+"/messages/"+chain[2].PublicID, e.u1, nil)
+	if m["deleted"] != true || num(m, "reparentedMessageCount") != 1 {
+		t.Fatalf("delete: %v", m)
+	}
+	if got := e.convRow(id).MessageCount; got != 4 {
+		t.Fatalf("message count: %d", got)
+	}
+	child := e.msgRow(chain[3].PublicID)
+	if child.ParentMessageID == nil || *child.ParentMessageID != chain[1].ID {
+		t.Fatalf("child must be re-parented to the grandparent: %+v", child.ParentMessageID)
+	}
+	rows := e.list(id)
+	if len(rows) != 4 {
+		t.Fatalf("remaining: %d", len(rows))
+	}
+	var ui int64
+	e.DB.Model(&UIState{}).Count(&ui)
+	if ui != 0 {
+		t.Fatalf("ui state rows must be deleted: %d", ui)
+	}
+	var snaps int64
+	e.DB.Model(&ContextRecord{}).Where("record_type = ?", recordSnapshot).Count(&snaps)
+	if snaps != 1 {
+		t.Fatalf("snapshots after delete: %d", snaps)
+	}
+	// errors
+	e.expectErr("DELETE", "/conversations/"+id+"/messages/"+chain[0].PublicID, e.u1, nil, 400, "conversation.message_delete_root_invalid")
+	pend := e.seedMsg(conv, roleAssistant, "", msgPending, chain[4])
+	e.expectErr("DELETE", "/conversations/"+id+"/messages/"+pend.PublicID, e.u1, nil, 400, "conversation.message_delete_state_invalid")
+	sys := e.seedMsg(conv, roleSystem, "s", msgSuccess, chain[4])
+	e.expectErr("DELETE", "/conversations/"+id+"/messages/"+sys.PublicID, e.u1, nil, 400, "conversation.message_delete_target_invalid")
+	e.expectErr("DELETE", "/conversations/"+id+"/messages/zzz", e.u1, nil, 404, "message.not_found")
+	e.expectErr("DELETE", "/conversations/nope/messages/"+chain[1].PublicID, e.u1, nil, 404, "conversation.not_found")
+	other := e.newConv(e.u1, "o", "")
+	e.expectErr("DELETE", "/conversations/"+other+"/messages/"+chain[1].PublicID, e.u1, nil, 404, "message.not_found")
+	e.expectErr("DELETE", "/conversations/"+id+"/messages/"+chain[1].PublicID, e.u2, nil, 404, "conversation.not_found")
+	// deleting a tail message reparents nothing
+	m = e.ok("DELETE", "/conversations/"+id+"/messages/"+sys.PublicID[:0]+chain[4].PublicID, e.u1, nil)
+	if num(m, "reparentedMessageCount") != 2 {
+		t.Fatalf("two children (pending + system): %v", m)
+	}
+	if e.audit.find("delete_message") == nil {
+		t.Fatal("audit")
+	}
+}
+
+func TestForkConversation(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "Forkable", "gpt-4o")
+	p := newProject(e, e.u1, map[string]any{"name": "proj"})
+	e.ok("PATCH", "/conversations/"+id+"/project", e.u1, map[string]string{"projectID": str(p, "publicID")})
+	e.ok("PATCH", "/conversations/"+id+"/labels", e.u1, map[string]any{"labels": []string{"x"}})
+	us, as := chainMessages(e, e.u1, id, 3)
+	conv := e.convRow(id)
+	// add pending tail so we also check status conversion
+	e.DB.Model(&Message{}).Where("public_id = ?", str(as[1], "publicID")).Updates(map[string]any{"billed_nanousd": 99, "status": msgPending})
+	e.DB.Model(&Message{}).Where("public_id = ?", str(as[1], "publicID")).Update("status", msgSuccess)
+	e.DB.Create(&UIState{UserID: 1, ConversationID: conv.ID, MessageID: uint(num(as[0], "id")), BlockID: "blk", StateJSON: `{"a":1}`})
+
+	e.expectErr("POST", "/conversations/"+id+"/messages/"+str(us[1], "publicID")+"/fork", e.u1, nil, 400, "conversation.message_fork_target_invalid")
+	// fork at depth 4 (assistant of the second turn)
+	m := e.ok("POST", "/conversations/"+id+"/messages/"+str(as[1], "publicID")+"/fork", e.u1, nil)
+	nid := str(m, "publicID")
+	if nid == id || str(m, "title") != "Forkable" || num(m, "messageCount") != 4 || str(m, "status") != "active" ||
+		str(m, "projectID") != str(p, "publicID") || str(m, "labelsJSON") != `["x"]` || str(m, "model") != str(e.ok("GET", "/conversations/"+id, e.u1, nil), "model") {
+		t.Fatalf("forked conversation: %v", m)
+	}
+	if str(m, "sessionKey") == str(e.ok("GET", "/conversations/"+id, e.u1, nil), "sessionKey") {
+		t.Fatal("new session key expected")
+	}
+	if !e.convRow(nid).LabelsManuallyManaged {
+		t.Fatal("manual flag is copied")
+	}
+	rows := e.list(nid)
+	if len(rows) != 4 {
+		t.Fatalf("copied messages: %d", len(rows))
+	}
+	for i, r := range rows {
+		if i == 0 && r["parentMessageID"] != nil {
+			t.Fatalf("root has no parent")
+		}
+		if i > 0 && r["parentMessageID"] != rows[i-1]["id"] {
+			t.Fatalf("chain parent at %d", i)
+		}
+		if str(r, "runID") != "" || str(r, "branchReason") != "default" || r["sourceMessageID"] != nil {
+			t.Fatalf("copied row %d: %v", i, r)
+		}
+		if str(r, "publicID") == str(e.list(id)[i], "publicID") {
+			t.Fatal("new public ids expected")
+		}
+		if _, has := r["billingCost"]; has {
+			t.Fatalf("billing zeroed -> no billing cost: %v", r["billingCost"])
+		}
+	}
+	if str(rows[3], "content") != str(as[1], "content") || num(rows[3], "outputTokens") != 5 {
+		t.Fatalf("content and counters copied: %v", rows[3])
+	}
+	if ui, _ := rows[1]["uiState"].(map[string]any); ui == nil || ui["blk"] == nil {
+		t.Fatalf("ui state cloned: %v", rows[1]["uiState"])
+	}
+	var nb int64
+	e.DB.Model(&Message{}).Where("conversation_id = ? AND billed_nanousd <> 0", e.convRow(nid).ID).Count(&nb)
+	if nb != 0 {
+		t.Fatalf("billing must be zeroed: %d", nb)
+	}
+	// the source is untouched
+	if len(e.list(id)) != 6 || e.convRow(id).MessageCount != 6 {
+		t.Fatal("source changed")
+	}
+	// fork audit
+	a := e.audit.find("fork_conversation")
+	if a == nil || a.Detail["source_conversation_id"] == nil {
+		t.Fatalf("audit: %+v", a)
+	}
+	// pending / unknown / foreign
+	pend := e.seedMsg(conv, roleAssistant, "", msgPending, nil)
+	e.expectErr("POST", "/conversations/"+id+"/messages/"+pend.PublicID+"/fork", e.u1, nil, 400, "conversation.message_fork_state_invalid")
+	e.expectErr("POST", "/conversations/"+id+"/messages/zzz/fork", e.u1, nil, 404, "message.not_found")
+	e.expectErr("POST", "/conversations/"+id+"/messages/"+str(as[0], "publicID")+"/fork", e.u2, nil, 404, "conversation.not_found")
+	e.expectErr("POST", "/conversations/nope/messages/"+str(as[0], "publicID")+"/fork", e.u1, nil, 404, "conversation.not_found")
+}
+
+func TestForkPendingStatusBecomesInterruptedAndHistoryChecks(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	conv := e.convRow(id)
+	u := e.seedMsg(conv, roleUser, "u", msgPending, nil)
+	a := e.seedMsg(conv, roleAssistant, "a", msgSuccess, u)
+	m := e.ok("POST", "/conversations/"+id+"/messages/"+a.PublicID+"/fork", e.u1, nil)
+	rows := e.list(str(m, "publicID"))
+	if str(rows[0], "status") != "interrupted" || str(rows[1], "status") != "success" {
+		t.Fatalf("statuses: %v %v", rows[0]["status"], rows[1]["status"])
+	}
+	// empty status becomes success
+	e2 := e.seedMsg(conv, roleAssistant, "x", "", nil)
+	m = e.ok("POST", "/conversations/"+id+"/messages/"+e2.PublicID+"/fork", e.u1, nil)
+	if rows = e.list(str(m, "publicID")); str(rows[0], "status") != "success" {
+		t.Fatalf("empty status: %v", rows[0]["status"])
+	}
+	// a chain whose first message has a missing parent is incomplete
+	orphanParent := e.seedMsg(conv, roleUser, "p", msgSuccess, nil)
+	child := e.seedMsg(conv, roleAssistant, "c", msgSuccess, orphanParent)
+	e.DB.Delete(orphanParent)
+	e.expectErr("POST", "/conversations/"+id+"/messages/"+child.PublicID+"/fork", e.u1, nil, 400, "conversation.message_fork_history_incomplete")
+	// too deep (> 2000)
+	deep := e.newConv(e.u1, "deep", "")
+	dc := e.convRow(deep)
+	var prev *Message
+	rowsToInsert := make([]Message, 0, 2001)
+	_ = rowsToInsert
+	for i := 0; i < 2001; i++ {
+		role := roleUser
+		if i%2 == 1 {
+			role = roleAssistant
+		}
+		mm := Message{ConversationID: dc.ID, UserID: 1, PublicID: newPublicID(), Role: role, ContentType: "text", Content: "x", Status: msgSuccess, BranchReason: branchDefault, BilledCurrency: "USD"}
+		if prev != nil {
+			pid := prev.ID
+			mm.ParentMessageID = &pid
+		}
+		if err := e.DB.Create(&mm).Error; err != nil {
+			t.Fatal(err)
+		}
+		prev = &mm
+	}
+	last := prev
+	if last.Role != roleUser {
+		t.Fatal("expected user at depth 2001")
+	}
+	asst := Message{ConversationID: dc.ID, UserID: 1, PublicID: newPublicID(), Role: roleAssistant, ContentType: "text", Content: "x", Status: msgSuccess, BranchReason: branchDefault, BilledCurrency: "USD", ParentMessageID: &last.ID}
+	e.DB.Create(&asst)
+	e.expectErr("POST", "/conversations/"+deep+"/messages/"+asst.PublicID+"/fork", e.u1, nil, 400, "conversation.message_fork_history_incomplete")
+}
