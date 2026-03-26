@@ -555,3 +555,266 @@ func (s *service) finishSuccess(ctx context.Context, ps *pendingSend, lr *liveRu
 	s.scheduleMetadata(ctx, ps)
 	return execOutcome{Result: result}
 }
+
+// userPromptTokens charges the prompt to the user message: the upstream's
+// reported input count, or an estimate of the text when none arrived. A
+// message that is only re-answered keeps its first count.
+func (s *service) userPromptTokens(upd map[string]any, ps *pendingSend, res GenerateResult) {
+	if ps.plan.ReuseUser != nil {
+		return
+	}
+	n := res.Usage.Input
+	if n <= 0 {
+		n = int64(estimateTokens(ps.req.Content))
+	}
+	upd["input_tokens"], upd["token_usage"] = n, n
+}
+
+func currencyOr(c string) string {
+	if c == "" {
+		return "USD"
+	}
+	return c
+}
+
+func (s *service) updateConversationModel(tx *gorm.DB, ps *pendingSend, res GenerateResult, now time.Time) error {
+	model := res.Route.PlatformModelName
+	if model == "" {
+		model = ps.model
+	}
+	upd := map[string]any{"updated_at": now}
+	if model != "" && model != ps.conv.ModelName {
+		upd["model"] = model
+	}
+	if res.ResponseID != "" {
+		upd["last_response_id"] = truncateRunes(res.ResponseID, 128)
+	}
+	return tx.Model(&Conversation{}).Where("id = ?", ps.conv.ID).Updates(upd).Error
+}
+
+func errorEvent(f failure, requestID string, data *SendResult) map[string]any {
+	ev := map[string]any{"status": f.Status, "message": f.Message, "errorCode": f.Code}
+	if requestID != "" {
+		ev["requestId"] = requestID
+	}
+	if data != nil {
+		ev["data"] = data
+	}
+	return ev
+}
+
+// reportAlreadyClosed handles a job whose messages were closed elsewhere.
+func (s *service) reportAlreadyClosed(ctx context.Context, ps *pendingSend) execOutcome {
+	f := failure{Status: http.StatusServiceUnavailable, Code: ErrStreamInterrupted.Code, Message: ErrStreamInterrupted.Message}
+	result, _ := s.sendResult(ctx, ps)
+	return execOutcome{Result: result, Fail: &f}
+}
+
+func (s *service) finishFailure(ctx context.Context, ps *pendingSend, lr *liveRun, f failure, res GenerateResult, billable bool, started time.Time) execOutcome {
+	now := s.now()
+	asstStatus, runStatus, userStatus := msgError, runError, msgError
+	switch {
+	case f.Canceled:
+		asstStatus, runStatus, userStatus = msgCanceled, runCanceled, msgSuccess
+	case f.Code == ErrStreamInterrupted.Code, f.Broken && strings.TrimSpace(res.Content) != "":
+		asstStatus, runStatus = msgInterrupted, runInterrupted
+	}
+	var st Settlement
+	if billable {
+		var err error
+		if st, err = s.settle(ctx, ps, res, true); err != nil {
+			s.log.Warn("conversation_failure_settle_failed", logErr(err))
+			billable = false
+		}
+	} else {
+		s.ports.Billing.Release(ctx, ps.reservation)
+	}
+	msg := truncateRunes(f.stored(), 255)
+	applied := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		upd := map[string]any{"status": asstStatus, "error_code": f.Code, "error_message": msg}
+		if strings.TrimSpace(res.Content) != "" {
+			upd["content"] = res.Content
+		}
+		if strings.TrimSpace(res.Reasoning) != "" {
+			upd["reasoning_content"] = res.Reasoning
+		}
+		if billable {
+			upd["token_usage"], upd["input_tokens"], upd["output_tokens"] = res.Usage.Output, 0, res.Usage.Output
+			upd["cache_read_tokens"], upd["cache_write_tokens"], upd["reasoning_tokens"] = res.Usage.CacheRead, res.Usage.CacheWrite, res.Usage.Reasoning
+			upd["billed_currency"], upd["billed_nanousd"], upd["pricing_snapshot"] = currencyOr(st.Currency), st.Nanousd, settlementSnapshot(st)
+		}
+		upd["latency_ms"] = latencyMS(started, now, res.TotalLatencyMS)
+		r := tx.Model(&Message{}).Where("id = ? AND status = ?", ps.asstMsg.ID, msgPending).Updates(upd)
+		if r.Error != nil {
+			return r.Error
+		}
+		if r.RowsAffected == 0 {
+			return nil
+		}
+		applied = true
+		uu := map[string]any{"status": userStatus}
+		if userStatus == msgError {
+			uu["error_code"], uu["error_message"] = f.Code, msg
+		}
+		s.userPromptTokens(uu, ps, res)
+		if err := tx.Model(&Message{}).Where("id = ? AND status IN ?", ps.userMsg.ID, []string{msgPending, msgError}).Updates(uu).Error; err != nil {
+			return err
+		}
+		cols := runRouteColumns(res, ps)
+		cols["status"], cols["ended_at"], cols["error_code"], cols["error_message"] = runStatus, now, f.Code, msg
+		cols["total_latency_ms"] = latencyMS(started, now, res.TotalLatencyMS)
+		if err := tx.Model(&Run{}).Where("run_id = ?", ps.req.RunID).Updates(cols).Error; err != nil {
+			return err
+		}
+		if err := s.persistTrace(tx, ps.req.RunID, res.Trace); err != nil {
+			return err
+		}
+		cu := map[string]any{"updated_at": now}
+		if ps.model != "" && ps.model != ps.conv.ModelName {
+			cu["model"] = ps.model
+		}
+		return tx.Model(&Conversation{}).Where("id = ?", ps.conv.ID).Updates(cu).Error
+	})
+	if err != nil {
+		s.log.Error("conversation_failure_persist_failed", logErr(err))
+	} else if applied {
+		s.persistArtifacts(ctx, ps, res.Trace)
+	}
+	result, _ := s.sendResult(ctx, ps)
+	if result != nil {
+		// A failed run starts no title or label generation.
+		result.MetadataRefreshHint = ""
+	}
+	if !applied && err == nil {
+		// Someone else already closed the pair; report whatever is stored.
+		s.hub.publish(lr, evError, errorEvent(f, ps.requestID, result))
+		return execOutcome{Result: result, Fail: &f, Billable: billable}
+	}
+	s.hub.publish(lr, evError, errorEvent(f, ps.requestID, result))
+	return execOutcome{Result: result, Fail: &f, Billable: billable}
+}
+
+func (s *service) finishBlocked(ctx context.Context, ps *pendingSend, lr *liveRun, v ModerationVerdict, direction string, res GenerateResult, started time.Time) execOutcome {
+	now := s.now()
+	var st Settlement
+	billed := res.Usage.Total() > 0 || res.Billable
+	if billed {
+		var err error
+		if st, err = s.settle(ctx, ps, res, false); err != nil {
+			s.log.Warn("conversation_blocked_settle_failed", logErr(err))
+			billed = false
+		}
+	} else {
+		s.ports.Billing.Release(ctx, ps.reservation)
+	}
+	cats := marshalNoEscape(orEmptyStrings(v.Categories))
+	// An input-side block is labelled on the stream only by the ledger
+	// snapshot after settlement (whether upstream usage happened depends on
+	// timing); an output-side block carries the label immediately.
+	liveReason := v.BilledReason
+	if direction == dirInput {
+		liveReason = ""
+	}
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		upd := map[string]any{
+			"status": msgBlocked, "content": "", "reasoning_content": "", "content_type": "text",
+			"moderation_event_id": v.EventID, "moderation_categories_json": cats,
+			"error_code": BlockedErrorCode, "error_message": BlockedErrorMessage,
+		}
+		if billed {
+			upd["token_usage"], upd["input_tokens"], upd["output_tokens"] = res.Usage.Total(), res.Usage.Input, res.Usage.Output
+			upd["billed_currency"], upd["billed_nanousd"] = currencyOr(st.Currency), st.Nanousd
+			upd["pricing_snapshot"] = snapshotWithReason(settlementSnapshot(st), v.BilledReason)
+		}
+		// The moderation engine may already have withdrawn the pair; the
+		// update is idempotent over pending and blocked rows.
+		r := tx.Model(&Message{}).Where("id = ? AND status IN ?", ps.asstMsg.ID, []string{msgPending, msgBlocked}).Updates(upd)
+		if r.Error != nil {
+			return r.Error
+		}
+		if r.RowsAffected == 0 {
+			return nil
+		}
+		uu := map[string]any{"status": msgSuccess}
+		if direction == dirInput {
+			uu = map[string]any{
+				"status": msgBlocked, "moderation_event_id": v.EventID, "moderation_categories_json": cats,
+				"error_code": BlockedErrorCode, "error_message": BlockedErrorMessage,
+			}
+		}
+		if err := tx.Model(&Message{}).Where("id = ?", ps.userMsg.ID).Updates(uu).Error; err != nil {
+			return err
+		}
+		cols := runRouteColumns(res, ps)
+		cols["status"], cols["ended_at"] = runBlocked, now
+		cols["moderation_state"], cols["moderation_event_id"], cols["moderation_categories_json"] = "blocked", v.EventID, cats
+		cols["total_latency_ms"] = latencyMS(started, now, res.TotalLatencyMS)
+		if err := tx.Model(&Run{}).Where("run_id = ?", ps.req.RunID).Updates(cols).Error; err != nil {
+			return err
+		}
+		return tx.Model(&Conversation{}).Where("id = ?", ps.conv.ID).UpdateColumn("updated_at", now).Error
+	})
+	if err != nil {
+		s.log.Error("conversation_blocked_persist_failed", logErr(err))
+	}
+	result, _ := s.sendResult(ctx, ps)
+	ev := map[string]any{"eventID": v.EventID, "direction": direction, "categories": orEmptyStrings(v.Categories), "data": result}
+	if liveReason != "" {
+		ev["billedReason"] = liveReason
+	}
+	s.hub.publish(lr, evModerationBlocked, ev)
+	return execOutcome{Result: result, Blocked: true, Billable: billed}
+}
+
+// snapshotWithReason adds the billed reason to a pricing snapshot object so a
+// reload can rebuild the billing note of a blocked message.
+func snapshotWithReason(snapshot, reason string) string {
+	if reason == "" {
+		return snapshot
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(snapshot), &m) != nil || m == nil {
+		m = map[string]any{}
+	}
+	m["billedReason"] = reason
+	return marshalNoEscape(m)
+}
+
+func orEmptyStrings(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
+}
+
+// sendResult loads the pair from the database as response objects.
+func (s *service) sendResult(ctx context.Context, ps *pendingSend) (*SendResult, error) {
+	var msgs []Message
+	ids := []uint{ps.userMsg.ID, ps.asstMsg.ID}
+	if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&msgs).Error; err != nil {
+		return nil, err
+	}
+	conv, err := s.conversationByID(ctx, ps.conv.ID)
+	if err != nil {
+		return nil, err
+	}
+	dtos, err := s.enrich(ctx, msgs, enrichOpts{userID: ps.userID, conv: conv, send: true})
+	if err != nil {
+		return nil, err
+	}
+	res := &SendResult{MetadataRefreshHint: ps.hint}
+	for i := range dtos {
+		d := dtos[i]
+		// The vendor label is resolved on later reads, not on the send result.
+		d.ModelVendor, d.ModelIcon = "", ""
+		if d.ID == ps.userMsg.ID {
+			// The send result shows the user message as it was created.
+			d.UpdatedAt = d.CreatedAt
+			res.UserMessage = &d
+		} else {
+			res.AssistantMessage = &d
+		}
+	}
+	return res, nil
+}
