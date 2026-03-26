@@ -453,3 +453,235 @@ type pendingSend struct {
 	created     int
 	hint        string
 }
+
+// prepareSend validates a send request, reserves budget and creates the
+// message pair and run row. Errors are ordinary request errors.
+func (s *service) prepareSend(ctx context.Context, userID uint, isAdmin bool, convPublicID, requestID string, req preparedRequest) (*pendingSend, error) {
+	conv, err := s.getConversation(ctx, userID, convPublicID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.validateRefs(ctx, userID, req); err != nil {
+		if req.InStream && errors.Is(err, ErrKBUnavailable) {
+			return s.rejectedPair(ctx, conv, userID, isAdmin, requestID, req, err), err
+		}
+		return nil, err
+	}
+	files, err := s.resolveFiles(ctx, userID, req.FileIDs)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := s.resolveBranch(ctx, conv, userID, req)
+	if err != nil {
+		return nil, err
+	}
+	model := req.Model
+	if model == "" {
+		model = conv.ModelName
+	}
+	task := taskChat
+	if req.Media != nil {
+		task = req.Media.Kind
+	}
+	if task == taskChat && model != "" && !s.ports.Catalog.ChatModelAvailable(ctx, userID, model) {
+		if pc, ok := s.ports.Catalog.(PricingCatalog); ok && pc.ModelUnpriced(ctx, userID, model) {
+			return nil, ErrPricingRequired
+		}
+		if rc, ok := s.ports.Catalog.(RouteCatalog); ok && req.InStream && !rc.ModelRoutable(ctx, model) {
+			return s.rejectedPair(ctx, conv, userID, isAdmin, requestID, req, ErrModelRouteMissing), ErrModelRouteMissing
+		}
+		return nil, ErrModelAccessDenied
+	}
+	ps := &pendingSend{conv: *conv, userID: userID, isAdmin: isAdmin, requestID: requestID, req: req, plan: plan, files: files, model: model, task: task}
+
+	res, rerr := s.ports.Billing.Reserve(ctx, ReserveRequest{UserID: userID, ConversationID: conv.ID, Model: model, Task: task, RunID: req.RunID})
+	if rerr != nil {
+		// Persist the rejection as an error pair so the conversation shows it.
+		f := classifyFailure(rerr)
+		if _, perr := s.createPair(ctx, ps, true, &f); perr != nil {
+			if apperr.Registered(ErrRunAlreadyExists.Code) && perr == ErrRunAlreadyExists {
+				return nil, perr
+			}
+			s.log.Warn("conversation_rejection_persist_failed", logErr(perr))
+		}
+		return nil, rerr
+	}
+	if err := s.validateTools(ctx, userID, req); err != nil {
+		s.ports.Billing.Release(ctx, res)
+		return nil, err
+	}
+	ps.reservation = res
+	if _, err := s.createPair(ctx, ps, false, nil); err != nil {
+		s.ports.Billing.Release(ctx, res)
+		return nil, err
+	}
+	return ps, nil
+}
+
+// rejectedPair persists the error pair of a send that was refused before any
+// generation started. It returns nil when the pair could not be stored.
+func (s *service) rejectedPair(ctx context.Context, conv *Conversation, userID uint, isAdmin bool, requestID string, req preparedRequest, cause error) *pendingSend {
+	plan, err := s.resolveBranch(ctx, conv, userID, req)
+	if err != nil {
+		return nil
+	}
+	model := req.Model
+	if model == "" {
+		model = conv.ModelName
+	}
+	ps := &pendingSend{conv: *conv, userID: userID, isAdmin: isAdmin, requestID: requestID, req: req, plan: plan, model: model, task: taskChat}
+	f := classifyFailure(cause)
+	if _, err := s.createPair(ctx, ps, true, &f); err != nil {
+		return nil
+	}
+	return ps
+}
+
+// createPair inserts the run, the messages and the attachment rows.
+func (s *service) createPair(ctx context.Context, ps *pendingSend, rejected bool, fail *failure) (*pendingSend, error) {
+	now := s.now()
+	status := msgPending
+	runStatus := runRunning
+	if rejected {
+		status, runStatus = msgError, runError
+	}
+	reuse := ps.plan.ReuseUser != nil
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var parentID *uint
+		if ps.plan.UserParent != nil {
+			var n int64
+			if err := tx.Model(&Message{}).Where("id = ? AND conversation_id = ?", ps.plan.UserParent.ID, ps.conv.ID).Count(&n).Error; err != nil {
+				return err
+			}
+			if n == 0 {
+				return ErrParentDeleted
+			}
+			id := ps.plan.UserParent.ID
+			parentID = &id
+		}
+		var effort *string
+		if ps.req.ReasoningEffort != "" {
+			e := ps.req.ReasoningEffort
+			effort = &e
+		}
+		run := Run{
+			RunID: ps.req.RunID, RequestID: ps.requestID, UserID: ps.userID, ConversationID: ps.conv.ID, TaskType: ps.task,
+			Provider: "internal", RequestedModelName: ps.model, ReasoningEffort: effort,
+			Status: runStatus, ModerationState: "not_required", StartedAt: now,
+		}
+		if rejected {
+			run.EndedAt = &now
+			run.ErrorCode, run.ErrorMessage = fail.Code, truncateRunes(fail.Message, 255)
+		}
+		if err := tx.Create(&run).Error; err != nil {
+			if database.IsDuplicate(database.Translate(err)) {
+				return ErrRunAlreadyExists
+			}
+			return err
+		}
+		if reuse {
+			ps.userMsg = *ps.plan.ReuseUser
+		} else {
+			um := Message{
+				ConversationID: ps.conv.ID, UserID: ps.userID, PublicID: newPublicID(), ParentMessageID: parentID,
+				RunID: ps.req.RunID, Role: roleUser, ContentType: ps.req.ContentType, Content: ps.req.Content,
+				BranchReason: ps.plan.Reason, BilledCurrency: "USD", Status: status, ReasoningEffort: effort,
+			}
+			if ps.plan.Source != nil {
+				um.SourceMessageID = &ps.plan.Source.ID
+			}
+			if rejected {
+				um.ErrorCode, um.ErrorMessage = fail.Code, truncateRunes(fail.Message, 255)
+			}
+			if err := tx.Create(&um).Error; err != nil {
+				return err
+			}
+			ps.userMsg = um
+			for _, f := range ps.files {
+				if err := tx.Create(&Attachment{
+					ConversationID: ps.conv.ID, MessageID: um.ID, UserID: ps.userID, FileID: f.FileID, Kind: attachmentKind(f.FileCategory),
+					FileName: f.FileName, MimeType: f.DetectedMIME, FileSize: f.SizeBytes, SHA256: f.SHA256,
+					StoragePath: f.StoragePath, Status: "active", UploadedAt: &f.CreatedAt,
+				}).Error; err != nil {
+					return err
+				}
+			}
+		}
+		umID := ps.userMsg.ID
+		am := Message{
+			ConversationID: ps.conv.ID, UserID: ps.userID, PublicID: newPublicID(), ParentMessageID: &umID,
+			RunID: ps.req.RunID, Role: roleAssistant, ContentType: "text", BranchReason: branchDefault,
+			BilledCurrency: "USD", Status: status, ReasoningEffort: effort,
+		}
+		if ps.plan.Source != nil {
+			// A branch makes both new messages carry its reason.
+			am.BranchReason = ps.plan.Reason
+		}
+		if reuse {
+			am.SourceMessageID = &ps.plan.Source.ID
+		}
+		if rejected {
+			am.ErrorCode, am.ErrorMessage = fail.Code, truncateRunes(fail.Message, 255)
+		}
+		if err := tx.Create(&am).Error; err != nil {
+			return err
+		}
+		ps.asstMsg = am
+		ps.created = 2
+		if reuse {
+			ps.created = 1
+		}
+		upd := map[string]any{"message_count": gorm.Expr("message_count + ?", ps.created), "updated_at": now}
+		return tx.Model(&Conversation{}).Where("id = ?", ps.conv.ID).Updates(upd).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	ps.conv.MessageCount += ps.created
+	if !rejected {
+		s.applyFallbackTitle(ctx, ps)
+	}
+	return ps, nil
+}
+
+// applyFallbackTitle stores the immediate title for placeholder titles and
+// decides the metadata refresh hint.
+func (s *service) applyFallbackTitle(ctx context.Context, ps *pendingSend) {
+	first := s.firstUserContent(ctx, ps)
+	titleCand := isPlaceholderTitle(ps.conv.Title)
+	if titleCand {
+		if t := fallbackTitle(first); t != "" {
+			if err := s.db.WithContext(ctx).Model(&Conversation{}).Where("id = ?", ps.conv.ID).UpdateColumn("title", t).Error; err == nil {
+				ps.conv.Title = t
+			}
+		}
+	}
+	switch {
+	case strings.TrimSpace(first) == "":
+		ps.hint = "skipped_no_titleable_content"
+	default:
+		wantTitle := s.userFlag(ctx, ps.userID, "chat.auto_generate_title") && s.isReplaceableTitle(ps.conv.Title, first)
+		wantLabels := s.userFlag(ctx, ps.userID, "chat.auto_generate_labels") && !ps.conv.LabelsManuallyManaged && len(parseStringList(ps.conv.LabelsJSON)) == 0
+		if wantTitle || wantLabels {
+			ps.hint = "pending"
+		} else {
+			ps.hint = "not_needed"
+		}
+	}
+}
+
+func (s *service) isReplaceableTitle(title, firstContent string) bool {
+	return isPlaceholderTitle(title) || (strings.TrimSpace(title) != "" && title == fallbackTitle(firstContent))
+}
+
+// firstUserContent returns the content of the conversation's first user turn.
+func (s *service) firstUserContent(ctx context.Context, ps *pendingSend) string {
+	var m Message
+	err := s.db.WithContext(ctx).Where("conversation_id = ? AND role = ? AND TRIM(content) <> ''", ps.conv.ID, roleUser).Order("id ASC").First(&m).Error
+	if err != nil {
+		return ps.req.Content
+	}
+	return m.Content
+}
+
+var _ = json.Marshal
