@@ -230,3 +230,249 @@ type BasicServiceCharge struct {
 	RunID          string
 	LatencyMS      int64
 }
+
+// Billing authorises and settles generation usage.
+type Billing interface {
+	Reserve(ctx context.Context, req ReserveRequest) (Reservation, error)
+	Settle(ctx context.Context, res Reservation, req SettleRequest) (Settlement, error)
+	Release(ctx context.Context, res Reservation)
+	ChargeBasicService(ctx context.Context, c BasicServiceCharge) error
+}
+
+// Moderation directions.
+const (
+	dirInput  = "input"
+	dirOutput = "output"
+)
+
+// ModerationImage is an image carried inside the request itself (temporary
+// chat); it has no stored file.
+type ModerationImage struct {
+	Name  string
+	Bytes []byte
+}
+
+// ModerationRequest is one content check.
+type ModerationRequest struct {
+	UserID         uint
+	ConversationID uint
+	Direction      string
+	Text           string
+	Ephemeral      bool
+	// Images are checked together with the text of an ephemeral input check.
+	Images []ModerationImage
+}
+
+// ModerationVerdict is the outcome of a content check.
+type ModerationVerdict struct {
+	Blocked      bool
+	EventID      string
+	Direction    string
+	Categories   []string
+	BilledReason string
+}
+
+// Moderation checks content.
+type Moderation interface {
+	Check(ctx context.Context, req ModerationRequest) (ModerationVerdict, error)
+}
+
+// ModerationBegin identifies a persisted turn whose moderation is tracked
+// across the whole run.
+type ModerationBegin struct {
+	UserID          uint
+	ConversationID  uint
+	RunID           string
+	MessageID       uint
+	MessagePublicID string
+	// PaidReservation marks a turn whose upstream usage is billed.
+	PaidReservation bool
+	// CancelGeneration stops the upstream generation; the engine calls it at
+	// most once, as soon as an input check hits.
+	CancelGeneration func()
+}
+
+// ModerationFile names a stored file attached to the user turn.
+type ModerationFile struct {
+	// ObjectID is the internal file row id.
+	ObjectID uint
+	// SHA256 is the stored content hash used to check identical files once.
+	SHA256 string
+}
+
+// ModerationOutput is what the model produced.
+type ModerationOutput struct {
+	Text      string
+	Reasoning string
+	// Images are the generated image files, with their bytes.
+	Images []ModerationImage
+}
+
+// ModerationSession tracks the moderation of one persisted run. Input checks
+// are queued while the model generates; Finish waits for every check and
+// settles the turn. A session is closed with Close when abandoned.
+type ModerationSession interface {
+	CheckInputText(text string)
+	CheckInputImages(files []ModerationFile)
+	// ReportOutputImageFailure records a reply image whose bytes cannot be
+	// loaded; it never counts as a pass.
+	ReportOutputImageFailure(ctx context.Context)
+	// Finish runs the output checks and returns the verdict. The engine has
+	// already tried to persist a block; the caller still records billing.
+	Finish(ctx context.Context, out ModerationOutput) ModerationVerdict
+	Close()
+}
+
+// SessionModeration is implemented by a Moderation that can track a run: it
+// checks stored images, withdraws a blocked turn by itself and recovers runs
+// left half-moderated by a crash. Moderation implementations without it are
+// used through Check, which only sees text.
+type SessionModeration interface {
+	Moderation
+	Begin(ctx context.Context, b ModerationBegin) ModerationSession
+}
+
+// ObjectBytes keeps the bytes of chat files. The integrator hands in the
+// shared object store (local disk or S3-compatible); without one the area
+// writes below the local storage root. Keys never carry a leading slash.
+type ObjectBytes interface {
+	Put(ctx context.Context, key string, data []byte, contentType string) error
+	// Get returns ErrObjectNotFound for a missing key.
+	Get(ctx context.Context, key string) ([]byte, error)
+	// Delete succeeds for a missing key.
+	Delete(ctx context.Context, key string) error
+}
+
+// ErrObjectNotFound is what ObjectBytes.Get answers for a missing key.
+var ErrObjectNotFound = errors.New("conversation: object not found")
+
+// Catalog answers questions about the model catalog.
+type Catalog interface {
+	// ChatModelAvailable reports whether the model is active, supports chat and
+	// may be used by the user.
+	ChatModelAvailable(ctx context.Context, userID uint, model string) bool
+}
+
+// RuntimeSettings is the snapshot of administrator-controlled settings the
+// area reads.
+type RuntimeSettings struct {
+	DefaultNewConversationModel string
+	TaskModel                   string
+	TitlePrompt                 string
+	LabelsPrompt                string
+	UIComponentsEnabled         bool
+	KnowledgeBaseEnabled        bool
+	MaxUploadBytes              int64
+	// UserStorageQuotaBytes is the default per-user storage allowance (0 =
+	// unlimited).
+	UserStorageQuotaBytes       int64
+	MaxMessageFiles             int
+	MaxSelectedTools            int
+	MaxLLMCalls                 int
+	ContextMaxTurns             int
+	ContextCompactionEnabled    bool
+	ContextWindowFallbackTokens int
+	ContextCompactTriggerPct    int
+	ContextPreserveRecentTurns  int
+	ImageMaxBytes               int64
+	DocMaxBytes                 int64
+	AllowedMIMETypes            []string
+	FullContextMaxBytes         int64
+	FullContextMaxTokens        int
+	FullContextPDFMaxPages      int
+	RAGAvailable                bool
+	RAGAvailabilityReason       string
+	// ContextTokenBudgetEnabled switches on the context-token budget rule of
+	// the retrieval plan (large attachments are searched instead of injected).
+	ContextTokenBudgetEnabled bool
+	// ContextArtifactRetentionDays is how long evidence rows live (0 = never
+	// expire).
+	ContextArtifactRetentionDays int
+}
+
+// Settings supplies runtime and per-user settings.
+type Settings interface {
+	Runtime(ctx context.Context) RuntimeSettings
+	// UserSetting returns a per-user setting; ok is false when it is not set.
+	UserSetting(ctx context.Context, userID uint, key string) (value string, ok bool, err error)
+}
+
+// AuditEntry is one audit record.
+type AuditEntry struct {
+	UserID     uint
+	RequestID  string
+	ClientIP   string
+	UserAgent  string
+	Action     string
+	Resource   string
+	ResourceID string
+	Detail     map[string]any
+}
+
+// Auditor records audit entries. Failures never fail a request.
+type Auditor interface {
+	Record(ctx context.Context, e AuditEntry) error
+}
+
+// Capabilities validates references to other areas' resources.
+type Capabilities interface {
+	// ValidateMCPTools checks that the tools exist, are active, belong to active
+	// servers and include at most one image-attachment processor.
+	ValidateMCPTools(ctx context.Context, userID uint, toolIDs []uint) error
+	// ValidateSkills checks that every skill is visible to the user.
+	ValidateSkills(ctx context.Context, userID uint, skillIDs []uint) error
+	// ValidateKnowledgeBases checks visibility and that each has a ready file.
+	ValidateKnowledgeBases(ctx context.Context, userID uint, ids []string) error
+	// FileInUse reports whether another area (avatar, knowledge base) uses the file.
+	FileInUse(ctx context.Context, userID uint, fileID string) (bool, error)
+}
+
+// Ports groups the collaborators. Nil members get the defaults.
+type Ports struct {
+	Generator    Generator
+	Billing      Billing
+	Moderation   Moderation
+	Catalog      Catalog
+	Settings     Settings
+	Auditor      Auditor
+	Capabilities Capabilities
+	// OnFiles, when set, receives the chat-file store once the area is mounted
+	// so the integrator can adapt it for other areas.
+	OnFiles func(*Files)
+	// Objects stores file bytes; nil keeps them on the local storage root.
+	Objects ObjectBytes
+	// OnModeration, when set, receives the bridge through which the moderation
+	// engine reaches runs, messages, files and the live streams.
+	OnModeration func(*ModerationBridge)
+	// Indexer builds and tracks the retrieval index of files. Without it files
+	// are never offered for vectorization.
+	Indexer FileIndexer
+	// Knowledge plans and runs retrieval for a chat turn. Without it
+	// attachments are always injected in full and knowledge bases are ignored.
+	Knowledge Knowledge
+}
+
+func (p Ports) withDefaults(log *logx.Logger) Ports {
+	if p.Generator == nil {
+		p.Generator = unconfiguredGenerator{}
+	}
+	if p.Billing == nil {
+		p.Billing = noBilling{}
+	}
+	if p.Moderation == nil {
+		p.Moderation = noModeration{}
+	}
+	if p.Catalog == nil {
+		p.Catalog = openCatalog{}
+	}
+	if p.Settings == nil {
+		p.Settings = defaultSettings{}
+	}
+	if p.Auditor == nil {
+		p.Auditor = logAuditor{log: log}
+	}
+	if p.Capabilities == nil {
+		p.Capabilities = permissiveCapabilities{}
+	}
+	return p
+}
