@@ -476,3 +476,229 @@ func (p Ports) withDefaults(log *logx.Logger) Ports {
 	}
 	return p
 }
+
+// DefaultRuntimeSettings returns the documented defaults.
+func DefaultRuntimeSettings() RuntimeSettings {
+	return RuntimeSettings{
+		TaskModel:                   "follow",
+		UIComponentsEnabled:         true,
+		KnowledgeBaseEnabled:        true,
+		MaxUploadBytes:              20 * 1024 * 1024,
+		UserStorageQuotaBytes:       100 * 1024 * 1024,
+		MaxMessageFiles:             10,
+		MaxSelectedTools:            32,
+		MaxLLMCalls:                 5,
+		ContextMaxTurns:             40,
+		ContextCompactionEnabled:    true,
+		ContextWindowFallbackTokens: 128000,
+		ContextCompactTriggerPct:    80,
+		ContextPreserveRecentTurns:  6,
+		ImageMaxBytes:               10 * 1024 * 1024,
+		DocMaxBytes:                 20 * 1024 * 1024,
+		FullContextMaxBytes:         2 * 1024 * 1024,
+		FullContextMaxTokens:        100000,
+		FullContextPDFMaxPages:      100,
+		RAGAvailable:                false,
+		RAGAvailabilityReason:       "embedding_not_configured",
+	}
+}
+
+// ----- defaults -----
+
+type unconfiguredGenerator struct{}
+
+func (unconfiguredGenerator) Generate(context.Context, GenerateRequest, func(GenerateEvent)) (GenerateResult, error) {
+	return GenerateResult{}, ErrModelRouteMissing
+}
+
+type noBilling struct{}
+
+func (noBilling) Reserve(context.Context, ReserveRequest) (Reservation, error) {
+	return Reservation{Mode: "self"}, nil
+}
+
+func (noBilling) Settle(context.Context, Reservation, SettleRequest) (Settlement, error) {
+	return Settlement{Mode: "self", Currency: "USD"}, nil
+}
+func (noBilling) Release(context.Context, Reservation)                         {}
+func (noBilling) ChargeBasicService(context.Context, BasicServiceCharge) error { return nil }
+
+type noModeration struct{}
+
+func (noModeration) Check(context.Context, ModerationRequest) (ModerationVerdict, error) {
+	return ModerationVerdict{}, nil
+}
+
+type openCatalog struct{}
+
+func (openCatalog) ChatModelAvailable(_ context.Context, _ uint, model string) bool {
+	return strings.TrimSpace(model) != ""
+}
+
+type defaultSettings struct{}
+
+func (defaultSettings) Runtime(context.Context) RuntimeSettings { return DefaultRuntimeSettings() }
+func (defaultSettings) UserSetting(context.Context, uint, string) (string, bool, error) {
+	return "", false, nil
+}
+
+type logAuditor struct{ log *logx.Logger }
+
+func (a logAuditor) Record(_ context.Context, e AuditEntry) error {
+	if a.log != nil {
+		a.log.Info("conversation_audit", logx.F("action", e.Action), logx.F("resource", e.Resource), logx.F("resource_id", e.ResourceID), logx.F("user_id", e.UserID))
+	}
+	return nil
+}
+
+type permissiveCapabilities struct{}
+
+func (permissiveCapabilities) ValidateMCPTools(context.Context, uint, []uint) error { return nil }
+func (permissiveCapabilities) ValidateSkills(context.Context, uint, []uint) error   { return nil }
+func (permissiveCapabilities) ValidateKnowledgeBases(context.Context, uint, []string) error {
+	return nil
+}
+func (permissiveCapabilities) FileInUse(context.Context, uint, string) (bool, error) {
+	return false, nil
+}
+
+// timeOrZero is a tiny helper shared by DTO builders.
+func timePtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// ----- retrieval index ports -----
+
+// FileFacts are the stored facts of a file the indexer decides on.
+type FileFacts struct {
+	ObjectID         uint
+	FileID           string
+	UserID           uint
+	FileName         string
+	MimeType         string
+	DetectedMIME     string
+	FileCategory     string
+	StoragePath      string
+	Status           string
+	ProcessingStatus string
+	ProcessingReady  bool
+	ExtractStatus    string
+	EmbedStatus      string
+	EmbedSignature   string
+	ChunkCount       int
+	RAGOptOut        bool
+	UpdatedAt        time.Time
+}
+
+func factsOf(f FileObject) FileFacts {
+	return FileFacts{
+		ObjectID: f.ID, FileID: f.FileID, UserID: f.UserID, FileName: f.FileName, MimeType: f.MimeType, DetectedMIME: f.DetectedMIME,
+		FileCategory: f.FileCategory, StoragePath: f.StoragePath, Status: f.Status, ProcessingStatus: f.ProcessingStatus,
+		ProcessingReady: f.ProcessingReady, ExtractStatus: f.ExtractStatus, EmbedStatus: f.EmbedStatus,
+		EmbedSignature: f.EmbedSignature, ChunkCount: f.ChunkCount, RAGOptOut: f.RAGOptOut, UpdatedAt: f.UpdatedAt,
+	}
+}
+
+// FileIndexer is the retrieval index of files (owned by another area).
+type FileIndexer interface {
+	// Submit queues the caller's files for indexing. It returns typed errors
+	// (embedding.service_not_configured, ...) that are passed through.
+	Submit(ctx context.Context, userID uint, fileIDs []string) (*EmbeddingSubmission, error)
+	// Vectorization says whether a submission of the file would be accepted
+	// and, when not, why.
+	Vectorization(ctx context.Context, f FileFacts) (bool, string)
+	// TextReady is called when text processing of a stored file finished; the
+	// indexer starts the background index when auto-indexing applies.
+	TextReady(ctx context.Context, fileObjID uint)
+	// Forget deletes the index data of a file inside the caller's transaction.
+	Forget(ctx context.Context, tx *gorm.DB, fileObjID uint) error
+	// Clone copies the index of one file to another inside the transaction.
+	Clone(ctx context.Context, tx *gorm.DB, fromID, toID uint) error
+}
+
+// KnowledgeFile is one file offered to retrieval for a turn.
+type KnowledgeFile struct {
+	ObjectID        uint
+	FileID          string
+	Name            string
+	Category        string
+	SHA256          string
+	RAGOptOut       bool
+	EmbedStatus     string
+	ExtractStatus   string
+	ChunkCount      int
+	UpdatedAt       time.Time
+	ProcessingReady bool
+	Text            string
+	TextTokens      int
+	FullContextOK   bool
+	CurrentTurn     bool
+	Generated       bool
+	Attached        bool
+}
+
+// KnowledgeRequest describes a turn for the retrieval plan.
+type KnowledgeRequest struct {
+	UserID               uint
+	Message              string
+	PriorUserMessages    []string
+	FileMode             string
+	ContextBudgetFeature bool
+	ContextBudgetTokens  int
+	Files                []KnowledgeFile
+	KnowledgeBaseIDs     []string
+	Ephemeral            bool
+	// Searching reports the "searching" progress event.
+	Searching func()
+}
+
+// KnowledgeAttach names an image whose original must join the turn.
+type KnowledgeAttach struct {
+	FileID string
+	Name   string
+}
+
+// KnowledgeTrace is the retrieval section of the message process trace.
+type KnowledgeTrace struct {
+	Title       string
+	Summary     string
+	Detail      string
+	Status      string
+	PayloadJSON string
+}
+
+// KnowledgeResult is what retrieval contributes to the turn.
+type KnowledgeResult struct {
+	Ran       bool
+	Context   string
+	Inline    map[string]bool
+	Retrieved map[string]bool
+	Attach    []KnowledgeAttach
+	Sources   []KnowledgeSource
+	Artifacts []ContextArtifactInput
+	Trace     *KnowledgeTrace
+	Status    string
+	Reason    string
+}
+
+// Knowledge plans and runs retrieval for a turn. It returns the conversation
+// area's own typed errors (knowledge_base.unavailable, ...), which abort the
+// send.
+type Knowledge interface {
+	Prepare(ctx context.Context, req KnowledgeRequest) (KnowledgeResult, error)
+}
+
+// PricingCatalog is implemented by catalogs that can tell a model hidden for
+// want of a price from one that is not offered at all.
+type PricingCatalog interface {
+	ModelUnpriced(ctx context.Context, userID uint, model string) bool
+}
+
+// RouteCatalog is implemented by catalogs that can tell a model that does not
+// exist (or is switched off) from one the caller may not use.
+type RouteCatalog interface {
+	ModelRoutable(ctx context.Context, model string) bool
+}
