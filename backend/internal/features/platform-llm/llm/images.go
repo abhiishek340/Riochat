@@ -281,3 +281,251 @@ func buildOpenRouterImages(x *exchange) (*call, error) {
 	}
 	return jsonCall(http.MethodPost, u, body)
 }
+
+func sanitizeORProvider(p map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, k := range []string{"only", "order", "ignore"} {
+		if l, ok := p[k].([]any); ok {
+			out[k] = cloneJSON(l)
+		}
+	}
+	if b, ok := p["allow_fallbacks"].(bool); ok {
+		out["allow_fallbacks"] = b
+	}
+	if m, ok := p["options"].(map[string]any); ok {
+		out["options"] = cloneJSON(m)
+	}
+	switch s := p["sort"].(type) {
+	case string:
+		if orSortNames[s] {
+			out["sort"] = s
+		}
+	case map[string]any:
+		by := strOf(s["by"])
+		if orSortNames[by] {
+			sort := map[string]any{"by": by}
+			if part := strOf(s["partition"]); part == "model" || part == "none" {
+				sort["partition"] = part
+			}
+			out["sort"] = sort
+		}
+	}
+	return out
+}
+
+func buildXAIImages(x *exchange) (*call, error) {
+	o := x.opts
+	prompt, err := requirePrompt(x)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{"model": x.model, "prompt": prompt}
+	if s, ok := o.str("response_format"); ok && (s == "url" || s == "b64_json") {
+		body["response_format"] = s
+	}
+	if s, ok := o.str("aspect_ratio"); ok {
+		body["aspect_ratio"] = s
+	}
+	if s, ok := o.str("resolution"); ok {
+		body["resolution"] = s
+	}
+	if n, ok := o.positiveInt("n"); ok {
+		body["n"] = n
+	}
+	path := "/images/generations"
+	if x.proto == XAIImageEdits {
+		path = "/images/edits"
+		imgs := inputImages(x.req.Messages)
+		if len(imgs) == 0 {
+			return nil, invalid(ErrInvalidRequest, "image edit requires at least one input image")
+		}
+		if len(imgs) > xaiMaxEditImages {
+			return nil, invalid(ErrInvalidRequest, "xai image edits accept at most %d input images", xaiMaxEditImages)
+		}
+		ref := func(p Part) map[string]any {
+			return map[string]any{"url": dataURL(imageMIME(p.MIME), p.Data), "type": "image_url"}
+		}
+		if len(imgs) == 1 {
+			body["image"] = ref(imgs[0])
+		} else {
+			arr := make([]any, len(imgs))
+			for i, p := range imgs {
+				arr[i] = ref(p)
+			}
+			body["images"] = arr
+		}
+	}
+	u, err := x.apiURL("v1", path)
+	if err != nil {
+		return nil, err
+	}
+	return jsonCall(http.MethodPost, u, body)
+}
+
+// ---- parsing --------------------------------------------------------------
+
+func (imageAdapter) parse(x *exchange, body []byte) (*Result, error) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, &Error{Kind: KindParse, Message: "upstream returned an invalid JSON body", Cause: err, Accepted: true}
+	}
+	if e, ok := m["error"].(map[string]any); ok && e != nil {
+		return nil, upstreamFromObject(m, m)
+	}
+	return parseImagesDoc(m, x.proto)
+}
+
+func imageItemMIME(item map[string]any, outputFormat string, proto Protocol) string {
+	for _, k := range []string{"media_type", "mime_type"} {
+		if s := strings.ToLower(strOf(item[k])); strings.HasPrefix(s, "image/") {
+			return s
+		}
+	}
+	if proto == XAIImage || proto == XAIImageEdits {
+		return "image/jpeg"
+	}
+	switch strings.ToLower(outputFormat) {
+	case "jpeg", "jpg":
+		return "image/jpeg"
+	case "webp":
+		return "image/webp"
+	}
+	return "image/png"
+}
+
+func parseImagesDoc(m map[string]any, proto Protocol) (*Result, error) {
+	res := &Result{ID: strOf(m["id"])}
+	outFmt := strOf(m["output_format"])
+	for i, d := range asList(m["data"]) {
+		item, _ := d.(map[string]any)
+		if item == nil {
+			continue
+		}
+		img := Image{Index: i, MIME: imageItemMIME(item, outFmt, proto), RevisedPrompt: strOf(item["revised_prompt"])}
+		img.URL = strOf(item["url"])
+		if fo, ok := item["file_output"].(map[string]any); ok && img.URL == "" {
+			img.URL = strOf(fo["public_url"])
+		}
+		if b := strOf(item["b64_json"]); b != "" {
+			data, err := base64.StdEncoding.DecodeString(b)
+			if err != nil {
+				return nil, &Error{Kind: KindParse, Message: "upstream returned an invalid base64 image", Cause: err, Accepted: true}
+			}
+			img.Data = data
+		}
+		if len(img.Data) == 0 && img.URL == "" {
+			continue
+		}
+		if img.URL != "" {
+			res.Citations = addCitation(res.Citations, Citation{URL: img.URL})
+		}
+		res.Images = append(res.Images, img)
+		if res.RevisedPrompt == "" {
+			res.RevisedPrompt = img.RevisedPrompt
+		}
+	}
+	usage, _ := m["usage"].(map[string]any)
+	res.Usage = openAIUsage(usage, proto.isXAI())
+	res.FinishReason = "stop"
+	return res, nil
+}
+
+type imageStream struct {
+	x       *exchange
+	frames  int
+	partial map[int]Image
+	final   []Image
+	usage   Usage
+	prompt  string
+	id      string
+}
+
+func (imageAdapter) stream(x *exchange) streamer {
+	return &imageStream{x: x, partial: map[int]Image{}}
+}
+
+func (s *imageStream) frame(f sseFrame, emit func(Event) error) error {
+	s.frames++
+	data := strings.TrimSpace(f.Data)
+	if data == "" || data[0] != '{' {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return nil
+	}
+	typ := strOf(m["type"])
+	if typ == "" {
+		typ = f.Event
+	}
+	if u, ok := m["usage"].(map[string]any); ok && u != nil {
+		nu := openAIUsage(u, false)
+		mergeUsage(&s.usage, nu)
+		cp := s.usage
+		defer func() { _ = emit(Event{Type: EventUsage, Usage: &cp}) }()
+	}
+	b := strOf(m["b64_json"])
+	if b == "" && strOf(m["partial_image_b64"]) != "" {
+		b = strOf(m["partial_image_b64"])
+	}
+	switch {
+	case strings.HasSuffix(typ, "partial_image"):
+		raw, err := base64.StdEncoding.DecodeString(b)
+		if err != nil || len(raw) == 0 {
+			return nil
+		}
+		idx, _ := toInt(m["partial_image_index"])
+		img := Image{Index: int(idx), Data: raw, MIME: imageItemMIME(m, strOf(m["output_format"]), s.x.proto), Partial: true}
+		s.partial[img.Index] = img
+		return emit(Event{Type: EventImage, Index: img.Index, Image: &img})
+	case strings.HasSuffix(typ, ".completed") || strings.HasSuffix(typ, ".final") || typ == "completed":
+		raw, err := base64.StdEncoding.DecodeString(b)
+		if err == nil && len(raw) > 0 {
+			img := Image{Index: len(s.final), Data: raw, MIME: imageItemMIME(m, strOf(m["output_format"]), s.x.proto),
+				RevisedPrompt: strOf(m["revised_prompt"])}
+			s.final = append(s.final, img)
+			cp := img
+			return emit(Event{Type: EventImage, Index: img.Index, Image: &cp})
+		}
+		if u := strOf(m["url"]); u != "" {
+			img := Image{Index: len(s.final), URL: u, MIME: imageItemMIME(m, strOf(m["output_format"]), s.x.proto)}
+			s.final = append(s.final, img)
+			cp := img
+			return emit(Event{Type: EventImage, Index: img.Index, Image: &cp})
+		}
+	case typ == "response.created" || typ == "created":
+		if id := strOf(m["id"]); id != "" {
+			s.id = id
+		}
+	}
+	return nil
+}
+
+func (s *imageStream) result() (*Result, error) {
+	if s.frames == 0 {
+		return &Result{}, &Error{Kind: KindParse, Message: "upstream stream ended before any event", Accepted: true}
+	}
+	res := &Result{ID: s.id, Usage: s.usage, FinishReason: "stop"}
+	res.Images = s.final
+	if len(res.Images) == 0 {
+		// Keep the highest-index partial as the final image.
+		best := -1
+		for i := range s.partial {
+			if i > best {
+				best = i
+			}
+		}
+		if best >= 0 {
+			img := s.partial[best]
+			img.Partial = false
+			res.Images = []Image{img}
+		}
+	}
+	for _, im := range res.Images {
+		if im.RevisedPrompt != "" {
+			res.RevisedPrompt = im.RevisedPrompt
+			break
+		}
+	}
+	return res, nil
+}
