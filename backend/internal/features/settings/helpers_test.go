@@ -155,3 +155,155 @@ func (h *harness) expectInvalid(w *httptest.ResponseRecorder, code, field, rule,
 		}
 	}
 }
+
+func fieldsOf(d map[string]any) []string {
+	var out []string
+	if raw, ok := d["fields"].([]any); ok {
+		for _, f := range raw {
+			out = append(out, f.(string))
+		}
+	}
+	return out
+}
+
+// ---- fakes ---------------------------------------------------------------------------------
+
+type fakeAudit struct {
+	mu      sync.Mutex
+	entries []settings.AuditEntry
+}
+
+func (f *fakeAudit) Record(_ context.Context, e settings.AuditEntry) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries = append(f.entries, e)
+}
+
+func (f *fakeAudit) all() []settings.AuditEntry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]settings.AuditEntry(nil), f.entries...)
+}
+
+type fakeAdmins struct {
+	ok  bool
+	err error
+}
+
+func (f fakeAdmins) HasBoundSuperAdmin(context.Context) (bool, error) { return f.ok, f.err }
+
+type fakeVectors struct {
+	ok  bool
+	err error
+}
+
+func (f fakeVectors) VectorStoreAvailable(context.Context) (bool, error) { return f.ok, f.err }
+
+type fakeEmbedding struct {
+	mu             sync.Mutex
+	status         settings.EmbeddingStatus
+	statusErr      error
+	reindex        settings.ReindexOutcome
+	reindexErr     error
+	reindexFlag    *bool
+	tasks          []settings.EmbeddingTask
+	total          int64
+	tasksErr       error
+	lastQuery      settings.TaskQuery
+	retry          settings.RetryOutcome
+	retryErr       error
+	lastRetry      []string
+	reconcileCalls int
+	reconcileErr   error
+	probeErr       error
+	probeCalls     int
+	probeDeadline  time.Duration
+}
+
+func (f *fakeEmbedding) Status(context.Context) (settings.EmbeddingStatus, error) {
+	return f.status, f.statusErr
+}
+
+func (f *fakeEmbedding) Reindex(_ context.Context, includeEmpty bool) (settings.ReindexOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reindexFlag = &includeEmpty
+	return f.reindex, f.reindexErr
+}
+
+func (f *fakeEmbedding) Tasks(_ context.Context, q settings.TaskQuery) ([]settings.EmbeddingTask, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastQuery = q
+	return f.tasks, f.total, f.tasksErr
+}
+
+func (f *fakeEmbedding) Retry(_ context.Context, ids []string) (settings.RetryOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastRetry = ids
+	return f.retry, f.retryErr
+}
+
+func (f *fakeEmbedding) Reconcile(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reconcileCalls++
+	return f.reconcileErr
+}
+
+func (f *fakeEmbedding) Probe(ctx context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probeCalls++
+	if dl, ok := ctx.Deadline(); ok {
+		f.probeDeadline = time.Until(dl)
+	}
+	return f.probeErr
+}
+
+func (f *fakeEmbedding) reconciles() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reconcileCalls
+}
+
+type fakeRuntime struct {
+	status  settings.RuntimeStatus
+	err     error
+	actions []string
+}
+
+func (f *fakeRuntime) Status(context.Context) (settings.RuntimeStatus, error) { return f.status, f.err }
+
+func (f *fakeRuntime) act(name string) (settings.RuntimeStatus, error) {
+	f.actions = append(f.actions, name)
+	st := f.status
+	st.Status = name
+	return st, f.err
+}
+func (f *fakeRuntime) Start(context.Context) (settings.RuntimeStatus, error) { return f.act("start") }
+func (f *fakeRuntime) Stop(context.Context) (settings.RuntimeStatus, error)  { return f.act("stop") }
+func (f *fakeRuntime) Restart(context.Context) (settings.RuntimeStatus, error) {
+	return f.act("restart")
+}
+
+var errBoom = errors.New("boom")
+
+func decodeMap(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var m map[string]any
+	testkit.Decode(t, w, &m)
+	return m
+}
+
+func toJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func ctxBG() context.Context { return context.Background() }
