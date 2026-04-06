@@ -472,3 +472,233 @@ func TestSendBudgetRejectionPersistsPair(t *testing.T) {
 		}
 	}
 }
+
+func TestSendSettlementFailureMapped(t *testing.T) {
+	e := newEnv(t)
+	e.bill.settleE = apperr.New("billing.settlement_failed", "settlement failed").WithStatus(409)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	w := e.call("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", nil))
+	if w.Code == 200 {
+		t.Fatalf("settlement failure must not be a plain success: %s", w.Body)
+	}
+}
+
+func TestBranchRetryAndEdit(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	r1 := e.send(e.u1, id, "first", nil)
+	u1, a1 := pair(r1)
+	// retry: source assistant, parent = its user parent
+	r2 := e.send(e.u1, id, "first", map[string]any{
+		"sourceMessagePublicID": str(a1, "publicID"), "parentMessagePublicID": str(u1, "publicID"), "branchReason": "retry"})
+	u2, a2 := pair(r2)
+	if str(u2, "publicID") != str(u1, "publicID") {
+		t.Fatalf("retry reuses the user message: %v vs %v", u2["publicID"], u1["publicID"])
+	}
+	if str(a2, "publicID") == str(a1, "publicID") || a2["parentMessageID"] != u1["id"] || str(a2, "branchReason") != "retry" || str(a2, "sourcePublicID") != str(a1, "publicID") {
+		t.Fatalf("retry assistant: %v", a2)
+	}
+	if got := e.convRow(id).MessageCount; got != 3 {
+		t.Fatalf("message count after retry: %d", got)
+	}
+	// retry with default reason is invalid
+	e.expectErr("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", map[string]any{
+		"sourceMessagePublicID": str(a1, "publicID"), "parentMessagePublicID": str(u1, "publicID"), "branchReason": "default"}), 400, "message.invalid_branch")
+	// retry from an assistant source whose supplied parent differs
+	e.expectErr("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", map[string]any{
+		"sourceMessagePublicID": str(a1, "publicID"), "parentMessagePublicID": str(a1, "publicID"), "branchReason": "retry"}), 400, "message.invalid_branch")
+	// source without a reason (default) invalid; reason without source invalid
+	e.expectErr("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", map[string]any{"branchReason": "retry"}), 400, "message.invalid_branch")
+	// edit: source user message that is a root -> no parent allowed
+	e.expectErr("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", map[string]any{
+		"sourceMessagePublicID": str(u1, "publicID"), "parentMessagePublicID": str(a1, "publicID"), "branchReason": "edit"}), 400, "message.invalid_branch")
+	r3 := e.send(e.u1, id, "first edited", map[string]any{"sourceMessagePublicID": str(u1, "publicID"), "branchReason": "edit"})
+	u3, a3 := pair(r3)
+	if str(u3, "publicID") == str(u1, "publicID") || u3["parentMessageID"] != nil || str(u3, "branchReason") != "edit" || str(u3, "sourcePublicID") != str(u1, "publicID") {
+		t.Fatalf("edit user: %v", u3)
+	}
+	if a3["parentMessageID"] != u3["id"] {
+		t.Fatalf("edit assistant parent: %v", a3)
+	}
+	// unknown / foreign ids
+	e.expectErr("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", map[string]any{"parentMessagePublicID": "zzz"}), 400, "message.invalid_branch")
+	other := e.newConv(e.u2, "o", "gpt-4o")
+	ou, _ := pair(e.send(e.u2, other, "hey", nil))
+	e.expectErr("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", map[string]any{"parentMessagePublicID": str(ou, "publicID")}), 400, "message.invalid_branch")
+	// source role must be user, or assistant with retry
+	e.expectErr("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", map[string]any{
+		"sourceMessagePublicID": str(a1, "publicID"), "parentMessagePublicID": str(u1, "publicID"), "branchReason": "edit"}), 400, "message.invalid_branch")
+}
+
+func TestDefaultParentSelection(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	_, a1 := pair(e.send(e.u1, id, "one", nil))
+	u2, a2 := pair(e.send(e.u1, id, "two", nil))
+	if u2["parentMessageID"] != a1["id"] {
+		t.Fatalf("second user attaches to latest assistant: %v vs %v", u2["parentMessageID"], a1["id"])
+	}
+	_ = a2
+	// an errored assistant is not usable as a parent: parent falls back
+	conv := e.convRow(id)
+	badU := e.seedMsg(conv, roleUser, "bad", msgError, nil)
+	e.seedMsg(conv, roleAssistant, "", msgError, badU)
+	u3, _ := pair(e.send(e.u1, id, "three", nil))
+	var asstID uint
+	e.DB.Model(&Message{}).Where("public_id = ?", str(a2, "publicID")).Pluck("id", &asstID)
+	if u3["parentMessageID"] != float64(asstID) {
+		t.Fatalf("parent must be the newest usable assistant (%d): %v", asstID, u3["parentMessageID"])
+	}
+}
+
+func TestHistorySentToGeneratorFollowsBranch(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	u1, a1 := pair(e.send(e.u1, id, "q1", nil))
+	e.send(e.u1, id, "q2", nil)
+	// retry of the first answer: history only has q1
+	e.send(e.u1, id, "q1", map[string]any{"sourceMessagePublicID": str(a1, "publicID"), "parentMessagePublicID": str(u1, "publicID"), "branchReason": "retry"})
+	reqs := e.gen.requests()
+	var chat []GenerateRequest
+	for _, r := range reqs {
+		if r.Task == taskChat {
+			chat = append(chat, r)
+		}
+	}
+	if len(chat) != 3 {
+		t.Fatalf("chat calls: %d", len(chat))
+	}
+	if len(chat[1].Messages) != 3 { // q1, a1, q2
+		t.Fatalf("second call history: %+v", chat[1].Messages)
+	}
+	if len(chat[2].Messages) != 1 || chat[2].Messages[0].Content != "q1" {
+		t.Fatalf("retry history: %+v", chat[2].Messages)
+	}
+	if chat[0].Model != "gpt-4o" || !strings.HasPrefix(chat[0].RunID, "run_") || chat[0].UserID != 1 || chat[0].MaxLLMCalls != 5 {
+		t.Fatalf("request metadata: %+v", chat[0])
+	}
+}
+
+func TestProjectSystemPromptReachesGenerator(t *testing.T) {
+	e := newEnv(t)
+	p := newProject(e, e.u1, map[string]any{"name": "p", "systemPrompt": "Be terse."})
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	e.ok("PATCH", "/conversations/"+id+"/project", e.u1, map[string]string{"projectID": str(p, "publicID")})
+	e.send(e.u1, id, "hi", nil)
+	if got := e.gen.requests()[0].System; got != "Be terse." {
+		t.Fatalf("system: %q", got)
+	}
+}
+
+func TestModelOverrideUpdatesConversation(t *testing.T) {
+	e := newEnv(t)
+	e.cat.available["claude-sonnet"] = true
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	e.gen.set(func(_ context.Context, req GenerateRequest, emit func(GenerateEvent)) (GenerateResult, error) {
+		return GenerateResult{Content: "ok", Usage: Usage{Input: 1, Output: 1}, Route: RouteInfo{PlatformModelName: req.Model, Provider: "anthropic"}}, nil
+	})
+	e.send(e.u1, id, "hi", map[string]any{"model": "claude-sonnet"})
+	c := e.convRow(id)
+	if c.ModelName != "claude-sonnet" || c.Provider != "openai" {
+		t.Fatalf("conversation model: %+v", c)
+	}
+}
+
+func TestMessageWithoutModelReportsRouteMissing(t *testing.T) {
+	e := newEnv(t)
+	e.gen.set(func(context.Context, GenerateRequest, func(GenerateEvent)) (GenerateResult, error) {
+		return GenerateResult{}, ErrModelRouteMissing
+	})
+	id := e.newConv(e.u1, "t", "")
+	e.expectErr("POST", "/conversations/"+id+"/messages", e.u1, sendBody("x", nil), 503, "llm.model_route_not_configured")
+}
+
+func TestModerationBlocksInputAndOutput(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	e.mod.block[dirInput] = true
+	r := e.ok("POST", "/conversations/"+id+"/messages", e.u1, sendBody("bad words", nil))
+	u, a := pair(r)
+	if str(u, "status") != "blocked" || str(u, "content") != "bad words" || str(a, "status") != "blocked" || str(a, "content") != "" {
+		t.Fatalf("input block: %v / %v", u, a)
+	}
+	mo, _ := u["moderation"].(map[string]any)
+	if mo == nil || str(mo, "direction") != "input" || str(mo, "eventID") != "evt_1" {
+		t.Fatalf("moderation info: %v", u["moderation"])
+	}
+	if len(e.gen.requests()) != 0 {
+		t.Fatal("blocked input must not reach the generator")
+	}
+	// output block
+	e.mod.block = map[string]bool{dirOutput: true}
+	id2 := e.newConv(e.u1, "t", "gpt-4o")
+	r = e.ok("POST", "/conversations/"+id2+"/messages", e.u1, sendBody("fine", nil))
+	u, a = pair(r)
+	if str(u, "status") != "success" || str(a, "status") != "blocked" || str(a, "content") != "" || str(a, "attachments") != "[]" {
+		t.Fatalf("output block: %v / %v", u, a)
+	}
+	mo, _ = a["moderation"].(map[string]any)
+	if mo == nil || str(mo, "direction") != "output" {
+		t.Fatalf("moderation direction: %v", a["moderation"])
+	}
+	for _, k := range []string{"knowledgeSources", "processTrace", "uiState"} {
+		if _, ok := a[k]; ok {
+			t.Fatalf("%s must be removed from blocked assistant message", k)
+		}
+	}
+	// listing keeps the same view
+	rows := e.list(id2)
+	if str(rows[1], "content") != "" || str(rows[1], "status") != "blocked" {
+		t.Fatalf("list view of blocked: %v", rows[1])
+	}
+	// blocked user content stays visible to the owner
+	rows = e.list(id)
+	if str(rows[0], "content") != "bad words" {
+		t.Fatalf("blocked user content: %v", rows[0])
+	}
+}
+
+func TestRetryReusesUserForContextWhenUserFailed(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	calls := 0
+	e.gen.set(func(ctx context.Context, req GenerateRequest, emit func(GenerateEvent)) (GenerateResult, error) {
+		if req.Task != taskChat {
+			return defaultGenerate(ctx, req, emit)
+		}
+		calls++
+		if calls == 1 {
+			return GenerateResult{}, ErrUpstream
+		}
+		return defaultGenerate(ctx, req, emit)
+	})
+	w := e.call("POST", "/conversations/"+id+"/messages", e.u1, sendBody("flaky", nil))
+	testkit.Expect(t, w, 502, "upstream.unavailable")
+	rows := e.list(id)
+	u, a := rows[0], rows[1]
+	r := e.send(e.u1, id, "flaky", map[string]any{"sourceMessagePublicID": str(a, "publicID"), "parentMessagePublicID": str(u, "publicID"), "branchReason": "retry"})
+	ru, ra := pair(r)
+	if str(ru, "publicID") != str(u, "publicID") || str(ra, "status") != "success" || str(ru, "status") != "success" {
+		t.Fatalf("retry after failure: user=%v asst=%v", ru, ra)
+	}
+	// following turn: the retried user message counts as successful context
+	e.send(e.u1, id, "next", nil)
+	var chat []GenerateRequest
+	for _, r := range e.gen.requests() {
+		if r.Task == taskChat {
+			chat = append(chat, r)
+		}
+	}
+	last := chat[len(chat)-1]
+	if len(last.Messages) != 3 || last.Messages[0].Content != "flaky" {
+		t.Fatalf("context: %+v", last.Messages)
+	}
+}
+
+func TestSendConcurrencyDoesNotBreak(t *testing.T) {
+	e := newEnv(t)
+	for i := 0; i < 3; i++ {
+		id := e.newConv(e.u1, fmt.Sprintf("c%d", i), "gpt-4o")
+		e.send(e.u1, id, "hi", nil)
+	}
+}
