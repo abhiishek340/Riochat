@@ -214,3 +214,158 @@ func NativeToolFromCapabilities(raw string) []NativeTool {
 	}
 	return out
 }
+
+// PriceOverride replaces a tool's billing data.
+type PriceOverride struct {
+	PriceNanoUSD *int64
+	Unit         string
+	PriceLabel   string
+	Billable     *bool
+}
+
+// ParsePriceOverrides reads {"<tool key>": {priceNanousd, unit, priceLabel,
+// billable}}. Negative prices are invalid.
+func ParsePriceOverrides(raw string) (map[string]PriceOverride, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var doc map[string]map[string]any
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		return nil, err
+	}
+	out := map[string]PriceOverride{}
+	for key, v := range doc {
+		var o PriceOverride
+		if x, ok := v["priceNanousd"]; ok {
+			n, ok := toInt(x)
+			if !ok || n < 0 {
+				return nil, fmt.Errorf("invalid price for tool %q", key)
+			}
+			o.PriceNanoUSD = &n
+		}
+		o.Unit = strOf(v["unit"])
+		o.PriceLabel = strOf(v["priceLabel"])
+		if b, ok := v["billable"].(bool); ok {
+			o.Billable = &b
+		}
+		out[key] = o
+	}
+	return out, nil
+}
+
+// ApplyOverrides returns tools with pricing overrides applied. A positive
+// price implies billable.
+func ApplyOverrides(tools []NativeTool, overrides map[string]PriceOverride) []NativeTool {
+	out := make([]NativeTool, len(tools))
+	for i, t := range tools {
+		if o, ok := overrides[t.Key]; ok {
+			if o.PriceNanoUSD != nil {
+				t.PriceNanoUSD = *o.PriceNanoUSD
+				if t.PriceNanoUSD > 0 {
+					t.Billable = true
+				}
+			}
+			if o.Billable != nil {
+				t.Billable = *o.Billable
+			}
+			if o.Unit != "" {
+				t.BillingUnit = o.Unit
+			}
+			if o.PriceLabel != "" {
+				t.PriceLabel = o.PriceLabel
+			}
+		}
+		out[i] = t
+	}
+	return out
+}
+
+// UsagePrice returns the per-unit price for a tool key, available only when
+// the tool is billable with a positive price; overrides replace the catalog.
+func UsagePrice(tools []NativeTool, overrides map[string]PriceOverride, key string) (int64, bool) {
+	for _, t := range ApplyOverrides(tools, overrides) {
+		if t.Key == key {
+			if t.Billable && t.PriceNanoUSD > 0 {
+				return t.PriceNanoUSD, true
+			}
+			return 0, false
+		}
+	}
+	if n, ok := ExtraUsagePrices[key]; ok {
+		if o, ok := overrides[key]; ok && o.PriceNanoUSD != nil {
+			n = *o.PriceNanoUSD
+		}
+		return n, n > 0
+	}
+	return 0, false
+}
+
+var strippedToolKeys = []string{"model", "messages", "input", "instructions", "prompt", "system", "systemInstruction",
+	"headers", "api_key", "apiKey", "base_url", "baseURL", "stream", "previous_response_id"}
+
+// MatchNativeTool recognises a user-supplied tool object as one of the
+// catalog entries for protocol and returns the sanitized object to send: the
+// canonical payload overrides type-specific fields, protected keys are
+// stripped, nested maps merge with canonical values winning. The type is
+// inferred from raw keys such as google_search when type is absent.
+func MatchNativeTool(protocol string, user map[string]any, catalog []NativeTool) (map[string]any, *NativeTool, bool) {
+	pk := PolicyKeyFor(protocol)
+	typ := strOf(user["type"])
+	if typ == "" {
+		var keys []string
+		for k := range user {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if c := camelToSnake(k); c != "" {
+				for i := range catalog {
+					if catalog[i].Protocol == pk && catalog[i].Type == c {
+						typ = c
+					}
+				}
+			}
+			if typ != "" {
+				break
+			}
+		}
+	}
+	if typ == "" {
+		return nil, nil, false
+	}
+	for i := range catalog {
+		t := &catalog[i]
+		if t.Protocol != pk || t.Type != typ {
+			continue
+		}
+		merged := cloneJSON(user).(map[string]any)
+		for _, k := range strippedToolKeys {
+			delete(merged, k)
+		}
+		// A raw "google_search": {...} key becomes type + fields on protocols
+		// that use typed tools.
+		if raw, ok := merged[camelToSnake(typ)].(map[string]any); ok && strOf(user["type"]) == "" && pk != "gemini_generate_content" && pk != "google_image_generation" {
+			delete(merged, camelToSnake(typ))
+			for k, v := range raw {
+				merged[k] = v
+			}
+		}
+		deepMergeCanonical(merged, t.Payload)
+		return merged, t, true
+	}
+	return nil, nil, false
+}
+
+// deepMergeCanonical writes canonical values over dst, merging nested maps.
+func deepMergeCanonical(dst, canon map[string]any) {
+	for k, v := range canon {
+		if cm, ok := v.(map[string]any); ok {
+			if dm, ok := dst[k].(map[string]any); ok {
+				deepMergeCanonical(dm, cm)
+				continue
+			}
+		}
+		dst[k] = cloneJSON(v)
+	}
+}
