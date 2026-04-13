@@ -124,3 +124,231 @@ function interleave(data: number[], version: number): number[] {
 // --- Matrix -------------------------------------------------------------------
 
 const bit = (value: number, index: number): boolean => ((value >>> index) & 1) !== 0;
+
+class Grid {
+  readonly size: number;
+  readonly modules: boolean[][];
+  readonly reserved: boolean[][];
+
+  constructor(version: number) {
+    this.size = version * 4 + 17;
+    this.modules = Array.from({ length: this.size }, () => new Array<boolean>(this.size).fill(false));
+    this.reserved = Array.from({ length: this.size }, () => new Array<boolean>(this.size).fill(false));
+  }
+
+  set(x: number, y: number, dark: boolean): void {
+    const row = this.modules[y];
+    const flag = this.reserved[y];
+    if (row && flag) {
+      row[x] = dark;
+      flag[x] = true;
+    }
+  }
+
+  finder(cx: number, cy: number): void {
+    for (let dy = -4; dy <= 4; dy++) {
+      for (let dx = -4; dx <= 4; dx++) {
+        const dist = Math.max(Math.abs(dx), Math.abs(dy));
+        const x = cx + dx;
+        const y = cy + dy;
+        if (x >= 0 && x < this.size && y >= 0 && y < this.size) this.set(x, y, dist !== 2 && dist !== 4);
+      }
+    }
+  }
+
+  alignment(cx: number, cy: number): void {
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) this.set(cx + dx, cy + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+  }
+
+  formatBits(mask: number): void {
+    // Level M indicator is 00.
+    const data = (0 << 3) | mask;
+    let rem = data;
+    for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+    const bits = ((data << 10) | rem) ^ 0x5412;
+    const n = this.size;
+    for (let i = 0; i <= 5; i++) this.set(8, i, bit(bits, i));
+    this.set(8, 7, bit(bits, 6));
+    this.set(8, 8, bit(bits, 7));
+    this.set(7, 8, bit(bits, 8));
+    for (let i = 9; i < 15; i++) this.set(14 - i, 8, bit(bits, i));
+    for (let i = 0; i < 8; i++) this.set(n - 1 - i, 8, bit(bits, i));
+    for (let i = 8; i < 15; i++) this.set(8, n - 15 + i, bit(bits, i));
+    this.set(8, n - 8, true);
+  }
+
+  versionBits(version: number): void {
+    if (version < 7) return;
+    let rem = version;
+    for (let i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >>> 11) * 0x1f25);
+    const bits = (version << 12) | rem;
+    for (let i = 0; i < 18; i++) {
+      const a = this.size - 11 + (i % 3);
+      const b = Math.floor(i / 3);
+      this.set(a, b, bit(bits, i));
+      this.set(b, a, bit(bits, i));
+    }
+  }
+
+  functionPatterns(version: number): void {
+    const n = this.size;
+    for (let i = 0; i < n; i++) {
+      this.set(6, i, i % 2 === 0);
+      this.set(i, 6, i % 2 === 0);
+    }
+    this.finder(3, 3);
+    this.finder(n - 4, 3);
+    this.finder(3, n - 4);
+    const align = SPECS[version]?.align ?? [];
+    const last = align.length - 1;
+    align.forEach((cy, i) => {
+      align.forEach((cx, j) => {
+        const onFinder = (i === 0 && j === 0) || (i === 0 && j === last) || (i === last && j === 0);
+        if (!onFinder) this.alignment(cx, cy);
+      });
+    });
+    this.formatBits(0);
+    this.versionBits(version);
+  }
+
+  placeCodewords(codewords: number[]): void {
+    const n = this.size;
+    let i = 0;
+    for (let right = n - 1; right >= 1; right -= 2) {
+      if (right === 6) right = 5;
+      for (let vert = 0; vert < n; vert++) {
+        for (let j = 0; j < 2; j++) {
+          const x = right - j;
+          const upward = ((right + 1) & 2) === 0;
+          const y = upward ? n - 1 - vert : vert;
+          if (!this.reserved[y]?.[x] && i < codewords.length * 8) {
+            const row = this.modules[y];
+            if (row) row[x] = bit(codewords[i >>> 3] ?? 0, 7 - (i & 7));
+            i++;
+          }
+        }
+      }
+    }
+  }
+
+  applyMask(mask: number): void {
+    for (let y = 0; y < this.size; y++) {
+      for (let x = 0; x < this.size; x++) {
+        let invert: boolean;
+        switch (mask) {
+          case 0: invert = (x + y) % 2 === 0; break;
+          case 1: invert = y % 2 === 0; break;
+          case 2: invert = x % 3 === 0; break;
+          case 3: invert = (x + y) % 3 === 0; break;
+          case 4: invert = (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0; break;
+          case 5: invert = ((x * y) % 2) + ((x * y) % 3) === 0; break;
+          case 6: invert = (((x * y) % 2) + ((x * y) % 3)) % 2 === 0; break;
+          default: invert = (((x + y) % 2) + ((x * y) % 3)) % 2 === 0; break;
+        }
+        const row = this.modules[y];
+        if (row && !this.reserved[y]?.[x] && invert) row[x] = !row[x];
+      }
+    }
+  }
+
+  clone(): Grid {
+    const copy = Object.create(Grid.prototype) as { size: number; modules: boolean[][]; reserved: boolean[][] };
+    copy.size = this.size;
+    copy.modules = this.modules.map((r) => r.slice());
+    copy.reserved = this.reserved;
+    return copy as Grid;
+  }
+}
+
+/** The four mask-selection penalty rules of the specification. */
+export function penaltyScore(m: readonly (readonly boolean[])[]): number {
+  const n = m.length;
+  const at = (x: number, y: number) => m[y]?.[x] === true;
+  let score = 0;
+
+  for (const horizontal of [true, false]) {
+    for (let a = 0; a < n; a++) {
+      let run = 1;
+      for (let b = 1; b <= n; b++) {
+        const same = b < n && (horizontal ? at(b, a) === at(b - 1, a) : at(a, b) === at(a, b - 1));
+        if (same) run++;
+        else {
+          if (run >= 5) score += 3 + (run - 5);
+          run = 1;
+        }
+      }
+      // Finder-like 1:1:3:1:1 pattern with four light modules on either side.
+      const line = Array.from({ length: n }, (_, b) => (horizontal ? at(b, a) : at(a, b)));
+      for (let b = 0; b + 11 <= n; b++) {
+        const seg = line.slice(b, b + 11).map((v) => (v ? 1 : 0)).join("");
+        if (seg === "10111010000" || seg === "00001011101") score += 40;
+      }
+    }
+  }
+  for (let y = 0; y < n - 1; y++) {
+    for (let x = 0; x < n - 1; x++) {
+      const c = at(x, y);
+      if (c === at(x + 1, y) && c === at(x, y + 1) && c === at(x + 1, y + 1)) score += 3;
+    }
+  }
+  let dark = 0;
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (at(x, y)) dark++;
+  const total = n * n;
+  score += (Math.ceil(Math.abs(dark * 20 - total * 10) / total) - 1) * 10;
+  return score;
+}
+
+/** Smallest supported version that holds `byteLength` bytes, or null. */
+export function pickVersion(byteLength: number): number | null {
+  for (let v = 1; v <= MAX_VERSION; v++) {
+    const header = 4 + (v >= 10 ? 16 : 8);
+    if (header + byteLength * 8 <= dataCapacity(v) * 8) return v;
+  }
+  return null;
+}
+
+/** Module matrix (true = dark) without the quiet zone, or null if too long. */
+export function encodeQr(text: string): boolean[][] | null {
+  const bytes = new TextEncoder().encode(text);
+  const version = pickVersion(bytes.length);
+  if (version === null) return null;
+  const codewords = interleave(buildCodewords(bytes, version), version);
+
+  const base = new Grid(version);
+  base.functionPatterns(version);
+  base.placeCodewords(codewords);
+
+  let best: Grid | null = null;
+  let bestScore = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    const candidate = base.clone();
+    candidate.applyMask(mask);
+    candidate.formatBits(mask);
+    const score = penaltyScore(candidate.modules);
+    if (score < bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best ? best.modules : null;
+}
+
+/** SVG path data for the dark modules with a 4-module quiet zone; viewBox is `0 0 size size`. */
+export function qrToSvg(matrix: readonly (readonly boolean[])[]): { path: string; size: number } {
+  const quiet = 4;
+  let path = "";
+  matrix.forEach((row, y) => {
+    let x = 0;
+    while (x < row.length) {
+      if (!row[x]) {
+        x++;
+        continue;
+      }
+      let end = x;
+      while (end < row.length && row[end]) end++;
+      path += `M${x + quiet} ${y + quiet}h${end - x}v1h-${end - x}z`;
+      x = end;
+    }
+  });
+  return { path, size: matrix.length + quiet * 2 };
+}
