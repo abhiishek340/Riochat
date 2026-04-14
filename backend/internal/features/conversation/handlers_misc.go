@@ -154,3 +154,153 @@ func (a *api) sharedFile(c *gin.Context) {
 	}
 	serveBytes(c, f, data, true)
 }
+
+func (a *api) cloneShared(c *gin.Context) {
+	d, sh, err := a.s.cloneShared(c.Request.Context(), uid(c), c.Param("share_id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "clone_shared_conversation", "conversation", d.PublicID, map[string]any{"share_id": sh.ShareID})
+	httpx.OK(c, d)
+}
+
+// ----- files -----
+
+func (a *api) uploadFile(c *gin.Context) {
+	rs := a.s.settings(c.Request.Context())
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, rs.MaxUploadBytes+(1<<20))
+	fh, err := c.FormFile("file")
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		switch {
+		case asMaxBytes(err, &tooBig):
+			a.fail(c, ErrFileRequired)
+		case err == http.ErrMissingFile || strings.Contains(err.Error(), "no multipart boundary") || strings.Contains(err.Error(), "request Content-Type isn't multipart"):
+			a.fail(c, ErrFileRequired)
+		default:
+			a.fail(c, ErrInvalidFile.WithCause(err))
+		}
+		return
+	}
+	f, err := fh.Open()
+	if err != nil {
+		a.fail(c, ErrFileInvalidStream.WithCause(err))
+		return
+	}
+	defer f.Close()
+	res, err := a.s.uploadFile(c.Request.Context(), uid(c), fh.Filename, fh.Header.Get("Content-Type"), c.PostForm("purpose"), f)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	if !res.Reused {
+		a.s.auditEntry(c, uid(c), "upload_file", "file", res.File.FileID, map[string]any{"size": res.File.SizeBytes})
+	}
+	httpx.OK(c, res)
+}
+
+func (a *api) listFiles(c *gin.Context) {
+	p := pagination.FromRequest(c.Request)
+	res, err := a.s.listFiles(c.Request.Context(), uid(c), fileListQuery{Q: c.Query("q"), Kind: c.Query("kind"), Sort: c.Query("sort")}, p.Offset(), p.Limit())
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, res)
+}
+
+func (a *api) fileContent(c *gin.Context) {
+	f, data, err := a.s.openFile(c.Request.Context(), uid(c), c.Param("file_id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	serveBytes(c, f, data, false)
+}
+
+func (a *api) fileExtract(c *gin.Context) {
+	d, err := a.s.extractFile(c.Request.Context(), uid(c), c.Param("file_id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, d)
+}
+
+func (a *api) fileProcessing(c *gin.Context) {
+	d, err := a.s.processingStatus(c.Request.Context(), uid(c), c.Param("file_id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, d)
+}
+
+type fileIDsReq struct {
+	FileIDs []string `json:"fileIDs" binding:"required,min=1,max=100,dive,max=64"`
+}
+
+func (a *api) fileStatuses(c *gin.Context) {
+	var req fileIDsReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	items, err := a.s.processingStatuses(c.Request.Context(), uid(c), req.FileIDs)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, items)
+}
+
+type embeddingsReq struct {
+	FileIDs []string `json:"fileIDs" binding:"required,min=1,max=100,dive,required,max=64"`
+}
+
+func (a *api) submitEmbeddings(c *gin.Context) {
+	var req embeddingsReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	res, err := a.s.submitEmbeddings(c.Request.Context(), uid(c), req.FileIDs)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "submit_file_embeddings", "file", "", map[string]any{"submitted": len(res.SubmittedFileIDs), "skipped": len(res.Skipped)})
+	httpx.OK(c, res)
+}
+
+type filePatchReq struct {
+	FileName  *string `json:"fileName"`
+	RAGOptOut *bool   `json:"ragOptOut"`
+}
+
+func (a *api) patchFile(c *gin.Context) {
+	var req filePatchReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	d, err := a.s.patchFile(c.Request.Context(), uid(c), c.Param("file_id"), req.FileName, req.RAGOptOut)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "update_file", "file", d.FileID, nil)
+	httpx.OK(c, d)
+}
+
+func (a *api) deleteFile(c *gin.Context) {
+	d, err := a.s.deleteFile(c.Request.Context(), uid(c), c.Param("file_id"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	a.s.auditEntry(c, uid(c), "delete_file", "file", d.FileID, nil)
+	httpx.OK(c, d)
+}
+
+func (a *api) filePolicy(c *gin.Context) {
+	httpx.OK(c, a.s.filePolicy(c.Request.Context(), uid(c)))
+}
