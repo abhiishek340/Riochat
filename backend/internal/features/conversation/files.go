@@ -425,3 +425,450 @@ func (s *service) vectorization(ctx context.Context, rs RuntimeSettings, f FileO
 	}
 	return true, ""
 }
+
+func (s *service) fileDTO(ctx context.Context, rs RuntimeSettings, f FileObject) FileDTO {
+	can, reason := s.vectorization(ctx, rs, f)
+	return FileDTO{
+		FileID: f.FileID, Purpose: f.Purpose, FileName: f.FileName, MimeType: f.MimeType, DetectedMIME: f.DetectedMIME,
+		FileCategory: f.FileCategory, SizeBytes: f.SizeBytes, SHA256: f.SHA256, Status: f.Status,
+		ProcessingStatus: f.ProcessingStatus, ProcessingReady: f.ProcessingReady, ProcessingErrorCode: f.ProcessingErrCode,
+		ProcessingErrorMessage: f.ProcessingErrMsg, ExtractStatus: f.ExtractStatus, EmbedStatus: f.EmbedStatus,
+		EmbedError: f.EmbedError, ChunkCount: f.ChunkCount, RAGOptOut: f.RAGOptOut, CanVectorize: can, VectorizationReason: reason,
+		LastAccessedAt: rfc(f.LastAccessedAt), ExpiresAt: rfc(f.ExpiresAt),
+		CreatedAt: *rfc(&f.CreatedAt), UpdatedAt: *rfc(&f.UpdatedAt),
+	}
+}
+
+// ragReasonOf words why a file is not searchable in the processing status.
+func ragReasonOf(f FileObject, can bool, reason string) string {
+	switch {
+	case f.ProcessingStatus == "failed":
+		return "extract_failed"
+	case can:
+		return reason
+	case f.FileCategory == "image" && (reason == "embedding_disabled" || reason == "rag_disabled"):
+		return "image_not_applicable"
+	case reason == "embedding_disabled":
+		return "rag_disabled"
+	}
+	return reason
+}
+
+func (s *service) processingDTO(ctx context.Context, rs RuntimeSettings, f FileObject) FileProcessingDTO {
+	can, reason := s.vectorization(ctx, rs, f)
+	return FileProcessingDTO{
+		FileID: f.FileID, DetectedMIME: f.DetectedMIME, FileCategory: f.FileCategory, ProcessingStatus: f.ProcessingStatus,
+		ProcessingReady: f.ProcessingReady, ExtractStatus: f.ExtractStatus, EmbedStatus: f.EmbedStatus, PreviewText: f.PreviewText,
+		OCRUsed: f.OCRUsed, RAGReady: f.EmbedStatus == "ready", RAGReason: ragReasonOf(f, can, reason), ErrorCode: f.ProcessingErrCode,
+		ErrorMessage: f.ProcessingErrMsg, ExtractChars: f.ExtractChars, ExtractPages: f.PageCount, ChunkCount: f.ChunkCount,
+		EmbedError: f.EmbedError, CanVectorize: can, VectorizationReason: reason,
+		StartedAt: rfc(f.ProcessingStarted), CompletedAt: rfc(f.ProcessingDone), UpdatedAt: *rfc(&f.UpdatedAt),
+	}
+}
+
+// ----- upload -----
+
+type uploadResult struct {
+	File   FileDTO   `json:"file"`
+	Quota  *QuotaDTO `json:"quota"`
+	Reused bool      `json:"reused"`
+}
+
+// maxUploadNameRunes is the longest stored file name a new upload may carry.
+const maxUploadNameRunes = 255
+
+// sanitizeName turns a client supplied name into the stored form: whitespace
+// runs inside the name become one underscore each, the rest is kept.
+func sanitizeName(n string) string {
+	var b strings.Builder
+	for _, r := range n {
+		if unicode.IsSpace(r) {
+			b.WriteByte('_')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func validFileName(name string) (string, bool) {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return "", false
+	}
+	if strings.ContainsAny(n, "/\\") || n == "." || n == ".." {
+		return "", false
+	}
+	for _, r := range n {
+		if unicode.IsControl(r) {
+			return "", false
+		}
+	}
+	return sanitizeName(n), true
+}
+
+func (s *service) uploadFile(ctx context.Context, userID uint, name, declaredMIME, purpose string, r io.Reader) (*uploadResult, error) {
+	rs := s.settings(ctx)
+	clean, ok := validFileName(path.Base(strings.ReplaceAll(name, "\\", "/")))
+	if !ok {
+		return nil, ErrInvalidFile
+	}
+	if utf8.RuneCountInString(clean) > maxUploadNameRunes {
+		return nil, errors.New("conversation: stored file name is too long")
+	}
+	if strings.TrimSpace(purpose) == "" {
+		purpose = defaultFilePurpose
+	}
+	data, err := io.ReadAll(io.LimitReader(r, rs.MaxUploadBytes+1))
+	if err != nil {
+		return nil, ErrFileInvalidStream.WithCause(err)
+	}
+	if int64(len(data)) > rs.MaxUploadBytes {
+		return nil, ErrFileRequired
+	}
+	head := data
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	detected := detectMIME(clean, head, declaredMIME)
+	if blockedMIME[detected] || blockedExt[strings.ToLower(filepath.Ext(clean))] || blockedMIME[baseMIME(declaredMIME)] {
+		return nil, ErrFileTypeBlocked
+	}
+	if len(rs.AllowedMIMETypes) > 0 && !containsFold(rs.AllowedMIMETypes, detected) {
+		return nil, ErrFileTypeBlocked
+	}
+	category := fileCategory(detected, clean)
+	limit := rs.MaxUploadBytes
+	if category == "image" && rs.ImageMaxBytes > 0 && rs.ImageMaxBytes < limit {
+		limit = rs.ImageMaxBytes
+	} else if category != "image" && rs.DocMaxBytes > 0 && rs.DocMaxBytes < limit {
+		limit = rs.DocMaxBytes
+	}
+	if int64(len(data)) > limit {
+		return nil, ErrFileTooLarge
+	}
+	sum := sha256.Sum256(data)
+	hash := hex.EncodeToString(sum[:])
+
+	// Identical uploads are serialized per user, hash and size, so two
+	// concurrent copies cannot both miss each other's record.
+	unlock := s.uploadGate.lock(itoa(int(userID)) + ":" + hash + ":" + itoa(len(data)))
+	defer unlock()
+	if reused, err := s.reuseVerified(ctx, rs, userID, hash, int64(len(data))); err != nil || reused != nil {
+		return reused, err
+	}
+
+	fileID := newFileID()
+	rel := path.Join(itoa(int(userID)), fileID)
+	if err := s.writeBytes(ctx, rel, data); err != nil {
+		return nil, err
+	}
+	f := FileObject{
+		FileID: fileID, UserID: userID, Purpose: strings.TrimSpace(purpose), FileName: clean, MimeType: baseMIME(declaredMIME),
+		DetectedMIME: detected, FileCategory: category, SizeBytes: int64(len(data)), SHA256: hash, StoragePath: rel,
+		Status: fileStatusActive, ProcessingStatus: "queued", ProcessingReady: false, ExtractStatus: "none",
+		EmbedStatus: "none",
+	}
+	if f.MimeType == "" {
+		f.MimeType = detected
+	}
+	var quota *StorageQuota
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := consumeQuota(tx, userID, f.SizeBytes, rs.UserStorageQuotaBytes, ErrQuotaExceeded); err != nil {
+			return err
+		}
+		if err := tx.Create(&f).Error; err != nil {
+			return err
+		}
+		var err error
+		quota, err = quotaFor(tx, userID, rs.UserStorageQuotaBytes)
+		return err
+	})
+	if err != nil {
+		s.removeBytes(ctx, rel)
+		if database.IsDuplicate(database.Translate(err)) {
+			if reused, rerr := s.reuseVerified(ctx, rs, userID, hash, int64(len(data))); rerr == nil && reused != nil {
+				return reused, nil
+			}
+		}
+		return nil, err
+	}
+	queued := f
+	if inlineProcessing.Load() {
+		s.processFile(ctx, f.ID, data)
+		if err := s.db.WithContext(ctx).Where("id = ?", f.ID).First(&queued).Error; err != nil {
+			return nil, err
+		}
+	} else {
+		go s.processFile(context.WithoutCancel(ctx), f.ID, data)
+	}
+	return &uploadResult{File: s.fileDTO(ctx, rs, queued), Quota: quotaDTO(quota)}, nil
+}
+
+// inlineProcessing makes uploads finish their text processing before the
+// request returns instead of in the background (used by tests).
+var inlineProcessing atomic.Bool
+
+// fileOutcome is the result of processing one uploaded file.
+type fileOutcome struct {
+	status, errCode, errMsg, extract string
+	ready                            bool
+	text, preview                    string
+	chars                            int
+}
+
+const extractFailedMessage = "cannot extract text from this file"
+
+// collapseSpace folds every run of whitespace, newlines included, into one
+// space.
+func collapseSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// evaluateFile works out what text processing makes of an uploaded file.
+func evaluateFile(f FileObject, data []byte) fileOutcome {
+	failed := fileOutcome{status: "failed", errCode: "extract_failed", errMsg: extractFailedMessage, extract: "failed"}
+	ready := fileOutcome{status: "ready", ready: true, extract: "none"}
+	ext := strings.ToLower(filepath.Ext(f.FileName))
+	switch f.FileCategory {
+	case "image", "audio", "video":
+		return ready
+	case "pdf":
+		if bytes.HasPrefix(bytes.TrimLeft(data, "\x00\t\n\r "), []byte("%PDF-")) && bytes.Contains(data, []byte("%%EOF")) {
+			return ready
+		}
+		return failed
+	}
+	if ext == ".xlsx" || ext == ".xls" {
+		if bytes.HasPrefix(data, []byte("PK")) || bytes.HasPrefix(data, []byte{0xD0, 0xCF, 0x11, 0xE0}) {
+			return ready
+		}
+		return failed
+	}
+	if isTextual(f.DetectedMIME, f.FileName) && f.FileCategory != "word" && f.FileCategory != "presentation" {
+		if !utf8.Valid(data) {
+			return failed
+		}
+		text := strings.TrimSpace(string(data))
+		if text == "" {
+			return failed
+		}
+		out := ready
+		out.extract = "ready"
+		out.text = text
+		out.chars = utf8.RuneCountInString(text)
+		out.preview = truncateRunes(collapseSpace(text), previewRunes)
+		return out
+	}
+	return ready
+}
+
+// processFile finishes the text processing of a freshly stored file and then
+// tells the indexer about it.
+func (s *service) processFile(ctx context.Context, id uint, data []byte) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	var f FileObject
+	if err := s.db.WithContext(ctx).Where("id = ? AND status = ?", id, fileStatusActive).First(&f).Error; err != nil {
+		return
+	}
+	now := s.now()
+	out := evaluateFile(f, data)
+	upd := map[string]any{
+		"processing_status": out.status, "processing_ready": out.ready, "processing_error_code": out.errCode,
+		"processing_error_message": out.errMsg, "extract_status": out.extract, "extract_text": out.text,
+		"preview_text": out.preview, "extract_chars": out.chars, "page_count": 0, "processing_completed_at": now,
+		"updated_at": now,
+	}
+	if out.status != "failed" {
+		upd["processing_started_at"] = now
+	}
+	if err := s.db.WithContext(ctx).Model(&FileObject{}).Where("id = ?", id).UpdateColumns(upd).Error; err != nil {
+		s.log.Warn("conversation_file_processing_failed", logx.Err(err))
+		return
+	}
+	if s.ports.Indexer != nil && out.ready {
+		s.ports.Indexer.TextReady(ctx, id)
+	}
+}
+
+// reuseVerified returns the user's existing upload of the same bytes after
+// checking that its object is still in the store with the same size and hash.
+// A record whose object is gone or differs is stale: it is deleted (quota
+// released, object removed) and the search repeats. It returns nil when no
+// usable record exists.
+func (s *service) reuseVerified(ctx context.Context, rs RuntimeSettings, userID uint, hash string, size int64) (*uploadResult, error) {
+	for attempt := 0; attempt < 4; attempt++ {
+		var existing FileObject
+		err := s.db.WithContext(ctx).Where("user_id = ? AND sha256 = ? AND size_bytes = ? AND status = ?", userID, hash, size, fileStatusActive).
+			Order("id ASC").First(&existing).Error
+		if err != nil {
+			if database.IsNotFound(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		stored, rerr := s.readBytes(ctx, existing.StoragePath)
+		switch {
+		case rerr == nil && int64(len(stored)) == size && sha256Hex(stored) == hash:
+			now := s.now()
+			if err := s.db.WithContext(ctx).Model(&FileObject{}).Where("id = ?", existing.ID).UpdateColumn("last_accessed_at", now).Error; err != nil {
+				s.log.Warn("conversation_file_touch_failed", logx.Err(err))
+			}
+			existing.LastAccessedAt = &now
+			quota, qerr := s.userQuota(ctx, userID)
+			if qerr != nil {
+				return nil, qerr
+			}
+			return &uploadResult{File: s.fileDTO(ctx, rs, existing), Quota: quota, Reused: true}, nil
+		case rerr == nil || errors.Is(rerr, ErrFileNotFound):
+			if _, derr := s.removeFile(ctx, &existing); derr != nil {
+				return nil, derr
+			}
+		default:
+			return nil, rerr
+		}
+	}
+	return nil, nil
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// keyedGate serializes work per key within the process.
+type keyedGate struct {
+	mu   sync.Mutex
+	held map[string]*gateEntry
+}
+
+type gateEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (g *keyedGate) lock(key string) func() {
+	g.mu.Lock()
+	if g.held == nil {
+		g.held = map[string]*gateEntry{}
+	}
+	e := g.held[key]
+	if e == nil {
+		e = &gateEntry{}
+		g.held[key] = e
+	}
+	e.refs++
+	g.mu.Unlock()
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		g.mu.Lock()
+		if e.refs--; e.refs == 0 {
+			delete(g.held, key)
+		}
+		g.mu.Unlock()
+	}
+}
+
+func containsFold(list []string, v string) bool {
+	for _, x := range list {
+		if strings.EqualFold(strings.TrimSpace(x), v) {
+			return true
+		}
+	}
+	return false
+}
+
+// ----- lookups -----
+
+func (s *service) getFile(ctx context.Context, userID uint, fileID string) (*FileObject, error) {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" || len(fileID) > 64 {
+		return nil, ErrFileInvalidID
+	}
+	var f FileObject
+	err := s.db.WithContext(ctx).Where("file_id = ? AND user_id = ? AND status = ?", fileID, userID, fileStatusActive).First(&f).Error
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, ErrFileNotFound
+		}
+		return nil, err
+	}
+	return &f, nil
+}
+
+type fileListQuery struct {
+	Q    string
+	Kind string
+	Sort string
+	Page int
+	Size int
+}
+
+// kindCategories maps a "kind" filter value to the stored categories it
+// selects. "document" matches a category no upload produces.
+var kindCategories = map[string][]string{
+	"image": {"image"}, "document": {"document"}, "spreadsheet": {"excel"}, "presentation": {"presentation"},
+	"code": {"text"}, "pdf": {"pdf"}, "audio": {"audio"}, "video": {"video"},
+}
+
+type fileListResult struct {
+	Total   int64     `json:"total"`
+	Results []FileDTO `json:"results"`
+	Quota   *QuotaDTO `json:"quota"`
+}
+
+func (s *service) listFiles(ctx context.Context, userID uint, q fileListQuery, offset, limit int) (*fileListResult, error) {
+	rs := s.settings(ctx)
+	db := s.db.WithContext(ctx).Model(&FileObject{}).Where("user_id = ? AND status = ?", userID, fileStatusActive)
+	if kw := strings.TrimSpace(q.Q); kw != "" {
+		db = db.Where("LOWER(file_name) LIKE ? ESCAPE '!'", "%"+escapeLike(strings.ToLower(kw))+"%")
+	}
+	var kinds []string
+	images := false
+	for _, k := range strings.Split(q.Kind, ",") {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k == "all" {
+			kinds, images = nil, false
+			break
+		}
+		if cats, ok := kindCategories[k]; ok {
+			kinds = append(kinds, cats...)
+			images = images || k == "image"
+		}
+	}
+	if len(kinds) > 0 {
+		if images {
+			// A picture is also whatever was declared as one.
+			db = db.Where("(file_category IN ? OR mime_type LIKE 'image/%')", kinds)
+		} else {
+			db = db.Where("file_category IN ?", kinds)
+		}
+	}
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, err
+	}
+	order := "created_at DESC, id DESC"
+	switch strings.ToLower(strings.TrimSpace(q.Sort)) {
+	case "name":
+		order = "LOWER(file_name) ASC, id ASC"
+	case "size":
+		order = "size_bytes DESC, id DESC"
+	case "last_used":
+		order = "CASE WHEN last_accessed_at IS NULL THEN 1 ELSE 0 END, last_accessed_at DESC, id DESC"
+	}
+	var rows []FileObject
+	if err := db.Order(order).Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	res := &fileListResult{Total: total, Results: make([]FileDTO, 0, len(rows))}
+	for _, f := range rows {
+		res.Results = append(res.Results, s.fileDTO(ctx, rs, f))
+	}
+	quota, err := s.userQuota(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	res.Quota = quota
+	return res, nil
+}
