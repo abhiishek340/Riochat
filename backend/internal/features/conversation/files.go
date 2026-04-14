@@ -872,3 +872,431 @@ func (s *service) listFiles(ctx context.Context, userID uint, q fileListQuery, o
 	res.Quota = quota
 	return res, nil
 }
+
+// openFile returns the bytes of an owned file and refreshes its last-use time.
+func (s *service) openFile(ctx context.Context, userID uint, fileID string) (*FileObject, []byte, error) {
+	f, err := s.getFile(ctx, userID, fileID)
+	if err != nil {
+		return nil, nil, err
+	}
+	data, err := s.readBytes(ctx, f.StoragePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	now := s.now()
+	_ = s.db.WithContext(ctx).Model(&FileObject{}).Where("id = ?", f.ID).UpdateColumn("last_accessed_at", now).Error
+	return f, data, nil
+}
+
+// ExtractDTO is the extracted text object.
+type ExtractDTO struct {
+	FileID       string `json:"fileID"`
+	ExtractText  string `json:"extractText"`
+	PreviewText  string `json:"previewText"`
+	ExtractChars int    `json:"extractChars"`
+	ExtractPages int    `json:"extractPages"`
+	OCRUsed      bool   `json:"ocrUsed"`
+}
+
+func (s *service) extractFile(ctx context.Context, userID uint, fileID string) (*ExtractDTO, error) {
+	f, err := s.getFile(ctx, userID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	if f.ExtractStatus != "ready" {
+		return nil, ErrFileExtractPending
+	}
+	if f.ExtractChars == 0 && strings.TrimSpace(f.ExtractText) == "" {
+		return nil, ErrFileExtractPending
+	}
+	return &ExtractDTO{FileID: f.FileID, ExtractText: f.ExtractText, PreviewText: f.PreviewText, ExtractChars: f.ExtractChars, ExtractPages: f.PageCount, OCRUsed: f.OCRUsed}, nil
+}
+
+func (s *service) processingStatus(ctx context.Context, userID uint, fileID string) (*FileProcessingDTO, error) {
+	f, err := s.getFile(ctx, userID, fileID)
+	if err != nil {
+		if errors.Is(err, ErrFileNotFound) {
+			// A status request for a file the caller cannot see is a server
+			// fault, not a 404.
+			return nil, errors.New("conversation: file status lookup failed: " + err.Error())
+		}
+		return nil, err
+	}
+	d := s.processingDTO(ctx, s.settings(ctx), *f)
+	return &d, nil
+}
+
+func (s *service) processingStatuses(ctx context.Context, userID uint, ids []string) ([]FileProcessingDTO, error) {
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if t := strings.TrimSpace(id); t != "" {
+			clean = append(clean, t)
+		}
+	}
+	clean = dedupeStrings(clean)
+	out := []FileProcessingDTO{}
+	if len(clean) == 0 {
+		return out, nil
+	}
+	var rows []FileObject
+	if err := s.db.WithContext(ctx).Where("user_id = ? AND status = ? AND file_id IN ?", userID, fileStatusActive, clean).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	byID := map[string]FileObject{}
+	for _, r := range rows {
+		byID[r.FileID] = r
+	}
+	rs := s.settings(ctx)
+	for _, id := range clean {
+		if f, ok := byID[id]; ok {
+			out = append(out, s.processingDTO(ctx, rs, f))
+		}
+	}
+	return out, nil
+}
+
+// EmbeddingSubmission is the result of submitting files for embedding.
+type EmbeddingSubmission struct {
+	SubmittedFileIDs []string        `json:"submittedFileIDs"`
+	Skipped          []EmbeddingSkip `json:"skipped"`
+}
+
+// EmbeddingSkip explains why a file was not submitted.
+type EmbeddingSkip struct {
+	FileID string `json:"fileID"`
+	Reason string `json:"reason"`
+}
+
+func (s *service) submitEmbeddings(ctx context.Context, userID uint, ids []string) (*EmbeddingSubmission, error) {
+	if s.ports.Indexer != nil {
+		return s.ports.Indexer.Submit(ctx, userID, ids)
+	}
+	clean := dedupeStrings(trimAll(ids))
+	if len(clean) > maxStatusBatch {
+		return nil, ErrEmbedTooMany
+	}
+	rs := s.settings(ctx)
+	if !rs.RAGAvailable {
+		return nil, ErrEmbedNotConfigured
+	}
+	out := &EmbeddingSubmission{SubmittedFileIDs: []string{}, Skipped: []EmbeddingSkip{}}
+	for _, id := range clean {
+		if id == "" {
+			continue
+		}
+		f, err := s.getFile(ctx, userID, id)
+		if err != nil {
+			out.Skipped = append(out.Skipped, EmbeddingSkip{FileID: id, Reason: "not_found"})
+			continue
+		}
+		if ok, reason := s.vectorization(ctx, rs, *f); !ok {
+			out.Skipped = append(out.Skipped, EmbeddingSkip{FileID: id, Reason: reason})
+			continue
+		}
+		if err := s.db.WithContext(ctx).Model(&FileObject{}).Where("id = ?", f.ID).UpdateColumn("embed_status", "queued").Error; err != nil {
+			return nil, ErrEmbedSubmitFailed.WithCause(err)
+		}
+		out.SubmittedFileIDs = append(out.SubmittedFileIDs, id)
+	}
+	return out, nil
+}
+
+func trimAll(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		out = append(out, strings.TrimSpace(v))
+	}
+	return out
+}
+
+func (s *service) patchFile(ctx context.Context, userID uint, fileID string, name *string, ragOptOut *bool) (*FileDTO, error) {
+	f, err := s.getFile(ctx, userID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	if name == nil && ragOptOut == nil {
+		return nil, ErrFilePatchRequired
+	}
+	upd := map[string]any{}
+	if name != nil {
+		clean, ok := validFileName(path.Base(strings.ReplaceAll(strings.TrimSpace(*name), "\\", "/")))
+		if !ok {
+			return nil, ErrFileInvalidName
+		}
+		upd["file_name"] = clean
+		f.FileName = clean
+	}
+	if ragOptOut != nil {
+		upd["rag_opt_out"] = *ragOptOut
+		f.RAGOptOut = *ragOptOut
+	}
+	if err := s.db.WithContext(ctx).Model(&FileObject{}).Where("id = ?", f.ID).Updates(upd).Error; err != nil {
+		return nil, err
+	}
+	d := s.fileDTO(ctx, s.settings(ctx), *f)
+	return &d, nil
+}
+
+// FileDeleteResult is returned when a file is deleted.
+type FileDeleteResult struct {
+	Deleted bool      `json:"deleted"`
+	FileID  string    `json:"fileID"`
+	Quota   *QuotaDTO `json:"quota"`
+}
+
+// removeFile deletes a file object, its bytes and releases its quota.
+func (s *service) removeFile(ctx context.Context, f *FileObject) (*QuotaDTO, error) {
+	def := s.settings(ctx).UserStorageQuotaBytes
+	var quota *StorageQuota
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Attachment rows are history: a message keeps showing the file it
+		// was sent with after the file itself is gone.
+		if s.ports.Indexer != nil {
+			if err := s.ports.Indexer.Forget(ctx, tx, f.ID); err != nil {
+				return err
+			}
+		} else if err := tx.Where("file_obj_id = ?", f.ID).Delete(&FileChunk{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&FileObject{}).Where("id = ?", f.ID).UpdateColumn("status", fileStatusDeleted).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&FileObject{}, f.ID).Error; err != nil {
+			return err
+		}
+		if err := releaseQuota(tx, f.UserID, f.SizeBytes); err != nil {
+			return err
+		}
+		var err error
+		quota, err = quotaFor(tx, f.UserID, def)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.removeBytes(ctx, f.StoragePath)
+	return quotaDTO(quota), nil
+}
+
+func (s *service) deleteFile(ctx context.Context, userID uint, fileID string) (*FileDeleteResult, error) {
+	f, err := s.getFile(ctx, userID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	inUse, err := s.ports.Capabilities.FileInUse(ctx, userID, f.FileID)
+	if err != nil {
+		return nil, err
+	}
+	if inUse {
+		return nil, ErrFileInUse
+	}
+	quota, err := s.removeFile(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	return &FileDeleteResult{Deleted: true, FileID: f.FileID, Quota: quota}, nil
+}
+
+// cleanupUnreferencedFiles removes files that were attached only to the given
+// (already deleted) conversations. It returns the count and the new quota.
+func (s *service) cleanupUnreferencedFiles(ctx context.Context, userID uint, convIDs []uint) (int, *QuotaDTO, error) {
+	var fileIDs []string
+	if len(convIDs) == 0 {
+		return 0, nil, nil
+	}
+	if err := s.db.WithContext(ctx).Unscoped().Model(&Attachment{}).
+		Where("user_id = ? AND conversation_id IN ? AND status <> ?", userID, convIDs, fileStatusDeleted).
+		Distinct().Pluck("file_id", &fileIDs).Error; err != nil {
+		return 0, nil, err
+	}
+	deleted := 0
+	var last *QuotaDTO
+	for _, id := range fileIDs {
+		var refs int64
+		if err := s.db.WithContext(ctx).Table("chat_attachments AS a").
+			Joins("JOIN chat_conversations c ON c.id = a.conversation_id AND c.deleted_at IS NULL").
+			Where("a.file_id = ? AND a.user_id = ? AND a.status <> ? AND a.deleted_at IS NULL", id, userID, fileStatusDeleted).
+			Count(&refs).Error; err != nil {
+			return deleted, last, err
+		}
+		if refs > 0 {
+			continue
+		}
+		inUse, err := s.ports.Capabilities.FileInUse(ctx, userID, id)
+		if err != nil || inUse {
+			continue
+		}
+		f, err := s.getFile(ctx, userID, id)
+		if err != nil {
+			continue
+		}
+		q, err := s.removeFile(ctx, f)
+		if err != nil {
+			s.log.Warn("conversation_file_remove_failed", logx.Err(err))
+			continue
+		}
+		deleted++
+		last = q
+	}
+	if deleted == 0 {
+		return 0, nil, nil
+	}
+	return deleted, last, nil
+}
+
+// copyFileFor duplicates a file object (and its bytes) for another user.
+func (s *service) copyFileFor(ctx context.Context, tx *gorm.DB, src FileObject, userID uint, quotaErr error) (*FileObject, error) {
+	data, err := s.readBytes(ctx, src.StoragePath)
+	if err != nil {
+		return nil, ErrSharedFileNotFound
+	}
+	// Identical content already owned by the target is reused without quota.
+	var existing FileObject
+	if err := tx.Where("user_id = ? AND sha256 = ? AND size_bytes = ? AND status = ?", userID, src.SHA256, src.SizeBytes, fileStatusActive).First(&existing).Error; err == nil && src.SHA256 != "" {
+		return &existing, nil
+	}
+	if err := consumeQuota(tx, userID, src.SizeBytes, s.settings(ctx).UserStorageQuotaBytes, quotaErr); err != nil {
+		return nil, err
+	}
+	fileID := newFileID()
+	rel := path.Join(itoa(int(userID)), fileID)
+	if err := s.writeBytes(ctx, rel, data); err != nil {
+		return nil, err
+	}
+	dup := src
+	dup.ID, dup.CreatedAt, dup.UpdatedAt, dup.DeletedAt = 0, src.CreatedAt, src.UpdatedAt, src.DeletedAt
+	dup.FileID, dup.UserID, dup.StoragePath = fileID, userID, rel
+	dup.LastAccessedAt = nil
+	dup.ID = 0
+	if err := tx.Create(&dup).Error; err != nil {
+		s.removeBytes(ctx, rel)
+		return nil, err
+	}
+	s.carryIndex(ctx, tx, src, &dup)
+	return &dup, nil
+}
+
+// carryIndex gives a copied file the retrieval index of its source: a ready
+// source with chunks is cloned (chunks and vectors) so the copy is ready at
+// once. In every other case, and when cloning fails, the copy starts as a
+// never-indexed file and is indexed normally later.
+func (s *service) carryIndex(ctx context.Context, tx *gorm.DB, src FileObject, dup *FileObject) {
+	reset := func() {
+		dup.EmbedStatus, dup.EmbedSignature, dup.EmbedError, dup.ChunkCount = "none", "", "", 0
+		tx.Model(&FileObject{}).Where("id = ?", dup.ID).UpdateColumns(map[string]any{
+			"embed_status": "none", "embed_signature": "", "embed_error": "", "chunk_count": 0,
+		})
+	}
+	if s.ports.Indexer == nil || src.EmbedStatus != "ready" || src.ChunkCount <= 0 {
+		reset()
+		return
+	}
+	if err := s.ports.Indexer.Clone(ctx, tx, src.ID, dup.ID); err != nil {
+		s.log.Warn("conversation_index_clone_failed", logErr(err))
+		reset()
+		return
+	}
+	dup.EmbedStatus, dup.EmbedSignature, dup.ChunkCount, dup.EmbedError = "ready", src.EmbedSignature, src.ChunkCount, ""
+}
+
+// storeGenerated saves a generated media file for the user.
+func (s *service) storeGenerated(ctx context.Context, tx *gorm.DB, userID uint, gf GeneratedFile) (*FileObject, error) {
+	name, ok := validFileName(gf.FileName)
+	if !ok {
+		name = "generated-" + newPublicID()[:8]
+	}
+	mimeType := baseMIME(gf.MimeType)
+	if mimeType == "" {
+		mimeType = detectMIME(name, gf.Data, "")
+	}
+	sum := sha256.Sum256(gf.Data)
+	if err := consumeQuota(tx, userID, int64(len(gf.Data)), s.settings(ctx).UserStorageQuotaBytes, ErrQuotaExceeded); err != nil {
+		return nil, err
+	}
+	fileID := newFileID()
+	rel := path.Join(itoa(int(userID)), fileID)
+	if err := s.writeBytes(ctx, rel, gf.Data); err != nil {
+		return nil, err
+	}
+	now := s.now()
+	f := FileObject{
+		FileID: fileID, UserID: userID, Purpose: "generated", FileName: name, MimeType: mimeType, DetectedMIME: mimeType,
+		FileCategory: fileCategory(mimeType, name), SizeBytes: int64(len(gf.Data)), SHA256: hex.EncodeToString(sum[:]),
+		StoragePath: rel, Status: fileStatusActive, ProcessingStatus: "ready", ProcessingReady: true,
+		ExtractStatus: "none", EmbedStatus: "none", ProcessingStarted: &now, ProcessingDone: &now,
+	}
+	if err := tx.Create(&f).Error; err != nil {
+		s.removeBytes(ctx, rel)
+		if database.IsDuplicate(database.Translate(err)) {
+			// Same bytes already stored for this user: reuse that object.
+			var prev FileObject
+			if e := tx.Where("user_id = ? AND sha256 = ? AND size_bytes = ? AND status = ?", userID, f.SHA256, f.SizeBytes, fileStatusActive).First(&prev).Error; e == nil {
+				_ = releaseQuota(tx, userID, f.SizeBytes)
+				return &prev, nil
+			}
+		}
+		return nil, err
+	}
+	return &f, nil
+}
+
+// ----- policy -----
+
+// FilePolicy is the chat file policy object.
+type FilePolicy struct {
+	MaxMessageFiles       int      `json:"maxMessageFiles"`
+	MaxUploadFileBytes    int64    `json:"maxUploadFileBytes"`
+	AllowedMIMETypes      []string `json:"allowedMIMETypes"`
+	ImageMaxBytes         int64    `json:"imageMaxBytes"`
+	DocMaxBytes           int64    `json:"docMaxBytes"`
+	EffectiveImageMaxByte int64    `json:"effectiveImageMaxBytes"`
+	EffectiveDocMaxBytes  int64    `json:"effectiveDocMaxBytes"`
+	FullContextMaxBytes   int64    `json:"fullContextMaxBytes"`
+	FullContextMaxTokens  int      `json:"fullContextMaxTokens"`
+	FullContextPDFMaxPage int      `json:"fullContextPDFMaxPages"`
+	RAGAvailable          bool     `json:"ragAvailable"`
+	RAGAvailabilityReason string   `json:"ragAvailabilityReason"`
+	CapabilityMode        string   `json:"capabilityMode"`
+	FileMode              string   `json:"fileMode"`
+}
+
+func minPositive(a, b int64) int64 {
+	switch {
+	case a > 0 && b > 0:
+		if a < b {
+			return a
+		}
+		return b
+	case a > 0:
+		return a
+	}
+	return b
+}
+
+func (s *service) filePolicy(ctx context.Context, userID uint) FilePolicy {
+	rs := s.settings(ctx)
+	mimes := append([]string(nil), rs.AllowedMIMETypes...)
+	if len(mimes) == 0 {
+		mimes = append(mimes, defaultAllowedMIME...)
+	}
+	sort.Strings(mimes)
+	mode := "full_context_only"
+	if rs.RAGAvailable {
+		mode = "full_context_and_rag"
+	}
+	fileMode := "auto"
+	if v, ok, err := s.ports.Settings.UserSetting(ctx, userID, "chat.file_mode"); err == nil && ok && strings.TrimSpace(v) != "" {
+		fileMode = strings.TrimSpace(v)
+	}
+	return FilePolicy{
+		MaxMessageFiles: rs.MaxMessageFiles, MaxUploadFileBytes: rs.MaxUploadBytes, AllowedMIMETypes: mimes,
+		ImageMaxBytes: rs.ImageMaxBytes, DocMaxBytes: rs.DocMaxBytes,
+		EffectiveImageMaxByte: minPositive(rs.MaxUploadBytes, rs.ImageMaxBytes),
+		EffectiveDocMaxBytes:  minPositive(rs.MaxUploadBytes, rs.DocMaxBytes),
+		FullContextMaxBytes:   rs.FullContextMaxBytes, FullContextMaxTokens: rs.FullContextMaxTokens,
+		FullContextPDFMaxPage: rs.FullContextPDFMaxPages, RAGAvailable: rs.RAGAvailable,
+		RAGAvailabilityReason: rs.RAGAvailabilityReason, CapabilityMode: mode, FileMode: fileMode,
+	}
+}
+
+var _ = bytes.MinRead
