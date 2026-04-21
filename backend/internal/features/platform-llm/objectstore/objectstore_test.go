@@ -187,3 +187,202 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(204)
 	}
 }
+
+func newS3(t *testing.T, f *fakeS3, mut func(*S3Options)) *S3 {
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	o := S3Options{Endpoint: srv.URL, Bucket: "bkt", Prefix: "p", PathStyle: true, AccessKeyID: "AK", SecretAccessKey: "SK",
+		Now: func() time.Time { return time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC) }}
+	if mut != nil {
+		mut(&o)
+	}
+	s, err := NewS3(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestS3PrefixAndRoundTrip(t *testing.T) {
+	f := newFakeS3()
+	s := newS3(t, f, nil)
+	ctx := context.Background()
+	info, err := s.Put(ctx, "/a", strings.NewReader("data"), 4, "text/plain")
+	if err != nil || info.Size != 4 || info.Key != "a" {
+		t.Fatalf("put: %+v %v", info, err)
+	}
+	if _, ok := f.objects["/bkt/p/a"]; !ok {
+		t.Fatalf("object should be p/a in bucket bkt, have %v", f.objects)
+	}
+	if f.lengths[0] != 4 {
+		t.Fatalf("content length: %v", f.lengths)
+	}
+	r := f.reqs[0]
+	if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential=AK/20260301/us-east-1/s3/aws4_request") ||
+		r.Header.Get("x-amz-date") != "20260301T090000Z" {
+		t.Fatalf("signature headers: %v", r.Header)
+	}
+	rc, oi, err := s.Open(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(b) != "data" || oi.ContentType != "text/plain" || oi.Size != 4 || oi.ModTime.Year() != 2026 {
+		t.Fatalf("open: %q %+v", b, oi)
+	}
+	if _, _, err := s.Open(ctx, "zzz"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing: %v", err)
+	}
+	p, cleanup, err := s.Materialize(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(filepath.Base(p), "riochat-object-") {
+		t.Fatalf("temp name %s", p)
+	}
+	if d, _ := os.ReadFile(p); string(d) != "data" {
+		t.Fatal("materialized content")
+	}
+	cleanup()
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatal("cleanup must remove the temp file")
+	}
+	if err := s.Delete(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, "a"); err != nil {
+		t.Fatalf("deleting a missing object: %v", err)
+	}
+	if err := s.Delete(ctx, "  "); err != nil {
+		t.Fatalf("invalid key delete: %v", err)
+	}
+}
+
+func TestS3UnknownSizeAndEscaping(t *testing.T) {
+	f := newFakeS3()
+	s := newS3(t, f, func(o *S3Options) { o.Prefix = "" })
+	if _, err := s.Put(context.Background(), "dir/my file+1.txt", bytes.NewReader([]byte("12345")), -1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if f.lengths[0] != 5 {
+		t.Fatalf("spooled length: %v", f.lengths)
+	}
+	if _, ok := f.objects["/bkt/dir/my file+1.txt"]; !ok {
+		t.Fatalf("keys: %v", f.objects)
+	}
+	if !strings.Contains(f.reqs[0].URL.EscapedPath(), "my%20file%2B1.txt") {
+		t.Fatalf("path not canonically escaped: %s", f.reqs[0].URL.EscapedPath())
+	}
+}
+
+func TestS3RequiresBucketAndVirtualHost(t *testing.T) {
+	if _, err := NewS3(S3Options{}); err == nil || err.Error() != "s3 bucket is required" {
+		t.Fatalf("got %v", err)
+	}
+	s, _ := NewS3(S3Options{Endpoint: "https://r2.example.com", Bucket: "b", Region: ""})
+	u, _ := s.objectURL("k/x")
+	if u.String() != "https://b.r2.example.com/k/x" || s.o.Region != "auto" {
+		t.Fatalf("virtual host url %s region %s", u, s.o.Region)
+	}
+	aws, _ := NewS3(S3Options{Bucket: "b", Region: "eu-west-1"})
+	u, _ = aws.objectURL("k")
+	if u.String() != "https://b.s3.eu-west-1.amazonaws.com/k" {
+		t.Fatalf("aws url %s", u)
+	}
+}
+
+func TestS3AnonymousAndEnvCredentials(t *testing.T) {
+	f := newFakeS3()
+	s := newS3(t, f, func(o *S3Options) {
+		o.AccessKeyID, o.SecretAccessKey = "", ""
+		o.Getenv = func(string) string { return "" }
+	})
+	if _, err := s.Put(context.Background(), "a", strings.NewReader("x"), 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if f.reqs[0].Header.Get("Authorization") != "" {
+		t.Fatal("no credentials: request must be unsigned")
+	}
+	env := map[string]string{"AWS_ACCESS_KEY_ID": "EK", "AWS_SECRET_ACCESS_KEY": "ES", "AWS_SESSION_TOKEN": "tok"}
+	s2 := newS3(t, f, func(o *S3Options) {
+		o.AccessKeyID, o.SecretAccessKey = "", ""
+		o.Getenv = func(k string) string { return env[k] }
+	})
+	if _, err := s2.Put(context.Background(), "b", strings.NewReader("x"), 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	last := f.reqs[len(f.reqs)-1]
+	if !strings.Contains(last.Header.Get("Authorization"), "Credential=EK/") || last.Header.Get("x-amz-security-token") != "tok" {
+		t.Fatalf("env credential chain: %v", last.Header)
+	}
+}
+
+func TestS3ServerErrorSurfaces(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(403)
+		io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>no</Message></Error>`)
+	}))
+	defer srv.Close()
+	s, _ := NewS3(S3Options{Endpoint: srv.URL, Bucket: "b", PathStyle: true})
+	_, err := s.Put(context.Background(), "a", strings.NewReader("x"), 1, "")
+	if err == nil || !strings.Contains(err.Error(), "AccessDenied") || errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+type spanSink struct {
+	mu    sync.Mutex
+	spans []*trace.SpanData
+}
+
+func (s *spanSink) Export(_ context.Context, sp []*trace.SpanData) error {
+	s.mu.Lock()
+	s.spans = append(s.spans, sp...)
+	s.mu.Unlock()
+	return nil
+}
+func (s *spanSink) Shutdown(context.Context) error { return nil }
+
+func TestS3Tracing(t *testing.T) {
+	sink := &spanSink{}
+	tr := trace.New(trace.Options{Exporter: sink, SamplingRate: 1, FlushEvery: time.Hour})
+	f := newFakeS3()
+	s := newS3(t, f, func(o *S3Options) { o.Tracer = tr })
+	ctx := context.Background()
+	s.Put(ctx, "a", strings.NewReader("x"), 1, "text/plain")
+	rc, _, _ := s.Open(ctx, "a")
+	// The open span is still running until the stream closes.
+	tr.Shutdown(ctx)
+	sink.mu.Lock()
+	names := map[string]bool{}
+	for _, sp := range sink.spans {
+		names[sp.Name] = true
+	}
+	sink.mu.Unlock()
+	if !names["objectstore.s3.put"] || names["objectstore.s3.open"] {
+		t.Fatalf("spans before close: %v", names)
+	}
+	rc.Close()
+}
+
+func TestSelectionAndLazyReload(t *testing.T) {
+	dir1, dir2 := t.TempDir(), t.TempDir()
+	cur := config.StorageConfig{Backend: "weird", Local: config.LocalStorageConfig{RootDir: dir1}}
+	lazy := NewLazy(func() Settings { return SettingsFrom(cur) }, nil)
+	ctx := context.Background()
+	if _, err := lazy.Put(ctx, "k", strings.NewReader("v"), 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir1, "k")); err != nil {
+		t.Fatal("unknown backend values select local")
+	}
+	cur.Local.RootDir = dir2
+	if _, _, err := lazy.Open(ctx, "k"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("config change must apply to the next operation: %v", err)
+	}
+	cur.Backend = "s3"
+	if _, err := lazy.Current(); err == nil {
+		t.Fatal("s3 without a bucket must fail")
+	}
+}
