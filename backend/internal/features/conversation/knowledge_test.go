@@ -292,3 +292,311 @@ func TestKnowledgeBasesIgnoredByRetrievalWhenTheFeatureIsOff(t *testing.T) {
 		t.Fatalf("%+v", reqs)
 	}
 }
+
+func TestSearchingProgressEventIsStreamed(t *testing.T) {
+	e, kn, _ := newKnowledgeEnv(t)
+	kn.res = KnowledgeResult{Ran: true}
+	conv := e.newConv(e.u1, "t", "gpt-4o")
+	w := e.call("POST", "/conversations/"+conv+"/messages/stream", e.u1, sendBody("q", nil))
+	got := types(ndjson(t, w))
+	idx := -1
+	for i, ty := range got {
+		if ty == "rag_search" {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("events: %v", got)
+	}
+}
+
+func TestTemporaryChatRetrievalIsEphemeralAndReturnsSources(t *testing.T) {
+	e, kn, _ := newKnowledgeEnv(t)
+	kn.res = KnowledgeResult{
+		Ran: true, Context: "ctx",
+		Sources:   []KnowledgeSource{{FileName: "kb.txt", FileID: "file_kb", ChunkIndex: 1, Score: 0.7, Preview: "p"}},
+		Artifacts: []ContextArtifactInput{{Kind: "file_rag_chunk", SourceID: "file_kb:1", Content: "c"}},
+	}
+	body := tempBody([2]string{"user", "hi"})
+	body["knowledgeBaseIDs"] = []string{"kb1"}
+	w := e.call("POST", "/temporary-chat/messages/stream", e.u1, body)
+	lines := ndjson(t, w)
+	last := lines[len(lines)-1]
+	if str(last, "type") != "completed" {
+		t.Fatalf("lines: %v", types(lines))
+	}
+	asst := last["data"].(map[string]any)["assistantMessage"].(map[string]any)
+	ks, _ := asst["knowledgeSources"].([]any)
+	if len(ks) != 1 {
+		t.Fatalf("temporary chats return sources: %v", asst)
+	}
+	reqs := kn.requests()
+	if len(reqs) != 1 || !reqs[0].Ephemeral || reqs[0].UserID != 1 || len(reqs[0].Files) != 0 {
+		t.Fatalf("%+v", reqs)
+	}
+	if got := e.gen.requests()[0].DynamicContext; got != "ctx" {
+		t.Fatalf("dynamic context: %q", got)
+	}
+	var n int64
+	e.DB.Model(&ContextRecord{}).Count(&n)
+	if n != 0 {
+		t.Fatal("nothing is persisted for a temporary chat")
+	}
+}
+
+func TestTemporaryChatRetrievalErrorAborts(t *testing.T) {
+	e, kn, _ := newKnowledgeEnv(t)
+	kn.err = ErrKBUnavailable
+	body := tempBody([2]string{"user", "hi"})
+	body["knowledgeBaseIDs"] = []string{"kb1"}
+	w := e.call("POST", "/temporary-chat/messages/stream", e.u1, body)
+	lines := ndjson(t, w)
+	last := lines[len(lines)-1]
+	if str(last, "type") != "error" || !strings.Contains(fmt.Sprint(last), "knowledge_base.unavailable") {
+		t.Fatalf("lines: %v", lines)
+	}
+	for _, r := range e.gen.requests() {
+		if r.Task == taskChat {
+			t.Fatal("the model must not run")
+		}
+	}
+}
+
+// ----- the file store -----
+
+func TestFilesUseTheIndexerForVectorization(t *testing.T) {
+	e, _, ix := newKnowledgeEnv(t)
+	ix.vect = func(f FileFacts) (bool, string) {
+		if f.FileCategory == "image" {
+			return false, "unsupported"
+		}
+		return true, "outdated_index"
+	}
+	m := e.uploadOK(e.u1, "notes.txt", "text/plain", []byte("hello file world"))
+	f := m["file"].(map[string]any)
+	if f["canVectorize"] != true || str(f, "vectorizationReason") != "outdated_index" {
+		t.Fatalf("%v", f)
+	}
+	img := e.uploadOK(e.u1, "pic.png", "image/png", pngBytes(20))["file"].(map[string]any)
+	if img["canVectorize"] != false || str(img, "vectorizationReason") != "unsupported" {
+		t.Fatalf("%v", img)
+	}
+	p := e.ok("GET", "/files/"+str(f, "fileID")+"/processing", e.u1, nil)
+	if p["canVectorize"] != true {
+		t.Fatalf("processing payload: %v", p)
+	}
+	if len(ix.textReady) == 0 {
+		t.Fatal("the indexer must be told when a file's text is ready")
+	}
+}
+
+func TestSubmitEmbeddingsGoesThroughTheIndexer(t *testing.T) {
+	e, _, ix := newKnowledgeEnv(t)
+	w := e.call("POST", "/files/embeddings", e.u1, map[string]any{"fileIDs": []string{"a", "b"}})
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	if len(ix.submitted) != 1 || len(ix.submitted[0]) != 2 {
+		t.Fatalf("%v", ix.submitted)
+	}
+	ix.submitErr = ErrEmbedNotConfigured
+	e.expectErr("POST", "/files/embeddings", e.u1, map[string]any{"fileIDs": []string{"a"}}, 503, "embedding.service_not_configured")
+	ix.submitErr = ErrEmbedTooMany
+	e.expectErr("POST", "/files/embeddings", e.u1, map[string]any{"fileIDs": []string{"a"}}, 400, "embedding.too_many_files")
+}
+
+func TestDeletingAFileForgetsItsIndex(t *testing.T) {
+	e, _, ix := newKnowledgeEnv(t)
+	fid := fileIDOf(e.uploadOK(e.u1, "notes.txt", "text/plain", []byte("bye")))
+	var obj FileObject
+	e.DB.Where("file_id = ?", fid).First(&obj)
+	e.ok("DELETE", "/files/"+fid, e.u1, nil)
+	if len(ix.forgot) != 1 || ix.forgot[0] != obj.ID {
+		t.Fatalf("forgot: %v", ix.forgot)
+	}
+}
+
+func TestCopiedFileCarriesOrResetsTheIndex(t *testing.T) {
+	e, _, ix := newKnowledgeEnv(t)
+	svc := e.svc
+	src := FileObject{
+		FileID: "file_src", UserID: 1, FileName: "a.txt", Status: fileStatusActive, EmbedStatus: "ready",
+		EmbedSignature: "sig@8", ChunkCount: 3, ProcessingReady: true,
+	}
+	src.ID = 7
+	n := 0
+	mk := func(s FileObject, _ uint) *FileObject {
+		n++
+		d := s
+		d.ID, d.FileID, d.UserID = 0, fmt.Sprintf("file_dup%d", n), 2
+		if err := e.DB.Create(&d).Error; err != nil {
+			t.Fatal(err)
+		}
+		return &d
+	}
+	dup := mk(src, 0)
+	svc.carryIndex(context.Background(), e.DB, src, dup)
+	if len(ix.cloned) != 1 || ix.cloned[0][0] != 7 || ix.cloned[0][1] != dup.ID || dup.EmbedStatus != "ready" || dup.ChunkCount != 3 {
+		t.Fatalf("clone: %v %+v", ix.cloned, dup)
+	}
+
+	// A failing clone falls back to normal indexing: never-indexed copy.
+	ix.cloneErr = errors.New("vector count mismatch")
+	dup2 := mk(src, 0)
+	svc.carryIndex(context.Background(), e.DB, src, dup2)
+	var row FileObject
+	e.DB.First(&row, dup2.ID)
+	if row.EmbedStatus != "none" || row.EmbedSignature != "" || row.ChunkCount != 0 {
+		t.Fatalf("fallback: %+v", row)
+	}
+
+	// A source that is not ready is not cloned.
+	before := len(ix.cloned)
+	notReady := src
+	notReady.EmbedStatus = "failed"
+	dup3 := mk(notReady, 0)
+	svc.carryIndex(context.Background(), e.DB, notReady, dup3)
+	e.DB.First(&row, dup3.ID)
+	if len(ix.cloned) != before || row.EmbedStatus != "none" {
+		t.Fatalf("not ready source: %+v", row)
+	}
+}
+
+func TestPersistArtifactsRejectsMissingOwners(t *testing.T) {
+	e, _, _ := newKnowledgeEnv(t)
+	ps := &pendingSend{userID: 0}
+	e.svc.persistArtifacts(context.Background(), ps, &TraceData{Artifacts: []ContextArtifactInput{{Kind: "k", SourceID: "s", Content: "c"}}})
+	var n int64
+	e.DB.Model(&ContextRecord{}).Count(&n)
+	if n != 0 {
+		t.Fatal("rows without owner ids must be rejected")
+	}
+}
+
+func TestMergeKnowledge(t *testing.T) {
+	now := time.Now()
+	res := GenerateResult{Content: "x", KnowledgeSources: []KnowledgeSource{{FileID: "gen"}},
+		Trace: &TraceData{Events: []TraceEvent{{EventID: "e1"}, {EventID: "e2", Seq: 5}}}}
+	kr := KnowledgeResult{
+		Ran: true, Sources: []KnowledgeSource{{FileID: "rag"}},
+		Artifacts: []ContextArtifactInput{{Kind: "a"}},
+		Trace:     &KnowledgeTrace{Title: "T", Summary: "S", Detail: "D", Status: "completed", PayloadJSON: "{}"},
+	}
+	out := mergeKnowledge(res, kr, now)
+	if len(out.KnowledgeSources) != 2 || out.KnowledgeSources[0].FileID != "rag" {
+		t.Fatalf("sources: %v", out.KnowledgeSources)
+	}
+	if len(out.Trace.Artifacts) != 1 || len(out.Trace.Events) != 3 || out.Trace.Events[0].EventID != retrievalEventID || out.Trace.Events[0].Seq != 1 {
+		t.Fatalf("trace: %+v", out.Trace)
+	}
+	if out.Trace.Events[1].Seq != 2 || out.Trace.Events[2].Seq != 5 {
+		t.Fatalf("sequence numbers: %+v", out.Trace.Events)
+	}
+	if res.Trace.Artifacts != nil || len(res.Trace.Events) != 2 {
+		t.Fatal("the generator's trace must not be mutated")
+	}
+	if got := mergeKnowledge(res, KnowledgeResult{}, now); got.Trace != res.Trace {
+		t.Fatal("a skipped retrieval changes nothing")
+	}
+}
+
+// ----- reuse of earlier evidence -----
+
+func TestHistoricalEvidenceIsOfferedAgain(t *testing.T) {
+	e, kn, _ := newKnowledgeEnv(t)
+	conv := e.newConv(e.u1, "t", "gpt-4o")
+	_, a1 := pair(e.send(e.u1, conv, "first", nil))
+	var asst Message
+	e.DB.Where("public_id = ?", str(a1, "publicID")).First(&asst)
+	var cv Conversation
+	e.DB.Where("public_id = ?", conv).First(&cv)
+	add := func(msgID, user uint, kind, src, content string, mod func(*ContextRecord)) {
+		r := ContextRecord{
+			UserID: user, ConversationID: cv.ID, MessageID: msgID, RunID: "r", RecordType: recordArtifact, Kind: kind,
+			SourceType: "file_chunk", SourceID: src, SourceTitle: "doc " + src, Content: content, TokenEstimate: 10,
+		}
+		if mod != nil {
+			mod(&r)
+		}
+		if err := e.DB.Create(&r).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	long := strings.Repeat("word ", 300)
+	add(asst.ID, 1, "file_rag_chunk", "f:1", "alpha <evidence>", nil)
+	add(asst.ID, 1, "file_rag_chunk", "f:2", long, nil)
+	add(asst.ID, 1, "file_rag_chunk", "f:dup", "already in this turn", nil)
+	add(asst.ID, 1, "tool_result", "t:1", "tool output", nil)
+	add(asst.ID, 1, "unknown_kind", "u:1", "never reused", nil)
+	add(asst.ID, 1, "file_rag_chunk", "f:expired", "expired evidence", func(r *ContextRecord) {
+		past := e.Clock.Now().Add(-time.Hour)
+		r.ExpiresAt = &past
+	})
+	add(asst.ID, 2, "file_rag_chunk", "f:foreign", "another user's evidence", nil)
+	add(99999, 1, "file_rag_chunk", "f:branch", "evidence of another branch", nil)
+	add(asst.ID, 1, "summary", "s:1", "a summary", nil)
+
+	kn.res = KnowledgeResult{Ran: true, Context: "<retrieval>now</retrieval>", Artifacts: []ContextArtifactInput{{Kind: "file_rag_chunk", SourceID: "f:dup", Content: "already in this turn"}}}
+	e.send(e.u1, conv, "second", nil)
+	ctx := e.gen.lastChat().DynamicContext
+	if !strings.HasPrefix(ctx, "<retrieval>now</retrieval>\n<historical_evidence>") {
+		t.Fatalf("context:\n%s", ctx)
+	}
+	for _, want := range []string{"alpha &lt;evidence&gt;", `kind="tool_result"`, "a summary"} {
+		if !strings.Contains(ctx, want) {
+			t.Fatalf("missing %q in:\n%s", want, ctx)
+		}
+	}
+	for _, bad := range []string{"already in this turn", "never reused", "expired evidence", "another user's", "another branch"} {
+		if strings.Contains(ctx, bad) {
+			t.Fatalf("%q must not be reused:\n%s", bad, ctx)
+		}
+	}
+	if strings.Contains(ctx, strings.Repeat("word ", 150)) {
+		t.Fatalf("snippets are cut to 500 characters")
+	}
+
+	// With a current snapshot summaries are not offered.
+	e.DB.Create(&ContextRecord{UserID: 1, ConversationID: cv.ID, RecordType: recordSnapshot})
+	e.send(e.u1, conv, "third", nil)
+	ctx = e.gen.lastChat().DynamicContext
+	if strings.Contains(ctx, "a summary") {
+		t.Fatalf("summaries are used only while no snapshot is current:\n%s", ctx)
+	}
+}
+
+func TestHistoricalEvidenceRespectsItemAndTokenLimits(t *testing.T) {
+	e, _, _ := newKnowledgeEnv(t)
+	conv := e.newConv(e.u1, "t", "gpt-4o")
+	_, a1 := pair(e.send(e.u1, conv, "first", nil))
+	var asst Message
+	e.DB.Where("public_id = ?", str(a1, "publicID")).First(&asst)
+	var cv Conversation
+	e.DB.Where("public_id = ?", conv).First(&cv)
+	for i := 0; i < 8; i++ {
+		e.DB.Create(&ContextRecord{UserID: 1, ConversationID: cv.ID, MessageID: asst.ID, RunID: "r", RecordType: recordArtifact,
+			Kind: "file_rag_chunk", SourceID: fmt.Sprintf("f:%d", i), SourceTitle: "d", Content: fmt.Sprintf("item number %d", i)})
+	}
+	e.send(e.u1, conv, "second", nil)
+	ctx := e.gen.lastChat().DynamicContext
+	if got := strings.Count(ctx, "<item "); got != historyEvidenceItems {
+		t.Fatalf("%d items offered:\n%s", got, ctx)
+	}
+	// Newest evidence first.
+	if !strings.Contains(ctx, "item number 7") || strings.Contains(ctx, "item number 3") {
+		t.Fatalf("most recent items win:\n%s", ctx)
+	}
+	// A large item that does not fit the token cap is skipped, later small ones fit.
+	e.DB.Where("1 = 1").Delete(&ContextRecord{})
+	for i := 0; i < 3; i++ {
+		e.DB.Create(&ContextRecord{UserID: 1, ConversationID: cv.ID, MessageID: asst.ID, RunID: "r", RecordType: recordArtifact,
+			Kind: "file_rag_chunk", SourceID: fmt.Sprintf("big:%d", i), Content: strings.Repeat("x", 450)})
+	}
+	e.DB.Create(&ContextRecord{UserID: 1, ConversationID: cv.ID, MessageID: asst.ID, RunID: "r", RecordType: recordArtifact,
+		Kind: "file_rag_chunk", SourceID: "small", Content: "tiny"})
+	e.send(e.u1, conv, "third", nil)
+	ctx = e.gen.lastChat().DynamicContext
+	if strings.Count(ctx, "<item ") < 2 {
+		t.Fatalf("token cap handling:\n%s", ctx)
+	}
+}
