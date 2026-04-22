@@ -296,3 +296,275 @@ func (g *generator) buildPrompt(ctx context.Context, req conversation.GenerateRe
 	out.instructions = strings.Join(sections, "\n\n")
 	return out
 }
+
+// chatRun is one attempt against one route.
+type chatRun struct {
+	g       *generator
+	client  *llm.Client
+	req     conversation.GenerateRequest
+	route   *channel.Route
+	tools   *mcp.RunTools
+	prompt  promptParts
+	emit    func(conversation.GenerateEvent)
+	started time.Time
+
+	delivered    int
+	firstTokenMS int64
+	text         strings.Builder
+	reasoning    strings.Builder
+	usage        llm.Usage
+	rawUsage     bool
+	calls        int
+	toolCalls    []conversation.ToolCallRecord
+	serverTools  map[string]int64
+	speed, tier  string
+	responseID   string
+
+	// What the trace says about the prompt and the upstream calls.
+	callLog             []llmCall
+	promptMsgCount      int
+	promptHistoryTokens int
+	promptInstrTokens   int
+	promptFingerprint   string
+	failed              bool
+}
+
+func (c *chatRun) execute(ctx context.Context) (conversation.GenerateResult, error) {
+	lroute := toLLMRoute(c.route)
+	msgs, err := c.messages(ctx)
+	if err != nil {
+		return conversation.GenerateResult{}, err
+	}
+	request := &llm.Request{
+		RequestID: c.req.RequestID, ConversationID: c.req.ConversationPublicID, Messages: msgs,
+		Instructions: joinNonEmpty("\n\n", c.route.SystemPrompt, c.prompt.instructions),
+		Options:      c.options(ctx),
+		Ephemeral:    c.req.Temporary,
+	}
+	c.snapshotPrompt(msgs, request.Instructions)
+	c.processUpdate("running", nil)
+	maxLLM, maxTool := c.req.MaxLLMCalls, 0
+	if c.tools != nil && c.tools.HasTools() {
+		for _, t := range c.tools.Tools() {
+			request.Tools = append(request.Tools, toolDef(t))
+		}
+		l, m := c.tools.Limits()
+		if l > 0 {
+			maxLLM = l
+		}
+		maxTool = m
+	}
+	if maxLLM <= 0 {
+		maxLLM = 5
+	}
+
+	sink := func(ev llm.Event) error {
+		switch ev.Type {
+		case llm.EventText:
+			if ev.Text == "" {
+				return nil
+			}
+			c.mark()
+			c.text.WriteString(ev.Text)
+			c.emit(conversation.GenerateEvent{Type: "delta", Delta: ev.Text})
+		case llm.EventReasoning:
+			if ev.Text == "" {
+				return nil
+			}
+			c.mark()
+			c.reasoning.WriteString(ev.Text)
+			c.emit(conversation.GenerateEvent{Type: "upstream_think_delta", Delta: ev.Text})
+		}
+		return nil
+	}
+
+	executed := 0
+	for {
+		c.calls++
+		call := llmCall{start: time.Now()}
+		res, err := c.client.Stream(ctx, lroute, request, sink)
+		call.end = time.Now()
+		if res != nil {
+			c.absorb(res)
+			call.toolCalls = len(res.ToolCalls)
+			c.usageUpdate()
+		}
+		if err != nil {
+			call.failed = true
+			c.callLog = append(c.callLog, call)
+			c.failed = true
+			return c.result(), err
+		}
+		c.callLog = append(c.callLog, call)
+		if len(res.ToolCalls) == 0 || c.tools == nil {
+			break
+		}
+		if request.DisableTools {
+			c.failed = true
+			return c.result(), conversation.ErrFinalAnswerMissing
+		}
+		// Record the assistant turn that asked for tools, then answer each call.
+		request.Messages = append(request.Messages, llm.Message{
+			Role: llm.RoleAssistant, Content: res.Text, Reasoning: res.Reasoning, ToolCalls: res.ToolCalls,
+		})
+		results := make([]llm.ToolResult, 0, len(res.ToolCalls))
+		for _, tc := range res.ToolCalls {
+			out := c.tools.Call(ctx, mcp.CallRequest{
+				ModelName: tc.Name, ArgumentsJSON: tc.Arguments, UserID: c.req.UserID, RequestID: c.req.RequestID,
+			})
+			executed++
+			results = append(results, llm.ToolResult{
+				CallID: tc.ID, Name: tc.Name, Output: out.ModelOutput, IsError: out.Status == mcp.CallError,
+				Error: out.Error,
+			})
+			c.toolCalls = append(c.toolCalls, conversation.ToolCallRecord{
+				ToolCallID: tc.ID, ToolName: out.ToolName, Status: out.Status, MCPServer: out.ServerName,
+				InputJSON: out.Input, OutputJSON: out.Output, ErrorJSON: out.Error,
+			})
+		}
+		request.Messages = append(request.Messages, llm.Message{Role: llm.RoleTool, ToolResults: results})
+		c.text.Reset()
+		if c.calls >= maxLLM-1 || (maxTool > 0 && executed >= maxTool) || c.tools.Fatal() {
+			request.DisableTools = true
+		}
+	}
+	c.finishExtras()
+	if td := c.buildTrace(false); td != nil && td.Process != nil {
+		c.processUpdate("completed", td.Process)
+	}
+	c.usageUpdate()
+	return c.result(), nil
+}
+
+// traced says whether the run shows live process and usage events.
+func (c *chatRun) traced() bool { return c.req.Task == "chat" && !c.req.Temporary }
+
+// processUpdate publishes the live state of the process block.
+func (c *chatRun) processUpdate(status string, block *conversation.TraceBlock) {
+	if !c.traced() {
+		return
+	}
+	now := time.Now()
+	started := c.started
+	if block == nil {
+		block = &conversation.TraceBlock{
+			Title: "Process", Summary: "Planning the reply", ContentMarkdown: "**Context planning**: preparing the prompt",
+			Status: status, Stage: "context_planning", StartedAt: &started, UpdatedAt: now,
+		}
+	}
+	c.emit(conversation.GenerateEvent{Type: "process_update", Fields: map[string]any{"status": status, "block": block}})
+}
+
+// usageUpdate publishes the token counts reported so far.
+func (c *chatRun) usageUpdate() {
+	if !c.traced() {
+		return
+	}
+	u := c.usage
+	c.emit(conversation.GenerateEvent{Type: "usage", Fields: map[string]any{
+		"input_tokens": u.InputTokens, "output_tokens": u.OutputTokens, "cache_read_tokens": u.CacheReadTokens,
+		"cache_write_tokens": u.CacheWriteTokens, "reasoning_tokens": u.ReasoningTokens,
+	}})
+}
+
+func (c *chatRun) mark() {
+	c.delivered++
+	if c.firstTokenMS == 0 {
+		c.firstTokenMS = time.Since(c.started).Milliseconds()
+		if c.firstTokenMS == 0 {
+			c.firstTokenMS = 1
+		}
+	}
+}
+
+func (c *chatRun) absorb(res *llm.Result) {
+	if res.ID != "" {
+		c.responseID = res.ID
+	}
+	u := res.Usage
+	c.usage.InputTokens += u.InputTokens
+	c.usage.OutputTokens += u.OutputTokens
+	c.usage.CacheReadTokens += u.CacheReadTokens
+	c.usage.CacheWriteTokens += u.CacheWriteTokens
+	c.usage.ReasoningTokens += u.ReasoningTokens
+	if u.Speed != "" {
+		c.speed = u.Speed
+	}
+	if u.ServiceTier != "" {
+		c.tier = u.ServiceTier
+	}
+	if res.ServiceTier != "" {
+		c.tier = res.ServiceTier
+	}
+	for k, v := range res.ServerToolUsage {
+		if c.serverTools == nil {
+			c.serverTools = map[string]int64{}
+		}
+		c.serverTools[k] += int64(v)
+	}
+	if len(res.Text) > 0 && c.text.Len() == 0 {
+		c.text.WriteString(res.Text)
+	}
+	if res.Reasoning != "" && c.reasoning.Len() == 0 {
+		c.reasoning.WriteString(res.Reasoning)
+	}
+}
+
+// finishExtras publishes the billing facts that the result type cannot carry.
+func (c *chatRun) finishExtras() {
+	ex := &runExtras{ServerTools: c.serverTools, Speed: c.speed, ServiceTier: c.tier}
+	if c.tools != nil {
+		for _, u := range c.tools.Usage() {
+			ex.MCP = append(ex.MCP, billing.MCPToolUsage{
+				ServerID: u.ServerID, ServerName: u.ServerName, ToolName: u.ToolName, CallCount: u.Count, PriceNanousd: u.PriceNanoUSD,
+			})
+		}
+	}
+	c.g.h.putExtras(c.req.RunID, ex)
+}
+
+func (c *chatRun) result() conversation.GenerateResult {
+	u := c.usage
+	if c.tools != nil && c.req.RunID != "" {
+		c.finishExtras()
+	}
+	res := conversation.GenerateResult{
+		Content: c.text.String(), Reasoning: c.reasoning.String(),
+		Usage: conversation.Usage{
+			Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadTokens, CacheWrite: u.CacheWriteTokens,
+			Reasoning: u.ReasoningTokens,
+		},
+		Route: routeInfo(c.route, c.req.Model), FirstTokenLatencyMS: c.firstTokenMS,
+		TotalLatencyMS: time.Since(c.started).Milliseconds(), ToolCalls: len(c.toolCalls), ResponseID: c.responseID,
+		Billable: c.calls > 0 && !u.IsZero(),
+	}
+	if tr := c.buildTrace(c.failed); tr != nil {
+		res.Trace = tr
+	} else if len(c.toolCalls) > 0 {
+		res.Trace = &conversation.TraceData{ToolCalls: c.toolCalls}
+	}
+	if res.Usage.Total() == 0 && res.Content != "" {
+		// The upstream reported no usage: estimate so the run is still metered.
+		res.Usage.Output = int64(len([]rune(res.Content))/charsPerToken) + 1
+	}
+	return res
+}
+
+func toolDef(t mcp.ToolSpec) llm.ToolDef {
+	def := llm.ToolDef{Name: t.Name, Description: t.Description, Schema: map[string]any{"type": "object", "properties": map[string]any{}}}
+	var schema map[string]any
+	if len(t.InputSchema) > 0 && json.Unmarshal(t.InputSchema, &schema) == nil && schema != nil {
+		def.Schema = schema
+	}
+	return def
+}
+
+func joinNonEmpty(sep string, parts ...string) string {
+	var out []string
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			out = append(out, strings.TrimSpace(p))
+		}
+	}
+	return strings.Join(out, sep)
+}
