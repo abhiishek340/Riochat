@@ -567,3 +567,304 @@ func TestListSorting(t *testing.T) {
 		}
 	}
 }
+
+func TestListResponseShape(t *testing.T) {
+	env := newEnv(t)
+	seed(t, env, Log{RequestID: "r", ActorUserID: 3, Action: "a", Resource: "b", ResourceID: "c", IP: "1.1.1.1", UserAgent: "ua", DetailJSON: `{"k":1}`})
+	w := env.Do("GET", listURL, env.Bearer(testkit.Admin(1)), nil)
+	var raw struct {
+		Total   int64
+		Results []map[string]any
+	}
+	testkit.Decode(t, w, &raw)
+	want := []string{"id", "requestID", "actorUserID", "actorUsername", "actorDisplayName", "actorLabel", "action", "resource", "resourceID", "ip", "userAgent", "detailJSON", "createdAt", "updatedAt"}
+	if len(raw.Results) != 1 || len(raw.Results[0]) != len(want) {
+		t.Fatalf("fields: %v", raw.Results)
+	}
+	for _, k := range want {
+		if _, ok := raw.Results[0][k]; !ok {
+			t.Errorf("missing field %s", k)
+		}
+	}
+	if s, ok := raw.Results[0]["detailJSON"].(string); !ok || s != `{"k":1}` {
+		t.Errorf("detailJSON must be a string: %v", raw.Results[0]["detailJSON"])
+	}
+	if _, err := time.Parse(time.RFC3339, raw.Results[0]["createdAt"].(string)); err != nil {
+		t.Errorf("createdAt: %v", err)
+	}
+	if testkit.Envelope(t, w).ErrorMsg != "" {
+		t.Error("errorMsg must be empty on success")
+	}
+}
+
+func TestListActorLabels(t *testing.T) {
+	env := newEnv(t)
+	calls := map[uint]int{}
+	SetActorResolver(ActorResolverFunc(func(_ context.Context, id uint) (Actor, bool, error) {
+		calls[id]++
+		switch id {
+		case 1:
+			return Actor{Username: "ann01", DisplayName: "Ann"}, true, nil
+		case 2:
+			return Actor{Username: "ann01", DisplayName: "  "}, true, nil
+		case 3:
+			return Actor{}, true, nil
+		case 4:
+			return Actor{}, false, nil // deleted
+		default:
+			return Actor{}, false, errors.New("db down")
+		}
+	}))
+	seed(t, env,
+		Log{ActorUserID: 1}, Log{ActorUserID: 1}, Log{ActorUserID: 1},
+		Log{ActorUserID: 2}, Log{ActorUserID: 3}, Log{ActorUserID: 4}, Log{ActorUserID: 5}, Log{ActorUserID: 0},
+	)
+	p := list(t, env, "?sort=id_asc")
+	if len(p.Results) != 8 {
+		t.Fatalf("lookup failures must not fail the request: %d", len(p.Results))
+	}
+	type trio struct{ user, display, label string }
+	got := map[uint]trio{}
+	for _, r := range p.Results {
+		got[r.ActorUserID] = trio{r.ActorUsername, r.ActorDisplayName, r.ActorLabel}
+	}
+	want := map[uint]trio{
+		1: {"ann01", "Ann", "Ann"},
+		2: {"ann01", "  ", "ann01"},
+		3: {"", "", "3"},
+		4: {"", "", ""},
+		5: {"", "", ""},
+		0: {"", "", ""},
+	}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("actor %d: %+v want %+v", id, got[id], w)
+		}
+	}
+	if calls[1] != 1 {
+		t.Errorf("distinct actors must be resolved once per request, got %d", calls[1])
+	}
+	if _, ok := calls[0]; ok {
+		t.Error("actor 0 must not be looked up")
+	}
+}
+
+func TestListWithoutResolverLeavesNamesEmpty(t *testing.T) {
+	env := newEnv(t)
+	seed(t, env, Log{ActorUserID: 9})
+	r := list(t, env, "").Results[0]
+	if r.ActorUserID != 9 || r.ActorLabel != "" || r.ActorUsername != "" {
+		t.Fatalf("%+v", r)
+	}
+}
+
+func TestListAccessControl(t *testing.T) {
+	env := newEnv(t)
+	testkit.Expect(t, env.Do("GET", listURL, nil, nil), 401, "auth.invalid_token")
+	testkit.Expect(t, env.Do("GET", listURL, env.Bearer(testkit.User(5)), nil), 403, "auth.admin_required")
+	testkit.Expect(t, env.Do("GET", listURL, env.Bearer(testkit.Admin(5)), nil), 200, "")
+	super := testkit.Admin(6)
+	super.Role = "superadmin"
+	testkit.Expect(t, env.Do("GET", listURL, env.Bearer(super), nil), 200, "")
+}
+
+func TestListAvailableInLocalMode(t *testing.T) {
+	env := newEnv(t, testkit.WithConfig(func(c *config.Config) { c.Local = config.LocalConfig{Enabled: true, DataDir: "/x"} }))
+	testkit.Expect(t, env.Do("GET", listURL, env.Bearer(testkit.Admin(1)), nil), 200, "")
+}
+
+func TestListStorageFailureIsGeneric(t *testing.T) {
+	env := newEnv(t)
+	if err := env.DB.Migrator().DropTable(&Log{}); err != nil {
+		t.Fatal(err)
+	}
+	w := env.Do("GET", listURL, env.Bearer(testkit.Admin(1)), nil)
+	testkit.Expect(t, w, 500, "internal.error")
+	body := strings.ToLower(w.Body.String())
+	if strings.Contains(body, "no such table") || strings.Contains(body, "audit_logs") {
+		t.Fatalf("storage text leaked: %s", w.Body)
+	}
+}
+
+func TestNoWriteEndpoints(t *testing.T) {
+	env := newEnv(t)
+	admin := env.Bearer(testkit.Admin(1))
+	for _, m := range []string{"POST", "PUT", "PATCH", "DELETE"} {
+		for _, path := range []string{listURL, listURL + "/1"} {
+			w := env.Do(m, path, admin, map[string]string{})
+			if w.Code != 404 && w.Code != 405 {
+				t.Errorf("%s %s: %d", m, path, w.Code)
+			}
+		}
+	}
+}
+
+func TestSoftDeletedRowsAreHidden(t *testing.T) {
+	env := newEnv(t)
+	seed(t, env, Log{Action: "keep"}, Log{Action: "gone"})
+	env.DB.Where("action = ?", "gone").Delete(&Log{})
+	if p := list(t, env, ""); p.Total != 1 || p.Results[0].Action != "keep" {
+		t.Fatalf("%+v", p)
+	}
+}
+
+func TestMigrationsAreIdempotentAndSchemaMatches(t *testing.T) {
+	env := newEnv(t)
+	seen := map[string]bool{}
+	for _, s := range Migrations() {
+		if seen[s.Name] {
+			t.Fatalf("duplicate step %s", s.Name)
+		}
+		seen[s.Name] = true
+	}
+	m := env.DB.Migrator()
+	for _, col := range []string{"id", "created_at", "updated_at", "deleted_at", "request_id", "actor_user_id", "action", "resource", "resource_id", "ip", "user_agent", "detail_json"} {
+		if !m.HasColumn(&Log{}, col) {
+			t.Errorf("missing column %s", col)
+		}
+	}
+	if (Log{}).TableName() != "audit_logs" {
+		t.Error("table name")
+	}
+	for _, idx := range []string{"idx_audit_logs_request_id", "idx_audit_logs_actor_user_id", "idx_audit_logs_action", "idx_audit_logs_resource", "idx_audit_logs_resource_id", "idx_audit_logs_deleted_at", "idx_audit_logs_created_at"} {
+		if !m.HasIndex(&Log{}, idx) {
+			t.Errorf("missing index %s", idx)
+		}
+	}
+}
+
+// ---- cleanup ----
+
+func cleanupBody(typ, before string) map[string]string {
+	return map[string]string{"type": typ, "before": before}
+}
+
+func TestCleanupPurgesStrictlyOlderAndAudits(t *testing.T) {
+	env := newEnv(t)
+	cutoff := env.Clock.Now().Add(-time.Hour)
+	seed(t, env,
+		Log{Model: modelAt(cutoff.Add(-2 * time.Hour)), Action: "old1"},
+		Log{Model: modelAt(cutoff.Add(-time.Second)), Action: "old2"},
+		Log{Model: modelAt(cutoff), Action: "exact"},
+		Log{Model: modelAt(cutoff.Add(time.Minute)), Action: "new"},
+	)
+	// A soft-deleted old row must also be physically removed.
+	seed(t, env, Log{Model: modelAt(cutoff.Add(-time.Minute)), Action: "soft"})
+	env.DB.Where("action = ?", "soft").Delete(&Log{})
+
+	w := env.Do("POST", "/api/v1/admin/logs/cleanup", env.Bearer(testkit.Admin(1)), cleanupBody(" Audit ", cutoff.Format(time.RFC3339)))
+	testkit.Expect(t, w, 200, "")
+	var out struct {
+		Type         string
+		Before       string
+		DeletedCount int64
+	}
+	testkit.Decode(t, w, &out)
+	if out.Type != "audit" || out.DeletedCount != 3 || out.Before != cutoff.Format(time.RFC3339) {
+		t.Fatalf("response: %+v", out)
+	}
+	var n int64
+	env.DB.Unscoped().Model(&Log{}).Where("action IN ?", []string{"old1", "old2", "soft"}).Count(&n)
+	if n != 0 {
+		t.Fatalf("old rows survive (unscoped): %d", n)
+	}
+	p := list(t, env, "?sort=id_asc")
+	if p.Total != 3 {
+		t.Fatalf("want exact + new + purge entry, got %d", p.Total)
+	}
+	last := p.Results[2]
+	if last.Action != "admin_cleanup_logs" || last.Resource != "logs" || last.ResourceID != "audit" || last.ActorUserID != 1 {
+		t.Fatalf("purge entry: %+v", last)
+	}
+	for _, frag := range []string{`"type":"audit"`, `"deleted_count":3`, `"before":"` + cutoff.Format(time.RFC3339) + `"`} {
+		if !strings.Contains(last.DetailJSON, frag) {
+			t.Errorf("detail %s lacks %s", last.DetailJSON, frag)
+		}
+	}
+}
+
+func TestCleanupRejectionsDeleteAndRecordNothing(t *testing.T) {
+	env := newEnv(t)
+	seed(t, env, Log{Model: modelAt(env.Clock.Now().Add(-48 * time.Hour)), Action: "old"})
+	admin := env.Bearer(testkit.Admin(1))
+	past := env.Clock.Now().Add(-time.Hour).Format(time.RFC3339)
+	cases := []struct {
+		name string
+		body any
+		code string
+	}{
+		{"unknown type", cleanupBody("runs", past), "request.invalid_log_cleanup_type"},
+		{"future", cleanupBody("audit", env.Clock.Now().Add(time.Hour).Format(time.RFC3339)), "log_cleanup.before_in_future"},
+		{"bad before", cleanupBody("audit", "yesterday"), "request.invalid_log_cleanup_before"},
+		{"zero time", cleanupBody("audit", "0001-01-01T00:00:00Z"), "request.invalid_log_cleanup_before"},
+		{"missing before", map[string]string{"type": "audit"}, "request.invalid_body"},
+		{"missing type", map[string]string{"before": past}, "request.invalid_body"},
+		{"not json", "nope", "request.invalid_body"},
+	}
+	for _, tc := range cases {
+		testkit.Expect(t, env.Do("POST", "/api/v1/admin/logs/cleanup", admin, tc.body), 400, tc.code)
+	}
+	if p := list(t, env, ""); p.Total != 1 {
+		t.Fatalf("rows changed: %d", p.Total)
+	}
+	testkit.Expect(t, env.Do("POST", "/api/v1/admin/logs/cleanup", env.Bearer(testkit.User(2)), cleanupBody("audit", past)), 403, "auth.admin_required")
+}
+
+func TestCleanupMessages(t *testing.T) {
+	env := newEnv(t)
+	admin := env.Bearer(testkit.Admin(1))
+	w := env.Do("POST", "/api/v1/admin/logs/cleanup", admin, cleanupBody("audit", env.Clock.Now().Add(time.Hour).Format(time.RFC3339)))
+	if m := testkit.Envelope(t, w).ErrorMsg; m != "log cleanup before must not be in the future" {
+		t.Fatalf("future message: %q", m)
+	}
+	w = env.Do("POST", "/api/v1/admin/logs/cleanup", admin, cleanupBody("x", "bad"))
+	if m := testkit.Envelope(t, w).ErrorMsg; m != "invalid log cleanup before" {
+		t.Fatalf("before message: %q", m)
+	}
+	w = env.Do("POST", "/api/v1/admin/logs/cleanup", admin, cleanupBody("x", env.Clock.Now().Format(time.RFC3339)))
+	if m := testkit.Envelope(t, w).ErrorMsg; m != "invalid log cleanup type" {
+		t.Fatalf("type message: %q", m)
+	}
+}
+
+func TestValidateCleanup(t *testing.T) {
+	now := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	for _, typ := range []string{"audit", "auth", "usage", "orders", "conversation", "moderation", "errors", " ERRORS "} {
+		got, _, err := ValidateCleanup(typ, "2026-02-01T00:00:00Z", now)
+		if err != nil || got != strings.ToLower(strings.TrimSpace(typ)) {
+			t.Errorf("%q: %q %v", typ, got, err)
+		}
+	}
+	if _, b, err := ValidateCleanup("audit", now.Format(time.RFC3339), now); err != nil || !b.Equal(now) {
+		t.Errorf("before == now is allowed: %v", err)
+	}
+	if _, _, err := ValidateCleanup("audit", "2026-03-01T09:00:01Z", now); !errors.Is(err, ErrCleanupBeforeFuture) {
+		t.Errorf("future: %v", err)
+	}
+	// Order: bad before beats bad type.
+	if _, _, err := ValidateCleanup("nope", "bad", now); !errors.Is(err, ErrInvalidCleanupBefore) {
+		t.Errorf("order: %v", err)
+	}
+	if _, _, err := ValidateCleanup("", "2026-02-01T00:00:00Z", now); !errors.Is(err, ErrInvalidCleanupType) {
+		t.Errorf("empty type: %v", err)
+	}
+}
+
+func TestPurgeBeforeStorageFailure(t *testing.T) {
+	env := newEnv(t)
+	_ = env.DB.Migrator().DropTable(&Log{})
+	if _, err := PurgeBefore(context.Background(), env.DB, env.Clock.Now()); err == nil {
+		t.Fatal("expected storage error")
+	}
+}
+
+func TestCleanupFailureWritesNoAuditEntry(t *testing.T) {
+	env := newEnv(t)
+	// Drop the table: the purge fails with 500 and nothing is recorded.
+	_ = env.DB.Migrator().DropTable(&Log{})
+	w := env.Do("POST", "/api/v1/admin/logs/cleanup", env.Bearer(testkit.Admin(1)), cleanupBody("audit", env.Clock.Now().Add(-time.Hour).Format(time.RFC3339)))
+	testkit.Expect(t, w, 500, "internal.error")
+	if strings.Contains(env.Logs.String(), CleanupAction) {
+		t.Fatalf("audit line written for a failed purge: %s", env.Logs)
+	}
+}
