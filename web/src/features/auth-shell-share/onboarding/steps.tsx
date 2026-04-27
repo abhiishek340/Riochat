@@ -219,3 +219,152 @@ export function TwoFactorStep({ flow, alreadyEnabled, unavailable }: { flow: Onb
     </StepFrame>
   );
 }
+
+export function ThemeStep({ flow }: { flow: OnboardingFlow }) {
+  const t = useT();
+  return (
+    <StepFrame title={t("onboarding.theme.title")} description={t("onboarding.theme.body")}>
+      <div role="radiogroup" aria-label={t("onboarding.theme.title")} className="grid grid-cols-2 gap-3">
+        {PRESET_CHOICES.map((accent) => {
+          const active = flow.preset === accent;
+          return (
+            <button
+              key={accent}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              data-accent={accent}
+              onClick={() => flow.choosePreset(accent)}
+              className={cn(
+                "flex items-center gap-3 rounded-xl border p-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                active ? "border-primary bg-accent" : "hover:bg-muted",
+              )}
+            >
+              <span aria-hidden className="size-8 shrink-0 rounded-full bg-primary shadow-inner" />
+              <span className="grid">
+                <span className="text-sm font-medium">{t(`shell.theme.accents.${accent}`)}</span>
+                <span className="text-xs text-muted-foreground">{t(`onboarding.theme.hints.${accent}`)}</span>
+              </span>
+              {active ? <Check className="ml-auto size-4 text-primary" /> : null}
+            </button>
+          );
+        })}
+      </div>
+      <Actions>
+        <Button variant="ghost" onClick={flow.back} disabled={flow.busy}>
+          {t("common.actions.back")}
+        </Button>
+        <Button onClick={() => void flow.saveTheme()} loading={flow.busy}>
+          {t("common.actions.continue")}
+        </Button>
+      </Actions>
+    </StepFrame>
+  );
+}
+
+const MODES: { value: ThemeMode; icon: typeof Sun; key: "light" | "system" | "dark" }[] = [
+  { value: "light", icon: Sun, key: "light" },
+  { value: "system", icon: Monitor, key: "system" },
+  { value: "dark", icon: Moon, key: "dark" },
+];
+
+export function PersonalizeStep({ flow, profileTimezone }: { flow: OnboardingFlow; profileTimezone: string }) {
+  const t = useT();
+  const zones = timezoneChoices(flow.timezone);
+  const synced = flow.timezone === flow.deviceZone;
+  void profileTimezone;
+  return (
+    <StepFrame title={t("onboarding.personalize.title")} description={t("onboarding.personalize.body")}>
+      <Field>
+        <FieldLabel>{t("onboarding.personalize.timezone")}</FieldLabel>
+        <div className="flex gap-2">
+          <NativeSelect value={flow.timezone} onChange={(e) => flow.setTimezone(e.target.value)}>
+            {zones.map((z) => (
+              <option key={z} value={z}>
+                {z}
+              </option>
+            ))}
+          </NativeSelect>
+          <Button type="button" variant="outline" disabled={synced} onClick={() => flow.setTimezone(flow.deviceZone)}>
+            {t("onboarding.personalize.useDevice")}
+          </Button>
+        </div>
+        <FieldHint>{t("onboarding.personalize.deviceHint", { zone: flow.deviceZone })}</FieldHint>
+      </Field>
+      <div className="grid gap-1.5">
+        <span className="text-sm font-medium">{t("onboarding.personalize.mode")}</span>
+        <div role="radiogroup" aria-label={t("onboarding.personalize.mode")} className="grid grid-cols-3 gap-2">
+          {MODES.map(({ value, icon: Icon, key }) => (
+            <button
+              key={value}
+              type="button"
+              role="radio"
+              aria-checked={flow.mode === value}
+              onClick={() => flow.setMode(value)}
+              className={cn(
+                "flex flex-col items-center gap-1.5 rounded-xl border p-3 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                flow.mode === value ? "border-primary bg-accent font-medium" : "hover:bg-muted",
+              )}
+            >
+              <Icon className="size-5" />
+              {t(`shell.theme.${key}`)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <Actions>
+        <Button variant="ghost" onClick={flow.back} disabled={flow.busy}>
+          {t("common.actions.back")}
+        </Button>
+        <Button onClick={() => void flow.savePersonalization()} loading={flow.busy}>
+          {t("common.actions.continue")}
+        </Button>
+      </Actions>
+    </StepFrame>
+  );
+}
+
+export function ReadyStep({ flow, admin }: { flow: OnboardingFlow; admin: boolean }) {
+  const t = useT();
+  const [copied, setCopied] = useState(false);
+  const description = flow.bootstrap ? t("onboarding.ready.bootstrapBody") : admin ? t("onboarding.ready.adminBody") : t("onboarding.ready.userBody");
+  const copyAll = async () => {
+    const ok = await copyText(flow.recoveryCodes.join("\n"));
+    if (ok) {
+      setCopied(true);
+      toast.success(t("onboarding.ready.codesCopied"));
+      setTimeout(() => setCopied(false), 1800);
+    } else {
+      toast.error(t("onboarding.twoFactor.copyFailed"));
+    }
+  };
+  return (
+    <StepFrame title={t("onboarding.ready.title")} description={description}>
+      {flow.recoveryCodes.length > 0 ? (
+        <div className="grid gap-2 rounded-xl border bg-muted/40 p-4">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-medium">{t("onboarding.ready.recoveryTitle")}</h3>
+            <Button type="button" variant="outline" size="sm" onClick={() => void copyAll()}>
+              {copied ? <Check /> : <Copy />}
+              {t("onboarding.ready.copyAll")}
+            </Button>
+          </div>
+          <p className="text-[13px] text-muted-foreground">{t("onboarding.ready.recoveryHint")}</p>
+          <ul className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-[13px]">
+            {flow.recoveryCodes.map((c) => (
+              <li key={c}>{c}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      <Actions>
+        <Button variant="ghost" onClick={flow.back} disabled={flow.busy}>
+          {t("common.actions.back")}
+        </Button>
+        <Button onClick={() => void flow.finish()} loading={flow.busy}>
+          {t("onboarding.ready.finish")}
+        </Button>
+      </Actions>
+    </StepFrame>
+  );
+}
