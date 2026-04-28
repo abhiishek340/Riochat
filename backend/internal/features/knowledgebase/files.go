@@ -195,3 +195,151 @@ func (s *Service) addFiles(ctx context.Context, a access, actor uint, publicID s
 		return bumpRevision(tx, kb.ID, now)
 	})
 }
+
+func bumpRevision(tx *gorm.DB, baseID uint, now time.Time) error {
+	return tx.Model(&KnowledgeBase{}).Where("id = ?", baseID).Updates(map[string]any{
+		"revision":   gorm.Expr("revision + 1"),
+		"updated_at": now,
+	}).Error
+}
+
+// removeFile unlinks one file from a base; the file object is kept.
+func (s *Service) removeFile(ctx context.Context, a access, publicID, fileID string) error {
+	fid := strings.TrimSpace(fileID)
+	if fid == "" {
+		return ErrInvalid
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		kb, err := s.find(ctx, tx, a, publicID, true)
+		if err != nil {
+			return err
+		}
+		var obj fileObject
+		if err := s.linked(ctx, tx, kb.ID).Select("file_objects.*").
+			Where("file_objects.file_id = ?", fid).Take(&obj).Error; err != nil {
+			return translate(err)
+		}
+		res := tx.Where("knowledge_base_id = ? AND file_object_id = ?", kb.ID, obj.ID).Delete(&KnowledgeBaseFile{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return bumpRevision(tx, kb.ID, s.clock.Now())
+	})
+}
+
+// ----- processing status -----
+
+func (s *Service) statusesFor(ctx context.Context, baseID uint, ids []string) ([]StatusView, error) {
+	out := []StatusView{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []fileObject
+	if err := s.linked(ctx, s.db, baseID).Select("file_objects.*").
+		Where("file_objects.file_id IN ?", ids).
+		Order("kbf.sort_order ASC").Order("file_objects.id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		out = append(out, s.statusView(ctx, &rows[i]))
+	}
+	return out, nil
+}
+
+func (s *Service) statuses(ctx context.Context, a access, publicID string, fileIDs []string) ([]StatusView, error) {
+	ids := normalizeIDs(fileIDs)
+	if len(ids) == 0 || len(fileIDs) > maxFileIDsPerCall {
+		return nil, ErrInvalid
+	}
+	kb, err := s.find(ctx, s.db, a, publicID, false)
+	if err != nil {
+		return nil, err
+	}
+	return s.statusesFor(ctx, kb.ID, ids)
+}
+
+type snapshot struct {
+	KnowledgeBase KnowledgeBaseView `json:"knowledgeBase"`
+	Statuses      []StatusView      `json:"statuses"`
+}
+
+func (s *Service) snapshot(ctx context.Context, a access, publicID string, fileIDs []string) (*snapshot, error) {
+	ids := normalizeIDs(fileIDs)
+	if len(fileIDs) > 0 && len(ids) == 0 || len(fileIDs) > maxFileIDsPerCall {
+		return nil, ErrInvalid
+	}
+	kb, err := s.find(ctx, s.db, a, publicID, false)
+	if err != nil {
+		return nil, err
+	}
+	view, err := s.viewOf(ctx, kb)
+	if err != nil {
+		return nil, err
+	}
+	sts, err := s.statusesFor(ctx, kb.ID, ids)
+	if err != nil {
+		return nil, err
+	}
+	return &snapshot{KnowledgeBase: *view, Statuses: sts}, nil
+}
+
+// ----- content -----
+
+// openContent streams a file that is linked to a base the caller may reach.
+// The bytes are read on behalf of the file's real owner.
+func (s *Service) openContent(ctx context.Context, a access, publicID, fileID string) (*FileContent, error) {
+	fid := strings.TrimSpace(fileID)
+	if fid == "" {
+		return nil, ErrInvalid
+	}
+	kb, err := s.find(ctx, s.db, a, publicID, false)
+	if err != nil {
+		return nil, err
+	}
+	var obj fileObject
+	if err := s.linked(ctx, s.db, kb.ID).Select("file_objects.*").
+		Where("file_objects.file_id = ?", fid).Take(&obj).Error; err != nil {
+		return nil, translate(err)
+	}
+	return s.read(ctx, &obj)
+}
+
+// openPoolContent streams a platform pool file.
+func (s *Service) openPoolContent(ctx context.Context, fileID string) (*FileContent, error) {
+	fid := strings.TrimSpace(fileID)
+	if fid == "" {
+		return nil, ErrInvalid
+	}
+	var obj fileObject
+	if err := s.db.WithContext(ctx).
+		Where("file_id = ? AND user_id = ? AND status = ?", fid, 0, fileStatusActive).
+		Take(&obj).Error; err != nil {
+		if errors.Is(translate(err), ErrNotFound) {
+			return nil, ErrFileNotFound
+		}
+		return nil, err
+	}
+	return s.read(ctx, &obj)
+}
+
+func (s *Service) read(ctx context.Context, obj *fileObject) (*FileContent, error) {
+	if s.ports.Reader == nil {
+		return nil, ErrInternal.WithCause(errNoReader)
+	}
+	fc, err := s.ports.Reader.OpenFile(ctx, obj.UserID, obj.FileID)
+	if err != nil {
+		return nil, err
+	}
+	if fc.FileName == "" {
+		fc.FileName = obj.FileName
+	}
+	if fc.MimeType == "" {
+		fc.MimeType = obj.MimeType
+	}
+	return fc, nil
+}
+
+var errNoReader = errors.New("knowledgebase: no file reader configured")
