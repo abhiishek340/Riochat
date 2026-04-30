@@ -150,3 +150,164 @@ func TestEveryFieldHasItsLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestRecorderMasksSecretsAgain(t *testing.T) {
+	h := newHarness(t)
+	e, _ := h.rec.normalize(middleware.ErrorRecord{
+		RequestID: "r",
+		Cause:     "call failed password=hunter2",
+		Detail:    `{"error":{"message":"model not found","api_key=sk-live-123"}}`,
+	})
+	if strings.Contains(e.Cause, "hunter2") || !strings.Contains(e.Cause, "password=REDACTED") {
+		t.Fatalf("cause: %q", e.Cause)
+	}
+	if !strings.Contains(e.Detail, "model not found") || strings.Contains(e.Detail, "sk-live-123") {
+		t.Fatalf("detail: %q", e.Detail)
+	}
+}
+
+func TestExplicitOccurrenceTimeIsKept(t *testing.T) {
+	h := newHarness(t)
+	at := time.Date(2025, 12, 24, 10, 0, 0, 0, time.FixedZone("x", 3600))
+	h.rec.RecordError(context.Background(), middleware.ErrorRecord{RequestID: "r", Status: 500, At: at})
+	h.wg.Wait()
+	var e Entry
+	h.db.First(&e)
+	if !e.CreatedAt.Equal(at) {
+		t.Fatalf("created_at %v want %v", e.CreatedAt, at)
+	}
+}
+
+func TestSameRequestIDMayRepeat(t *testing.T) {
+	h := newHarness(t)
+	for i := 0; i < 2; i++ {
+		h.rec.RecordError(context.Background(), middleware.ErrorRecord{RequestID: "dup", Status: 500})
+	}
+	h.wg.Wait()
+	if n := h.count(t); n != 2 {
+		t.Fatalf("rows: %d", n)
+	}
+}
+
+func TestConcurrencyCapDropsExcess(t *testing.T) {
+	h := newHarness(t)
+	release := make(chan struct{})
+	var started atomic.Int32
+	real := h.rec.insert
+	h.rec.insert = func(ctx context.Context, e *Entry) error {
+		started.Add(1)
+		<-release
+		return real(ctx, e)
+	}
+	for i := 0; i < 37; i++ {
+		h.rec.RecordError(context.Background(), middleware.ErrorRecord{RequestID: fmt.Sprintf("r-%d", i), Status: 500})
+	}
+	if got := h.rec.Dropped(); got != 5 {
+		t.Fatalf("dropped %d want 5", got)
+	}
+	// While saturated, the next record is dropped too.
+	h.rec.RecordError(context.Background(), middleware.ErrorRecord{RequestID: "extra", Status: 500})
+	if got := h.rec.Dropped(); got != 6 {
+		t.Fatalf("dropped %d want 6", got)
+	}
+	close(release)
+	h.wg.Wait()
+	if n := h.count(t); n != 32 {
+		t.Fatalf("rows %d want 32", n)
+	}
+	// Slots are free again.
+	h.rec.RecordError(context.Background(), middleware.ErrorRecord{RequestID: "after", Status: 500})
+	h.wg.Wait()
+	if n := h.count(t); n != 33 {
+		t.Fatalf("rows after recovery %d want 33", n)
+	}
+	if got := strings.Count(h.logs.String(), "error_log_dropped"); got != 1 {
+		t.Fatalf("expected a single drop warning (first drop only), got %d", got)
+	}
+	if !strings.Contains(h.logs.String(), "r-32") {
+		t.Fatalf("drop warning should name the request: %s", h.logs)
+	}
+}
+
+func TestDropWarningCadence(t *testing.T) {
+	h := newHarness(t)
+	block := make(chan struct{})
+	h.rec.insert = func(ctx context.Context, e *Entry) error { <-block; return nil }
+	for i := 0; i < maxInFlight+250; i++ {
+		h.rec.RecordError(context.Background(), middleware.ErrorRecord{RequestID: fmt.Sprintf("r-%d", i), Status: 500})
+	}
+	close(block)
+	h.wg.Wait()
+	if h.rec.Dropped() != 250 {
+		t.Fatalf("dropped %d", h.rec.Dropped())
+	}
+	// Drops 1, 100 and 200 warn.
+	if got := strings.Count(h.logs.String(), "error_log_dropped"); got != 3 {
+		t.Fatalf("warnings %d want 3\n%s", got, h.logs)
+	}
+	if !strings.Contains(h.logs.String(), "dropped_total 200") {
+		t.Fatalf("missing cumulative count: %s", h.logs)
+	}
+}
+
+func TestFailedWriteIsLoggedAndSlotFreed(t *testing.T) {
+	h := newHarness(t)
+	h.rec.insert = func(ctx context.Context, e *Entry) error { return errors.New("disk on fire") }
+	for i := 0; i < maxInFlight*3; i++ {
+		h.rec.RecordError(context.Background(), middleware.ErrorRecord{RequestID: "bad", Status: 500})
+		h.wg.Wait()
+	}
+	if h.rec.Dropped() != 0 {
+		t.Fatalf("failed writes must release their slot; dropped %d", h.rec.Dropped())
+	}
+	if !strings.Contains(h.logs.String(), "error_log_write_failed") || !strings.Contains(h.logs.String(), "bad") {
+		t.Fatalf("warning missing: %s", h.logs)
+	}
+}
+
+func TestWriteHasFiveSecondTimeoutContext(t *testing.T) {
+	var gotTimeout time.Duration
+	r := newRecorder(nil, logx.Nop(), clock.System{}, func(ctx context.Context, timeout time.Duration, fn func(context.Context)) {
+		gotTimeout = timeout
+	})
+	r.RecordError(context.Background(), middleware.ErrorRecord{RequestID: "r", Status: 500})
+	if gotTimeout != 5*time.Second {
+		t.Fatalf("timeout %v", gotTimeout)
+	}
+}
+
+func TestPurgeBeforeIsStrict(t *testing.T) {
+	h := newHarness(t)
+	cut := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	for i, at := range []time.Time{cut.Add(-time.Hour), cut.Add(-time.Nanosecond), cut, cut.Add(time.Hour)} {
+		h.db.Create(&Entry{RequestID: fmt.Sprint("r", i), CreatedAt: at})
+	}
+	n, err := PurgeBefore(context.Background(), h.db, cut.In(time.FixedZone("z", 7200)))
+	if err != nil || n != 2 {
+		t.Fatalf("purged %d err %v", n, err)
+	}
+	if left := h.count(t); left != 2 {
+		t.Fatalf("left %d", left)
+	}
+	var older int64
+	h.db.Model(&Entry{}).Where("created_at < ?", cut).Count(&older)
+	if older != 0 {
+		t.Fatal("older rows survived")
+	}
+}
+
+func TestPathQueryIsMaskedByRecorder(t *testing.T) {
+	h := newHarness(t)
+	h.rec.RecordError(context.Background(), middleware.ErrorRecord{
+		RequestID: "r-path", Status: 500,
+		Path: "/api/x?Token=abc&a=1&flag&api_key=zzz",
+	})
+	h.wg.Wait()
+	var e Entry
+	if err := h.db.Where("request_id = ?", "r-path").First(&e).Error; err != nil {
+		t.Fatal(err)
+	}
+	if e.Path != "/api/x?Token=REDACTED&a=1&flag&api_key=REDACTED" {
+		t.Fatalf("path %q", e.Path)
+	}
+}
