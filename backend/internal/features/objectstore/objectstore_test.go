@@ -195,3 +195,213 @@ func newS3(t *testing.T, srv *httptest.Server, prefix string) *S3 {
 	}
 	return s
 }
+
+// Scenario 22: prefix handling, not-found outcome, silent delete of a missing key.
+func TestS3PrefixAndNotFound(t *testing.T) {
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	s := newS3(t, srv, "/app/prod/")
+	ctx := context.Background()
+
+	info, err := s.Write(ctx, "u/2026/05/f_a.txt", strings.NewReader("data"), 4, "text/plain")
+	if err != nil || info.Key != "u/2026/05/f_a.txt" || info.Size != 4 {
+		t.Fatalf("write: %+v %v", info, err)
+	}
+	if _, ok := fake.objects["/bkt/app/prod/u/2026/05/f_a.txt"]; !ok {
+		t.Fatalf("object not stored at the prefixed key: %v", fake.paths)
+	}
+	if !strings.HasPrefix(fake.auth[0], "AWS4-HMAC-SHA256 Credential=AKID/20260501/us-east-1/s3/aws4_request") {
+		t.Fatalf("unsigned request: %q", fake.auth[0])
+	}
+	obj, err := s.Open(ctx, "u/2026/05/f_a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(obj.Body)
+	obj.Body.Close()
+	if string(b) != "data" || obj.ContentType != "text/plain" || obj.ModTime.Year() != 2006 {
+		t.Fatalf("open: %q %+v", b, obj)
+	}
+	if _, err := s.Open(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing key: %v", err)
+	}
+	if err := s.Delete(ctx, "nope"); err != nil {
+		t.Fatalf("delete missing: %v", err)
+	}
+	if err := s.Delete(ctx, "  "); err != nil {
+		t.Fatalf("delete empty: %v", err)
+	}
+	if err := s.Delete(ctx, "u/2026/05/f_a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Open(ctx, "u/2026/05/f_a.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after delete: %v", err)
+	}
+}
+
+func TestS3ErrorDoesNotLeakBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(403)
+		_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code><Message>internal host leak</Message></Error>`))
+	}))
+	defer srv.Close()
+	s := newS3(t, srv, "")
+	_, err := s.Open(context.Background(), "k")
+	var se *S3Error
+	if !errors.As(err, &se) || se.Code != "AccessDenied" || strings.Contains(err.Error(), "leak") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatal("403 must not look like not-found")
+	}
+}
+
+func TestS3MaterializeCleansUp(t *testing.T) {
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	s := newS3(t, srv, "")
+	ctx := context.Background()
+	if _, err := s.Write(ctx, "doc.txt", bytes.NewReader([]byte("extract me")), -1, ""); err != nil {
+		t.Fatal(err)
+	}
+	p, cleanup, err := s.Materialize(ctx, "doc.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "extract me" {
+		t.Fatalf("temp copy: %q", b)
+	}
+	cleanup()
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatal("temporary copy must be removed")
+	}
+	if _, _, err := s.Materialize(ctx, "gone"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("materialize missing: %v", err)
+	}
+}
+
+func TestS3AmbientCredentials(t *testing.T) {
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	s, err := NewS3(S3Options{Endpoint: srv.URL, Bucket: "b", PathStyle: true, Getenv: func(k string) string {
+		return map[string]string{"AWS_ACCESS_KEY_ID": "ENVID", "AWS_SECRET_ACCESS_KEY": "envsecret", "AWS_SESSION_TOKEN": "tok"}[k]
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(context.Background(), "k", strings.NewReader("x"), 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fake.auth[0], "Credential=ENVID/") || !strings.Contains(fake.auth[0], "x-amz-security-token") {
+		t.Fatalf("ambient credentials not used: %q", fake.auth[0])
+	}
+	if !strings.Contains(fake.auth[0], "/auto/s3/") {
+		t.Fatalf("blank region must default to auto: %q", fake.auth[0])
+	}
+}
+
+func TestS3RequiresBucket(t *testing.T) {
+	if _, err := NewS3(S3Options{Region: "r"}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestSigningKeyVector(t *testing.T) {
+	// Published example from the Signature V4 documentation.
+	k := signingKey("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20150830", "us-east-1", "iam")
+	if got := hex.EncodeToString(k); got != "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9" {
+		t.Fatalf("signing key %s", got)
+	}
+}
+
+// Scenario 21: startup validation of the storage section.
+func TestValidateConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		c    config.StorageConfig
+		ok   bool
+	}{
+		{"blank", config.StorageConfig{}, true},
+		{"local", config.StorageConfig{Backend: "local"}, true},
+		{"s3 ok", config.StorageConfig{Backend: "s3", S3: config.S3Config{Bucket: "b", Region: "r"}}, true},
+		{"s3 no bucket", config.StorageConfig{Backend: "s3", S3: config.S3Config{Region: "r"}}, false},
+		{"s3 no region", config.StorageConfig{Backend: "s3", S3: config.S3Config{Bucket: "b"}}, false},
+		{"gcs", config.StorageConfig{Backend: "gcs"}, false},
+	}
+	for _, tc := range cases {
+		err := ValidateConfig(tc.c)
+		if (err == nil) != tc.ok || (err != nil && !errors.Is(err, ErrInvalidConfig)) {
+			t.Errorf("%s: %v", tc.name, err)
+		}
+	}
+}
+
+// Scenario 26: the next operation follows a configuration change.
+func TestManagerFollowsConfig(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	cur := config.StorageConfig{Backend: "local", Local: config.LocalStorageConfig{RootDir: dirA}}
+	var mu sync.Mutex
+	m := NewManager(func() config.StorageConfig { mu.Lock(); defer mu.Unlock(); return cur }, nil, nil)
+	ctx := context.Background()
+
+	if _, err := m.Write(ctx, "k.txt", strings.NewReader("one"), 3, ""); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := m.Current()
+	again, _ := m.Current()
+	if first != again {
+		t.Fatal("backend instance must be cached while the config is unchanged")
+	}
+	if _, err := os.Stat(filepath.Join(dirA, "k.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	cur.Local.RootDir = dirB
+	mu.Unlock()
+	if _, err := m.Open(ctx, "k.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("new root must be used, got %v", err)
+	}
+	if _, err := m.Write(ctx, "k.txt", strings.NewReader("two"), 3, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dirB, "k.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unknown backend values fall back to local at run time.
+	mu.Lock()
+	cur.Backend = "gcs"
+	mu.Unlock()
+	if st, err := m.Current(); err != nil {
+		t.Fatal(err)
+	} else if _, ok := st.(*Local); !ok {
+		t.Fatalf("unknown backend must fall back to local, got %T", st)
+	}
+
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	mu.Lock()
+	cur = config.StorageConfig{Backend: "s3", S3: config.S3Config{Endpoint: srv.URL, Region: "r", Bucket: "b", Prefix: "p", ForcePathStyle: true, AccessKeyID: "a", SecretAccessKey: "s"}}
+	mu.Unlock()
+	if _, err := m.Write(ctx, "k.txt", strings.NewReader("three"), 5, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fake.objects["/b/p/k.txt"]; !ok {
+		t.Fatalf("s3 backend not selected: %v", fake.paths)
+	}
+}
+
+func TestReadAllLimit(t *testing.T) {
+	l := NewLocal(t.TempDir())
+	ctx := context.Background()
+	_, _ = l.Write(ctx, "a", strings.NewReader("0123456789"), 10, "")
+	b, _, err := ReadAll(ctx, l, "a", 4)
+	if err != nil || string(b) != "0123" {
+		t.Fatalf("%q %v", b, err)
+	}
+}
