@@ -242,3 +242,237 @@ func (h *handlers) adminUpdate(c *gin.Context) {
 	h.audit(c, "knowledge_base.update_builtin", v.PublicID, nil)
 	one(c, v)
 }
+
+func (h *handlers) adminDelete(c *gin.Context) {
+	deleteFiles := c.Query("delete_files") == "true"
+	n, err := h.svc.deleteBase(c.Request.Context(), adminAccess(callerID(c)), c.Param("id"), deleteFiles)
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	h.audit(c, "knowledge_base.delete_builtin", c.Param("id"),
+		map[string]any{"delete_files": deleteFiles, "deleted_file_count": n})
+	httpx.OK(c, deleteResponse{Deleted: true, DeletedFileCount: n})
+}
+
+// ----- files of a base -----
+
+func (h *handlers) serveFiles(c *gin.Context, a access) {
+	views, total, err := h.svc.listFiles(c.Request.Context(), a, c.Param("id"), pagination.FromRequest(c.Request))
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, views)
+}
+
+func (h *handlers) filesVisible(c *gin.Context) { h.serveFiles(c, visibleTo(callerID(c))) }
+func (h *handlers) adminFiles(c *gin.Context)   { h.serveFiles(c, adminAccess(callerID(c))) }
+
+func (h *handlers) serveAvailable(c *gin.Context, a access) {
+	views, total, err := h.svc.availableFiles(c.Request.Context(), a, c.Param("id"), c.Query("q"), pagination.FromRequest(c.Request))
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, views)
+}
+
+func (h *handlers) availableMine(c *gin.Context) { h.serveAvailable(c, personalOf(callerID(c))) }
+func (h *handlers) adminAvailable(c *gin.Context) {
+	h.serveAvailable(c, adminAccess(callerID(c)))
+}
+
+func (h *handlers) addMine(c *gin.Context) {
+	var req fileIDsRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	uid := callerID(c)
+	if err := h.svc.addFiles(c.Request.Context(), personalOf(uid), uid, c.Param("id"), req.FileIDs); err != nil {
+		h.fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"updated": true})
+}
+
+func (h *handlers) adminAddFiles(c *gin.Context) {
+	var req fileIDsRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	uid := callerID(c)
+	if err := h.svc.addFiles(c.Request.Context(), adminAccess(uid), uid, c.Param("id"), req.FileIDs); err != nil {
+		h.fail(c, err)
+		return
+	}
+	h.audit(c, "knowledge_base.add_files_builtin", c.Param("id"), map[string]any{"count": len(req.FileIDs)})
+	httpx.OK(c, gin.H{"updated": true})
+}
+
+func (h *handlers) removeMine(c *gin.Context) {
+	if err := h.svc.removeFile(c.Request.Context(), personalOf(callerID(c)), c.Param("id"), c.Param("file_id")); err != nil {
+		h.fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"updated": true})
+}
+
+func (h *handlers) adminRemoveFile(c *gin.Context) {
+	if err := h.svc.removeFile(c.Request.Context(), adminAccess(callerID(c)), c.Param("id"), c.Param("file_id")); err != nil {
+		h.fail(c, err)
+		return
+	}
+	h.audit(c, "knowledge_base.remove_file_builtin", c.Param("id"), map[string]any{"file_id": c.Param("file_id")})
+	httpx.OK(c, gin.H{"updated": true})
+}
+
+// ----- processing status -----
+
+func (h *handlers) serveStatuses(c *gin.Context, a access) {
+	var req fileIDsRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	sts, err := h.svc.statuses(c.Request.Context(), a, c.Param("id"), req.FileIDs)
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	httpx.OK(c, sts)
+}
+
+func (h *handlers) statusesVisible(c *gin.Context) { h.serveStatuses(c, visibleTo(callerID(c))) }
+func (h *handlers) adminStatuses(c *gin.Context)   { h.serveStatuses(c, adminAccess(callerID(c))) }
+
+func (h *handlers) serveSnapshot(c *gin.Context, a access) {
+	var req optionalFileIDsRequest
+	if !bindIDs(c, &req, true) {
+		return
+	}
+	snap, err := h.svc.snapshot(c.Request.Context(), a, c.Param("id"), req.FileIDs)
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	httpx.OK(c, snap)
+}
+
+func (h *handlers) snapshotVisible(c *gin.Context) { h.serveSnapshot(c, visibleTo(callerID(c))) }
+func (h *handlers) adminSnapshot(c *gin.Context)   { h.serveSnapshot(c, adminAccess(callerID(c))) }
+
+// ----- content -----
+
+// sendContent writes a file as a download. The body is closed here.
+func (h *handlers) sendContent(c *gin.Context, fc *FileContent) {
+	defer fc.Body.Close()
+	name := filepath.Base(strings.ReplaceAll(fc.FileName, `\`, "/"))
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": name})
+	if disposition == "" {
+		disposition = "attachment"
+	}
+	ctype := fc.MimeType
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	c.Header("Content-Disposition", disposition)
+	c.Header("X-Content-Type-Options", "nosniff")
+	size := fc.Size
+	if size < 0 {
+		size = -1
+	}
+	c.DataFromReader(http.StatusOK, size, ctype, fc.Body, nil)
+}
+
+func (h *handlers) serveContent(c *gin.Context, a access) {
+	fc, err := h.svc.openContent(c.Request.Context(), a, c.Param("id"), c.Param("file_id"))
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	h.sendContent(c, fc)
+}
+
+func (h *handlers) contentVisible(c *gin.Context) { h.serveContent(c, visibleTo(callerID(c))) }
+func (h *handlers) adminContent(c *gin.Context)   { h.serveContent(c, adminAccess(callerID(c))) }
+
+// ----- platform file pool -----
+
+func (h *handlers) poolList(c *gin.Context) {
+	views, total, err := h.svc.platformFiles(c.Request.Context(), c.Query("q"), pagination.FromRequest(c.Request))
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, views)
+}
+
+func (h *handlers) poolContent(c *gin.Context) {
+	fc, err := h.svc.openPoolContent(c.Request.Context(), c.Param("file_id"))
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	h.sendContent(c, fc)
+}
+
+func (h *handlers) poolUpload(c *gin.Context) {
+	ctx := c.Request.Context()
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.svc.uploadLimit(ctx))
+	fh, err := c.FormFile("file")
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooBig):
+			h.fail(c, ErrFileRequired)
+		case errors.Is(err, http.ErrMissingFile), errors.Is(err, http.ErrNotMultipart):
+			h.fail(c, ErrFileRequired)
+		default:
+			h.fail(c, ErrInvalidStream.WithCause(err))
+		}
+		return
+	}
+	f, err := fh.Open()
+	if err != nil {
+		h.fail(c, ErrInvalidStream.WithCause(err))
+		return
+	}
+	defer f.Close()
+
+	v, err := h.svc.uploadPlatformFile(ctx, callerID(c), UploadRequest{
+		FileName: filepath.Base(fh.Filename), ContentType: fh.Header.Get("Content-Type"), Size: fh.Size, Body: f,
+	})
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	h.audit(c, "knowledge_base.upload_builtin_file", v.FileID,
+		map[string]any{"file_name": v.FileName, "size_bytes": v.SizeBytes})
+	httpx.OK(c, gin.H{"file": v})
+}
+
+func (h *handlers) poolDelete(c *gin.Context) {
+	fid := strings.TrimSpace(c.Param("file_id"))
+	if err := h.svc.deletePlatformFile(c.Request.Context(), fid); err != nil {
+		h.fail(c, err)
+		return
+	}
+	h.audit(c, "knowledge_base.delete_platform_file", fid, map[string]any{"deleted": true})
+	httpx.OK(c, gin.H{"deleted": true})
+}
+
+func (h *handlers) poolEmbeddings(c *gin.Context) {
+	var req fileIDsRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	res, requested, err := h.svc.submitEmbeddings(c.Request.Context(), req.FileIDs)
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	h.audit(c, "knowledge_base.submit_platform_file_embeddings", "", map[string]any{
+		"requested_file_ids": requested, "submitted_file_ids": res.SubmittedFileIDs, "skipped_count": len(res.Skipped),
+	})
+	httpx.OK(c, res)
+}
