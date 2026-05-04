@@ -174,3 +174,189 @@ func (s *S3) Write(ctx context.Context, key string, r io.Reader, size int64, con
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	return Info{Key: k, Size: n, ContentType: contentType, ModTime: s.o.Now()}, nil
 }
+
+// Open streams an object; NoSuchKey, NotFound and 404 become ErrNotFound.
+func (s *S3) Open(ctx context.Context, key string) (*Object, error) {
+	k, err := NormalizeKey(key)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.objectURL(k).String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	s.sign(req, emptySHA256)
+	resp, err := s.o.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode/100 != 2 {
+		defer resp.Body.Close()
+		e := readS3Error(resp)
+		if se, ok := e.(*S3Error); ok && isMissing(se) {
+			return nil, ErrNotFound
+		}
+		return nil, e
+	}
+	mod, _ := http.ParseTime(resp.Header.Get("Last-Modified"))
+	return &Object{Body: resp.Body, Size: resp.ContentLength, ContentType: resp.Header.Get("Content-Type"), ModTime: mod}, nil
+}
+
+// Delete removes an object; a missing key and an empty key succeed.
+func (s *S3) Delete(ctx context.Context, key string) error {
+	if strings.Trim(strings.TrimSpace(strings.ReplaceAll(key, "\\", "/")), "/") == "" {
+		return nil
+	}
+	k, err := NormalizeKey(key)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.objectURL(k).String(), nil)
+	if err != nil {
+		return err
+	}
+	s.sign(req, emptySHA256)
+	resp, err := s.o.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		return nil
+	}
+	e := readS3Error(resp)
+	if se, ok := e.(*S3Error); ok && isMissing(se) {
+		return nil
+	}
+	return e
+}
+
+// Materialize downloads the object to a temporary file; cleanup removes it.
+func (s *S3) Materialize(ctx context.Context, key string) (string, func(), error) {
+	obj, err := s.Open(ctx, key)
+	if err != nil {
+		return "", nil, err
+	}
+	defer obj.Body.Close()
+	tmp, err := os.CreateTemp("", "objectstore-dl-*")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.Remove(tmp.Name()) }
+	if _, err := io.Copy(tmp, &ctxReader{ctx: ctx, r: obj.Body}); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return tmp.Name(), cleanup, nil
+}
+
+func isMissing(e *S3Error) bool {
+	switch e.Code {
+	case "NoSuchKey", "NotFound", "404":
+		return true
+	}
+	return e.Status == http.StatusNotFound && (e.Code == "" || e.Code == "NoSuchKey")
+}
+
+func readS3Error(resp *http.Response) error {
+	e := &S3Error{Status: resp.StatusCode}
+	var body struct {
+		Code string `xml:"Code"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if xml.Unmarshal(raw, &body) == nil {
+		e.Code = strings.TrimSpace(body.Code)
+	}
+	return e
+}
+
+const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// sign adds Signature Version 4 headers for the S3 service.
+func (s *S3) sign(req *http.Request, payloadHash string) {
+	id, secret, token := s.credentials()
+	now := s.o.Now().UTC()
+	stamp := now.Format("20060102T150405Z")
+	date := now.Format("20060102")
+	req.Header.Set("x-amz-date", stamp)
+	req.Header.Set("x-amz-content-sha256", payloadHash)
+	if token != "" {
+		req.Header.Set("x-amz-security-token", token)
+	}
+	if id == "" || secret == "" {
+		return // anonymous access
+	}
+	host := req.URL.Host
+	signed := map[string]string{"host": host, "x-amz-content-sha256": payloadHash, "x-amz-date": stamp}
+	if token != "" {
+		signed["x-amz-security-token"] = token
+	}
+	if ct := req.Header.Get("Content-Type"); ct != "" {
+		signed["content-type"] = ct
+	}
+	names := make([]string, 0, len(signed))
+	for n := range signed {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var canon strings.Builder
+	for _, n := range names {
+		canon.WriteString(n + ":" + strings.TrimSpace(signed[n]) + "\n")
+	}
+	signedList := strings.Join(names, ";")
+	canonical := strings.Join([]string{
+		req.Method, canonicalPath(req.URL.Path), req.URL.RawQuery, canon.String(), signedList, payloadHash,
+	}, "\n")
+	scope := date + "/" + s.o.Region + "/s3/aws4_request"
+	toSign := "AWS4-HMAC-SHA256\n" + stamp + "\n" + scope + "\n" + hexSHA256(canonical)
+	sig := hex.EncodeToString(hmacSHA256(signingKey(secret, date, s.o.Region, "s3"), toSign))
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+id+"/"+scope+", SignedHeaders="+signedList+", Signature="+sig)
+}
+
+// canonicalPath encodes each path segment once, as S3 requires.
+func canonicalPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	segs := strings.Split(p, "/")
+	for i, sg := range segs {
+		segs[i] = awsEscape(sg)
+	}
+	return strings.Join(segs, "/")
+}
+
+func awsEscape(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '~' {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+func signingKey(secret, date, region, service string) []byte {
+	k := hmacSHA256([]byte("AWS4"+secret), date)
+	k = hmacSHA256(k, region)
+	k = hmacSHA256(k, service)
+	return hmacSHA256(k, "aws4_request")
+}
+
+func hmacSHA256(key []byte, msg string) []byte {
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(msg))
+	return m.Sum(nil)
+}
+
+func hexSHA256(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
