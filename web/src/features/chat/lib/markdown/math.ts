@@ -383,3 +383,177 @@ class Parser {
     return { t: "table", rows, align: "aligned" };
   }
 }
+
+function styleText(body: MathNode, variant: string): MathNode {
+  const map = (n: MathNode): MathNode => {
+    if (n.t === "i" && variant === "double-struck" && n.v in DOUBLE_STRUCK) return { t: "i", v: DOUBLE_STRUCK[n.v] as string, variant: "normal" };
+    if (n.t === "row") return { t: "row", c: n.c.map(map) };
+    return n;
+  };
+  const mapped = map(body);
+  return { t: "style", variant, body: mapped };
+}
+
+/** Parses LaTeX; never throws. */
+export function parseLatex(tex: string): MathNode {
+  const parser = new Parser(tex);
+  const nodes: MathNode[] = [];
+  let guard = 0;
+  while (!parser.eof() && guard++ < 10_000) {
+    const row = parser.parseRow(() => false);
+    nodes.push(row);
+    if (!parser.eof()) parser.pos++; // stray closer
+  }
+  return nodes.length === 1 ? (nodes[0] as MathNode) : { t: "row", c: nodes };
+}
+
+// --- MathML output --------------------------------------------------------------------------------
+
+export function escapeXml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function el(tag: string, attrs: Record<string, string | undefined>, inner: string): string {
+  const a = Object.entries(attrs)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => ` ${k}="${escapeXml(v as string)}"`)
+    .join("");
+  return `<${tag}${a}>${inner}</${tag}>`;
+}
+
+function row(nodes: string[]): string {
+  return nodes.length === 1 ? (nodes[0] as string) : el("mrow", {}, nodes.join(""));
+}
+
+function isLargeOp(n: MathNode): boolean {
+  return (n.t === "o" && n.large === true) || (n.t === "i" && n.variant === "op" && LIMITS_OPS.has(n.v));
+}
+
+export function toMathML(node: MathNode, display = false): string {
+  const go = (n: MathNode): string => {
+    switch (n.t) {
+      case "row":
+        return n.c.length === 0 ? el("mrow", {}, "") : row(n.c.map(go));
+      case "i":
+        return el("mi", n.variant === "op" ? { mathvariant: "normal" } : n.v.length > 1 && !/[α-ωΑ-Ω]/.test(n.v) ? { mathvariant: n.variant } : { mathvariant: n.variant }, escapeXml(n.v));
+      case "n":
+        return el("mn", {}, escapeXml(n.v));
+      case "o":
+        return el("mo", { stretchy: n.fence ? "false" : undefined, largeop: n.large ? "true" : undefined, separator: n.sep ? "true" : undefined }, escapeXml(n.v));
+      case "text":
+        return el("mtext", {}, escapeXml(n.v).replace(/ /g, "&#160;"));
+      case "space":
+        return el("mspace", { width: `${n.em}em` }, "");
+      case "frac":
+        return el("mfrac", n.line === false ? { linethickness: "0" } : {}, go(n.num) + go(n.den));
+      case "sqrt":
+        return n.index ? el("mroot", {}, go(n.body) + go(n.index)) : el("msqrt", {}, go(n.body));
+      case "sup":
+        return isLargeOp(n.base) && display ? el("mover", {}, go(n.base) + go(n.sup)) : el("msup", {}, go(n.base) + go(n.sup));
+      case "sub":
+        return isLargeOp(n.base) && display ? el("munder", {}, go(n.base) + go(n.sub)) : el("msub", {}, go(n.base) + go(n.sub));
+      case "subsup":
+        return isLargeOp(n.base) && display
+          ? el("munderover", {}, go(n.base) + go(n.sub) + go(n.sup))
+          : el("msubsup", {}, go(n.base) + go(n.sub) + go(n.sup));
+      case "under":
+        return el("munder", {}, go(n.base) + go(n.under));
+      case "over":
+        return el("mover", n.accent ? { accent: "true" } : {}, go(n.base) + go(n.over));
+      case "underover":
+        return el("munderover", {}, go(n.base) + go(n.under) + go(n.over));
+      case "style":
+        return el("mstyle", { mathvariant: n.variant }, go(n.body));
+      case "table": {
+        const rowsXml = n.rows
+          .map((r) =>
+            el(
+              "mtr",
+              {},
+              r
+                .map((cell, i) => {
+                  const align = n.align === "left" ? "left" : n.align === "aligned" ? (i % 2 === 0 ? "right" : "left") : undefined;
+                  return el("mtd", align ? { style: `text-align:${align}` } : {}, go(cell));
+                })
+                .join(""),
+            ),
+          )
+          .join("");
+        return el("mtable", { columnspacing: n.align === "aligned" ? "0em" : "1em", rowspacing: "0.4em" }, rowsXml);
+      }
+      case "fenced": {
+        const open = n.open ? el("mo", { fence: "true", stretchy: "true" }, escapeXml(n.open)) : "";
+        const close = n.close ? el("mo", { fence: "true", stretchy: "true" }, escapeXml(n.close)) : "";
+        return el("mrow", {}, open + go(n.body) + close);
+      }
+      case "error":
+        return el("merror", {}, el("mtext", {}, escapeXml(n.v)));
+    }
+  };
+  return go(node);
+}
+
+export interface MathResult {
+  html: string;
+  error: boolean;
+}
+
+function hasError(n: MathNode): boolean {
+  switch (n.t) {
+    case "error":
+      return true;
+    case "row":
+      return n.c.some(hasError);
+    case "frac":
+      return hasError(n.num) || hasError(n.den);
+    case "sqrt":
+      return hasError(n.body) || (n.index ? hasError(n.index) : false);
+    case "sup":
+      return hasError(n.base) || hasError(n.sup);
+    case "sub":
+      return hasError(n.base) || hasError(n.sub);
+    case "subsup":
+      return hasError(n.base) || hasError(n.sub) || hasError(n.sup);
+    case "under":
+      return hasError(n.base) || hasError(n.under);
+    case "over":
+      return hasError(n.base) || hasError(n.over);
+    case "underover":
+      return hasError(n.base) || hasError(n.under) || hasError(n.over);
+    case "style":
+      return hasError(n.body);
+    case "table":
+      return n.rows.some((r) => r.some(hasError));
+    case "fenced":
+      return hasError(n.body);
+    default:
+      return false;
+  }
+}
+
+/** The `<math>` element for a formula, carrying the TeX source as an annotation. */
+export function texToMathML(tex: string, display: boolean): MathResult {
+  const tree = parseLatex(tex.trim());
+  const body = toMathML(tree, display);
+  const html = el(
+    "math",
+    { display: display ? "block" : "inline", xmlns: "http://www.w3.org/1998/Math/MathML" },
+    el("semantics", {}, el("mrow", {}, body) + el("annotation", { encoding: "application/x-tex" }, escapeXml(tex.trim()))),
+  );
+  return { html, error: hasError(tree) };
+}
+
+export function isMathMLSupported(): boolean {
+  if (typeof document === "undefined") return true;
+  try {
+    const div = document.createElement("div");
+    div.innerHTML = '<math><mspace height="23px" width="77px"></mspace></math>';
+    document.body.appendChild(div);
+    const box = (div.firstChild as Element).firstChild as Element;
+    const ok = Math.abs(box.getBoundingClientRect().height - 23) <= 1;
+    div.remove();
+    return ok;
+  } catch {
+    return true;
+  }
+}
