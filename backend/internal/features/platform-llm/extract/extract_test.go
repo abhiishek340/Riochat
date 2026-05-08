@@ -327,3 +327,292 @@ func TestMinerUFailuresAndFallback(t *testing.T) {
 		t.Fatalf("%v %+v", err, res)
 	}
 }
+
+func TestMinerUSelfHosted(t *testing.T) {
+	srv, s := serve(t, 200, "application/json", `{"results":{"doc":{"md_content":"# Parsed\n\ntext"}}}`)
+	m := NewMinerU(pool(), "self_hosted", srv.URL, "T", 0, nil)
+	res, err := m.Extract(context.Background(), Request{Name: "doc.pdf", MIME: "application/pdf", Data: []byte("PDF")})
+	if err != nil || res.Text != "# Parsed\ntext" {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if s.path != "/file_parse" || !strings.HasPrefix(s.files["files"], "doc.pdf|") {
+		t.Fatalf("%s %v", s.path, s.files)
+	}
+	for status, code := range map[int]string{401: "mineru_unauthorized", 403: "mineru_forbidden", 500: "mineru_http_500: e"} {
+		srv, _ := serve(t, status, "", "e")
+		_, err := NewMinerU(pool(), "self_hosted", srv.URL, "", 0, nil).Extract(context.Background(), Request{Name: "a", Data: []byte("x")})
+		if err == nil || err.Error() != code {
+			t.Errorf("%d: %v", status, err)
+		}
+	}
+	srv, _ = serve(t, 200, "", "not json")
+	if _, err := NewMinerU(pool(), "self_hosted", srv.URL, "", 0, nil).Extract(context.Background(), Request{Name: "a", Data: []byte("x")}); !IsCode(err, "mineru_invalid_response") {
+		t.Fatalf("%v", err)
+	}
+	if NewMinerU(pool(), "", "", "", 0, nil).b.baseURL != DefaultMinerUBase || NewMinerU(pool(), "", "", "", 0, nil).b.timeout != 180*time.Second {
+		t.Fatal("cloud defaults")
+	}
+}
+
+// ---- built-in parsers ------------------------------------------------------
+
+func docxBytes() []byte {
+	return zipOf(map[string]string{"word/document.xml": `<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+<w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:tab/><w:t>world</w:t></w:r></w:p>
+<w:p><w:r><w:t>Second</w:t></w:r><w:r><w:br/><w:t>line</w:t></w:r></w:p>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:body></w:document>`})
+}
+
+func xlsxBytes() []byte {
+	return zipOf(map[string]string{
+		"xl/workbook.xml":            `<workbook xmlns:r="r"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+		"xl/_rels/workbook.xml.rels": `<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>`,
+		"xl/sharedStrings.xml":       `<sst><si><t>Name</t></si><si><t>Qty</t></si><si><r><t>Ap</t></r><r><t>ple</t></r></si></sst>`,
+		"xl/worksheets/sheet1.xml": `<worksheet><sheetData>
+<row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row>
+<row r="2"><c r="A2" t="s"><v>2</v></c><c r="C2"><v>5</v></c></row>
+<row r="3"></row></sheetData></worksheet>`,
+	})
+}
+
+func TestBuiltinParsers(t *testing.T) {
+	b := &Builtin{}
+	ctx := context.Background()
+	res, err := b.Extract(ctx, Request{Name: "n.txt", Data: []byte("\xef\xbb\xbf hello \n world \xff")})
+	if err != nil || !strings.HasPrefix(res.Text, "hello") || res.Engine != "builtin" {
+		t.Fatalf("%v %+v", err, res)
+	}
+	res, err = b.Extract(ctx, Request{Name: "main.go", Data: []byte("package main")})
+	if err != nil || res.Text != "package main" {
+		t.Fatalf("by extension: %v", err)
+	}
+	res, err = b.Extract(ctx, Request{Name: "d.docx", Data: docxBytes()})
+	if err != nil || res.Text != "Hello\tworld\nSecond\nline\nA1\tB1" {
+		t.Fatalf("%v %q", err, res.Text)
+	}
+	res, err = b.Extract(ctx, Request{Name: "s.xlsx", Data: xlsxBytes()})
+	if err != nil || res.Text != "Sheet: Data\nName |  | Qty\nApple |  | 5" {
+		t.Fatalf("%v %q", err, res.Text)
+	}
+	res, err = b.Extract(ctx, Request{Name: "t.csv", Data: []byte("a,b\n\n\"x,y\",2\n")})
+	if err != nil || res.Text != "Sheet: t\na | b\nx,y | 2" {
+		t.Fatalf("%v %q", err, res.Text)
+	}
+	for _, name := range []string{"x.pdf", "x.xls", "x.bin"} {
+		if _, err := b.Extract(ctx, Request{Name: name, Data: []byte("x")}); !IsCode(err, "builtin_unsupported") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := b.Extract(ctx, Request{Name: "bad.docx", Data: []byte("not a zip")}); !IsCode(err, "builtin_unprocessable") {
+		t.Fatalf("%v", err)
+	}
+	if _, err := b.Extract(ctx, Request{Name: "e.txt", Data: []byte("  ")}); !IsCode(err, "builtin_empty_content") {
+		t.Fatalf("%v", err)
+	}
+	if ok, _ := b.Probe(ctx); !ok || b.Name() != "builtin" {
+		t.Fatal("probe")
+	}
+}
+
+func TestBuiltinLegacyDoc(t *testing.T) {
+	var used string
+	b := &Builtin{
+		LookPath: func(n string) (string, error) {
+			if n == "textutil" {
+				return "/usr/bin/textutil", nil
+			}
+			return "", errors.New("not found")
+		},
+		Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			used = name
+			return []byte("  converted \n\n text "), nil
+		},
+	}
+	res, err := b.Extract(context.Background(), Request{Name: "old.doc", Data: []byte("DOC")})
+	if err != nil || res.Text != "converted\ntext" || res.Engine != "textutil" || used != "textutil" {
+		t.Fatalf("the result reports the engine that produced it: %v %+v", err, res)
+	}
+	none := &Builtin{LookPath: func(string) (string, error) { return "", errors.New("no") }}
+	if _, err := none.Extract(context.Background(), Request{Name: "old.doc", Data: []byte("x")}); !IsCode(err, "builtin_unsupported") {
+		t.Fatalf("%v", err)
+	}
+}
+
+// ---- model OCR --------------------------------------------------------------
+
+type fakeRenderer struct {
+	images map[int][]byte
+	errs   map[int]error
+	err    error
+	asked  []int
+}
+
+func (f *fakeRenderer) Render(ctx context.Context, pdf []byte, pages []int) (map[int][]byte, map[int]error, error) {
+	f.asked = pages
+	return f.images, f.errs, f.err
+}
+
+func llmServer(t *testing.T, status int) (*httptest.Server, *[]string) {
+	var bodies []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		n := len(bodies)
+		mu.Unlock()
+		if status != 200 {
+			w.WriteHeader(status)
+			io.WriteString(w, `{"error":{"message":"nope"}}`)
+			return
+		}
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":"  text of call %d  "}}]}`, n)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &bodies
+}
+
+func TestLLMOCRImageAndPDF(t *testing.T) {
+	srv, bodies := llmServer(t, 200)
+	client := llm.NewClient(llm.ClientOptions{HTTP: pool()})
+	rend := &fakeRenderer{images: map[int][]byte{2: []byte("J2"), 1: []byte("J1")}}
+	e := NewLLMOCR(client, llm.Route{BaseURL: srv.URL, Model: "vision", APIKey: "k"}, "", rend, 0)
+	res, err := e.Extract(context.Background(), Request{Name: "a.png", MIME: "image/png", Data: []byte("IMG")})
+	if err != nil || res.Text != "text of call 1" || res.Pages != 1 {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if !strings.Contains((*bodies)[0], "image_url") || !strings.Contains((*bodies)[0], "reading order") {
+		t.Fatalf("one image part and the default prompt: %s", (*bodies)[0])
+	}
+	res, err = e.Extract(context.Background(), Request{Name: "a.pdf", MIME: "application/pdf", Data: []byte("PDF"), Pages: "2-3"})
+	if err != nil || res.Text != "text of call 2\n\ntext of call 3" || res.Pages != 2 || len(res.PageTexts) != 2 {
+		t.Fatalf("pages are recognized in order: %v %+v", err, res)
+	}
+	if len(rend.asked) != 2 || rend.asked[0] != 2 || rend.asked[1] != 3 {
+		t.Fatalf("asked pages (1-based): %v", rend.asked)
+	}
+	// Failures.
+	if _, err := e.Extract(context.Background(), Request{Name: "a.pdf", MIME: "application/pdf", Data: []byte("x"), Pages: "zero"}); err == nil || err.Error() != "ocr_unprocessable: no target pages" {
+		t.Fatalf("%v", err)
+	}
+	empty := &fakeRenderer{images: map[int][]byte{}}
+	e2 := NewLLMOCR(client, llm.Route{BaseURL: srv.URL, Model: "v"}, "", empty, 0)
+	if _, err := e2.Extract(context.Background(), Request{Name: "a.pdf", MIME: "application/pdf", Data: []byte("x")}); err == nil || err.Error() != "ocr_unprocessable: no page images found" {
+		t.Fatalf("%v", err)
+	}
+	failing := &fakeRenderer{images: map[int][]byte{}, errs: map[int]error{3: errors.New("bad page")}}
+	e3 := NewLLMOCR(client, llm.Route{BaseURL: srv.URL, Model: "v"}, "", failing, 0)
+	if _, err := e3.Extract(context.Background(), Request{Name: "a.pdf", MIME: "application/pdf", Data: []byte("x"), Pages: "3"}); err == nil || !strings.Contains(err.Error(), "page 3: bad page") {
+		t.Fatalf("render failures are listed per page: %v", err)
+	}
+	if ok, _ := e.Probe(context.Background()); !ok {
+		t.Fatal("probe")
+	}
+}
+
+func TestLLMOCRErrorMapping(t *testing.T) {
+	for status, code := range map[int]string{401: "ocr_unauthorized", 403: "ocr_forbidden", 400: "ocr_unprocessable: nope", 422: "ocr_unprocessable: nope", 500: "ocr_http_500: nope"} {
+		srv, _ := llmServer(t, status)
+		client := llm.NewClient(llm.ClientOptions{HTTP: pool()})
+		e := NewLLMOCR(client, llm.Route{BaseURL: srv.URL, Model: "v"}, "", &fakeRenderer{}, 0)
+		_, err := e.Extract(context.Background(), Request{Name: "a.png", MIME: "image/png", Data: []byte("x")})
+		if err == nil || err.Error() != code {
+			t.Errorf("%d: %v want %s", status, err, code)
+		}
+	}
+	srv, _ := llmServer(t, 200)
+	srv.Close()
+	client := llm.NewClient(llm.ClientOptions{HTTP: pool()})
+	e := NewLLMOCR(client, llm.Route{BaseURL: srv.URL, Model: "v"}, "", &fakeRenderer{}, 0)
+	if _, err := e.Extract(context.Background(), Request{Name: "a.png", MIME: "image/png", Data: []byte("x")}); !IsCode(err, "ocr_unavailable") {
+		t.Fatalf("transport failures: %v", err)
+	}
+	un := NewLLMOCR(client, llm.Route{}, "", &fakeRenderer{}, 0)
+	if _, err := un.Extract(context.Background(), Request{Name: "a.png", MIME: "image/png", Data: []byte("x")}); !IsCode(err, "ocr_unavailable") {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestPopplerRendererCommandShape(t *testing.T) {
+	var calls [][]string
+	p := &PopplerRenderer{Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, append([]string{name}, args...))
+		return nil, errors.New("tool missing")
+	}}
+	imgs, errs, err := p.Render(context.Background(), []byte("%PDF"), []int{2})
+	if err != nil || len(imgs) != 0 || errs[2] == nil {
+		t.Fatalf("%v %v %v", err, imgs, errs)
+	}
+	joined := strings.Join(calls[0], " ")
+	if !strings.HasPrefix(joined, "pdftoppm -jpeg -r 150 -f 2 -l 2 -singlefile") {
+		t.Fatalf("%s", joined)
+	}
+	if _, _, err := p.Render(context.Background(), []byte("%PDF"), nil); err == nil {
+		t.Fatal("a failing renderer for all pages reports the failure")
+	}
+}
+
+// ---- factory ----------------------------------------------------------------
+
+type fakeResolver struct{ ok map[string]bool }
+
+func (f fakeResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
+	if f.ok[host] {
+		return []string{"10.0.0.2"}, nil
+	}
+	return nil, errors.New("no such host")
+}
+
+func TestManagedResolution(t *testing.T) {
+	yes := fakeResolver{ok: map[string]bool{ManagedTikaHost: true}}
+	no := fakeResolver{}
+	if ResolveManaged(context.Background(), yes, ManagedTikaHost, ManagedTikaURL, LocalTikaURL) != ManagedTikaURL ||
+		ResolveManaged(context.Background(), no, ManagedTikaHost, ManagedTikaURL, LocalTikaURL) != LocalTikaURL {
+		t.Fatal("managed resolution")
+	}
+	if c := ManagedCandidates(context.Background(), yes, ManagedTikaHost, ManagedTikaURL, LocalTikaURL); len(c) != 2 || c[0] != ManagedTikaURL || c[1] != LocalTikaURL {
+		t.Fatalf("%v", c)
+	}
+	if c := ManagedCandidates(context.Background(), no, ManagedTikaHost, ManagedTikaURL, LocalTikaURL); len(c) != 1 || c[0] != LocalTikaURL {
+		t.Fatalf("%v", c)
+	}
+}
+
+func TestFactoryAvailability(t *testing.T) {
+	ctx := context.Background()
+	d := Deps{HTTP: pool(), Resolver: fakeResolver{ok: map[string]bool{ManagedRapidOCRHost: true}}}
+	e, err := New(ctx, "builtin", Config{}, d)
+	if err != nil || e.Name() != "builtin" {
+		t.Fatal(err)
+	}
+	if e, _ := New(ctx, "", Config{}, d); e.Name() != "builtin" {
+		t.Fatal("empty means builtin")
+	}
+	missing := map[string]string{
+		"tika": "tika_unavailable", "docling": "docling_unavailable", "rapidocr": "ocr_unavailable", "tesseract": "ocr_unavailable",
+		"paddle": "ocr_unavailable", "mistral": "ocr_unavailable", "llm": "ocr_unavailable", "tencent": "ocr_unavailable", "aliyun": "ocr_unavailable", "nonsense": "nonsense_unavailable",
+	}
+	for kind, code := range missing {
+		if _, err := New(ctx, kind, Config{}, d); !IsCode(err, code) {
+			t.Errorf("%s: %v", kind, err)
+		}
+	}
+	if _, err := New(ctx, "mineru", Config{Source: "self_hosted"}, d); !IsCode(err, "mineru_unavailable") {
+		t.Fatalf("%v", err)
+	}
+	if e, err := New(ctx, "mineru", Config{}, d); err != nil || e.Name() != "mineru" {
+		t.Fatalf("cloud needs no url: %v", err)
+	}
+	e, err = New(ctx, "rapidocr", Config{Source: "managed"}, d)
+	if err != nil || e.(*OCR).b.baseURL != ManagedRapidOCRURL {
+		t.Fatalf("%v", err)
+	}
+	e, _ = New(ctx, "tika", Config{Source: "managed"}, d)
+	if e.(*Tika).b.baseURL != LocalTikaURL {
+		t.Fatal("unresolvable managed host falls back to localhost")
+	}
+	if e, err := New(ctx, "mistral", Config{Token: "k"}, d); err != nil || e.Name() != "mistral" {
+		t.Fatal(err)
+	}
+}
