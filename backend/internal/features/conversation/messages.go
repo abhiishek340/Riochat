@@ -448,3 +448,214 @@ func jsonDepth(v any) (int, bool) {
 		return 1, true
 	}
 }
+
+// normalizeUIState validates one block state. clear is true when the state
+// removes the block.
+func normalizeUIState(raw json.RawMessage) (compact string, clear bool, err error) {
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" || t == "{}" {
+		return "", true, nil
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return "", false, ErrInvalidUIState
+	}
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return "", false, ErrInvalidUIState
+	}
+	if len(obj) == 0 {
+		return "", true, nil
+	}
+	depth, ok := jsonDepth(v)
+	if !ok || depth > maxUIStateDepth {
+		return "", false, ErrInvalidUIState
+	}
+	c := marshalNoEscape(v)
+	if len(c) > maxUIStateBytes {
+		return "", false, ErrInvalidUIState
+	}
+	return c, false, nil
+}
+
+// UIStateResult is the answer to a UI state update.
+type UIStateResult struct {
+	MessageID       uint                       `json:"messageID"`
+	MessagePublicID string                     `json:"messagePublicID"`
+	UIState         map[string]json.RawMessage `json:"uiState"`
+}
+
+func (s *service) putUIState(ctx context.Context, userID uint, convPublicID, msgPublicID string, blocks map[string]json.RawMessage) (*UIStateResult, error) {
+	if len(blocks) == 0 || len(blocks) > maxUIBlocksPerRequest {
+		return nil, ErrInvalidUIState
+	}
+	normalized := map[string]string{}
+	clears := map[string]bool{}
+	for id, raw := range blocks {
+		if !validUIKey(id) {
+			return nil, ErrInvalidUIState
+		}
+		c, clr, err := normalizeUIState(raw)
+		if err != nil {
+			return nil, err
+		}
+		if clr {
+			clears[id] = true
+		} else {
+			normalized[id] = c
+		}
+	}
+	conv, err := s.getConversation(ctx, userID, convPublicID)
+	if err != nil {
+		return nil, err
+	}
+	msgPublicID = strings.TrimSpace(msgPublicID)
+	if msgPublicID == "" {
+		return nil, ErrMessageInvalidID
+	}
+	var result UIStateResult
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var m Message
+		e := lockRows(tx).Where("public_id = ? AND conversation_id = ? AND user_id = ?", msgPublicID, conv.ID, userID).First(&m).Error
+		if e != nil {
+			if database.IsNotFound(e) {
+				return ErrMessageNotFound
+			}
+			return e
+		}
+		if m.Role != roleAssistant || m.Status == msgPending {
+			return ErrUIStateTarget
+		}
+		var existing []UIState
+		if err := tx.Where("message_id = ?", m.ID).Find(&existing).Error; err != nil {
+			return err
+		}
+		have := map[string]UIState{}
+		for _, r := range existing {
+			have[r.BlockID] = r
+		}
+		for id := range clears {
+			if r, ok := have[id]; ok {
+				if err := tx.Delete(&UIState{}, r.ID).Error; err != nil {
+					return err
+				}
+				delete(have, id)
+			}
+		}
+		for id, c := range normalized {
+			if r, ok := have[id]; ok {
+				if err := tx.Model(&UIState{}).Where("id = ?", r.ID).Update("state_json", c).Error; err != nil {
+					return err
+				}
+				r.StateJSON = c
+				have[id] = r
+				continue
+			}
+			if len(have) >= maxUIBlocksPerMessage {
+				return ErrInvalidUIState
+			}
+			row := UIState{UserID: userID, ConversationID: conv.ID, MessageID: m.ID, BlockID: id, StateJSON: c}
+			if err := tx.Create(&row).Error; err != nil {
+				return err
+			}
+			have[id] = row
+		}
+		result.MessageID, result.MessagePublicID = m.ID, m.PublicID
+		result.UIState = map[string]json.RawMessage{}
+		for id, r := range have {
+			if c, ok := compactJSON([]byte(r.StateJSON)); ok && c != "{}" && c != "" {
+				result.UIState[id] = json.RawMessage(c)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ----- artifacts and tool calls -----
+
+// ArtifactDTO is a context artifact.
+type ArtifactDTO struct {
+	ID            uint    `json:"id"`
+	MessageID     uint    `json:"messageID"`
+	RunID         string  `json:"runID"`
+	Kind          string  `json:"kind"`
+	SourceType    string  `json:"sourceType"`
+	SourceID      string  `json:"sourceID"`
+	SourceTitle   string  `json:"sourceTitle"`
+	Content       string  `json:"content"`
+	TokenEstimate int     `json:"tokenEstimate"`
+	Score         float64 `json:"score"`
+	MetadataJSON  string  `json:"metadataJSON"`
+	ExpiresAt     *string `json:"expiresAt,omitempty"`
+	CreatedAt     string  `json:"createdAt"`
+}
+
+func (s *service) getArtifact(ctx context.Context, userID uint, id uint) (*ArtifactDTO, error) {
+	var r ContextRecord
+	err := s.db.WithContext(ctx).Where("id = ? AND user_id = ? AND record_type = ?", id, userID, recordArtifact).First(&r).Error
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, ErrArtifactNotFound
+		}
+		return nil, err
+	}
+	if r.ExpiresAt != nil && !r.ExpiresAt.After(s.now()) {
+		return nil, ErrArtifactNotFound
+	}
+	return &ArtifactDTO{
+		ID: r.ID, MessageID: r.MessageID, RunID: r.RunID, Kind: r.Kind, SourceType: r.SourceType, SourceID: r.SourceID,
+		SourceTitle: r.SourceTitle, Content: r.Content, TokenEstimate: r.TokenEstimate, Score: r.Score,
+		MetadataJSON: r.MetadataJSON, ExpiresAt: rfc(r.ExpiresAt), CreatedAt: *rfc(&r.CreatedAt),
+	}, nil
+}
+
+// ToolCallDetail is the stored detail of one tool call.
+type ToolCallDetail struct {
+	RunID           string `json:"runID"`
+	ToolCallID      string `json:"toolCallID"`
+	ToolName        string `json:"toolName"`
+	Status          string `json:"status"`
+	OutputJSON      string `json:"outputJSON"`
+	OutputSizeBytes int    `json:"outputSizeBytes"`
+	OutputOmitted   bool   `json:"outputOmitted"`
+	ErrorJSON       string `json:"errorJSON"`
+	ErrorSizeBytes  int    `json:"errorSizeBytes"`
+	ErrorOmitted    bool   `json:"errorOmitted"`
+}
+
+func (s *service) toolCallDetail(ctx context.Context, userID uint, runID, toolCallID string) (*ToolCallDetail, error) {
+	var run Run
+	err := s.db.WithContext(ctx).Where("run_id = ? AND user_id = ?", runID, userID).First(&run).Error
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, ErrToolCallNotFound
+		}
+		return nil, err
+	}
+	var ev RunEvent
+	err = s.db.WithContext(ctx).Where("run_id = ? AND event_scope = ? AND tool_call_id = ?", runID, scopeToolCall, toolCallID).First(&ev).Error
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, ErrToolCallNotFound
+		}
+		return nil, err
+	}
+	d := &ToolCallDetail{RunID: runID, ToolCallID: toolCallID, ToolName: ev.ToolName, Status: ev.Status}
+	d.OutputSizeBytes = len(ev.OutputJSON)
+	if d.OutputSizeBytes > toolPayloadMaxBytes {
+		d.OutputOmitted = true
+	} else {
+		d.OutputJSON = sanitizePayload(ev.OutputJSON, false)
+	}
+	d.ErrorSizeBytes = len(ev.ErrorJSON)
+	if d.ErrorSizeBytes > toolPayloadMaxBytes {
+		d.ErrorOmitted = true
+	} else {
+		d.ErrorJSON = sanitizePayload(ev.ErrorJSON, false)
+	}
+	return d, nil
+}
