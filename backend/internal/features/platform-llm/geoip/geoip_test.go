@@ -153,3 +153,172 @@ func TestMMDBLookupIPv4AndIPv6Trees(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestEligibleAddresses(t *testing.T) {
+	for _, ok := range []string{"8.8.8.8", "8.8.8.8:1234", "[2001:4860:4860::8888]:53", "2001:4860:4860::8888", "::ffff:8.8.8.8"} {
+		if _, good := Eligible(ok); !good {
+			t.Errorf("%s should be eligible", ok)
+		}
+	}
+	for _, bad := range []string{"", "10.0.0.1", "192.168.1.1", "127.0.0.1", "169.254.1.1", "::1", "fe80::1", "0.0.0.0", "224.0.0.1", "nope"} {
+		if _, good := Eligible(bad); good {
+			t.Errorf("%s must be skipped", bad)
+		}
+	}
+	if _, err := (*Resolver)(nil).Lookup(context.Background(), "8.8.8.8"); err != ErrSkipped {
+		t.Fatal("a nil resolver skips silently")
+	}
+}
+
+type direct struct{ c *http.Client }
+
+func (d direct) Do(ctx context.Context, ep outbound.Endpoint, req *http.Request) (*http.Response, error) {
+	return d.c.Do(req.WithContext(ctx))
+}
+
+func TestHTTPProviders(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/json"):
+			io.WriteString(w, `{"country":"fr","region":"IDF","city":"Paris","timezone":"Europe/Paris","loc":"48.85,2.35"}`)
+		case strings.Contains(r.URL.Path, "1.1.1.1"):
+			io.WriteString(w, `{"success":false}`)
+		case strings.Contains(r.URL.Path, "2.2.2.2"):
+			w.WriteHeader(500)
+		default:
+			io.WriteString(w, `{"success":true,"country_code":"DE","region":"Berlin","city":"Berlin","latitude":52.5,"longitude":13.4,"timezone":{"id":"Europe/Berlin"}}`)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+
+	w, err := New(Settings{Provider: "IPWhois", BaseURL: srv.URL + "/"}, direct{srv.Client()})
+	if err != nil || w.Source() != SourceAPI {
+		t.Fatalf("%v", err)
+	}
+	loc, err := w.Lookup(ctx, "8.8.4.4")
+	if err != nil || loc.CountryCode != "DE" || loc.TimeZone != "Europe/Berlin" || *loc.Latitude != 52.5 {
+		t.Fatalf("%v %+v", err, loc)
+	}
+	if _, err := w.Lookup(ctx, "1.1.1.1"); err == nil {
+		t.Fatal("success flag is required")
+	}
+	if _, err := w.Lookup(ctx, "2.2.2.2"); err == nil {
+		t.Fatal("non-2xx is an error")
+	}
+	if _, err := w.Lookup(ctx, "10.1.1.1"); err != ErrSkipped || len(paths) != 3 {
+		t.Fatalf("private addresses never reach the service: %v %v", err, paths)
+	}
+
+	i, _ := New(Settings{Provider: "ipinfo", BaseURL: srv.URL, Token: "tk en"}, direct{srv.Client()})
+	loc, err = i.Lookup(ctx, "8.8.4.4")
+	if err != nil || loc.CountryCode != "FR" || *loc.Longitude != 2.35 {
+		t.Fatalf("%v %+v", err, loc)
+	}
+	if last := paths[len(paths)-1]; last != "/8.8.4.4/json?token=tk+en" {
+		t.Fatalf("token goes in the query: %s", last)
+	}
+}
+
+func TestDisabledAndUnknownProviders(t *testing.T) {
+	for _, p := range []string{"", "none", "DISABLED", "  "} {
+		if r, err := New(Settings{Provider: p}, nil); r != nil || err != nil {
+			t.Fatalf("%q: %v %v", p, r, err)
+		}
+	}
+	if _, err := New(Settings{Provider: "bogus"}, nil); err == nil {
+		t.Fatal("unknown provider")
+	}
+	dir := t.TempDir()
+	if r, err := New(Settings{Provider: "mmdb", DatabasePath: filepath.Join(dir, "none.mmdb")}, nil); err != nil || r.Source() != SourceMMDB {
+		t.Fatalf("a missing file is tolerated: %v", err)
+	}
+}
+
+func TestRefreshDownloadsVerifiesAndSwaps(t *testing.T) {
+	img := buildDB(4, bitsOf([]byte{8, 8, 8}, 24), sampleRecord())
+	var mode atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch mode.Load() {
+		case 0:
+			w.Write(img)
+		case 1:
+			io.WriteString(w, "not a database")
+		default:
+			w.WriteHeader(503)
+		}
+	}))
+	defer srv.Close()
+	path := filepath.Join(t.TempDir(), "sub", "geoip.mmdb")
+	res, _ := New(Settings{Provider: "mmdb", DatabasePath: path}, nil)
+	f := &Refresher{S: RefreshSettings{URL: srv.URL, Path: path, MaxBytes: int64(len(img))}, HTTP: direct{srv.Client()}, Resolver: res}
+
+	mode.Store(1)
+	if err := f.Download(context.Background()); err == nil {
+		t.Fatal("an unreadable download must be rejected")
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("nothing is written for a rejected download")
+	}
+	mode.Store(0)
+	if err := f.Download(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if loc, err := res.Lookup(context.Background(), "8.8.8.8"); err != nil || loc.City != "Mountain View" {
+		t.Fatalf("the reader is swapped: %v %+v", err, loc)
+	}
+	f.S.MaxBytes = int64(len(img)) - 1
+	if err := f.Download(context.Background()); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("size cap: %v", err)
+	}
+	mode.Store(2)
+	f.S.MaxBytes = int64(len(img))
+	if err := f.Download(context.Background()); err == nil {
+		t.Fatal("HTTP errors fail")
+	}
+}
+
+func TestNextDelayBackoff(t *testing.T) {
+	if NextDelay(0, 0) != 168*time.Hour || NextDelay(5*time.Hour, 0) != 5*time.Hour {
+		t.Fatal("interval")
+	}
+	want := []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute, 32 * time.Minute, time.Hour, time.Hour}
+	for i, w := range want {
+		if got := NextDelay(time.Hour, i+1); got != w {
+			t.Fatalf("failure %d: %v != %v", i+1, got, w)
+		}
+	}
+}
+
+func TestRunRefreshesUntilCanceled(t *testing.T) {
+	img := buildDB(4, bitsOf([]byte{8, 8, 8}, 24), sampleRecord())
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(500)
+			return
+		}
+		w.Write(img)
+	}))
+	defer srv.Close()
+	path := filepath.Join(t.TempDir(), "g.mmdb")
+	ctx, cancel := context.WithCancel(context.Background())
+	var waits []time.Duration
+	f := &Refresher{S: RefreshSettings{URL: srv.URL, Path: path, MaxBytes: 1 << 20, Interval: time.Hour}, HTTP: direct{srv.Client()},
+		Sleep: func(ctx context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			if len(waits) == 2 {
+				cancel()
+			}
+			return ctx.Err()
+		}}
+	f.Run(ctx)
+	if len(waits) != 2 || waits[0] != time.Minute || waits[1] != time.Hour {
+		t.Fatalf("backoff after failure, interval after success: %v", waits)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("the second attempt wrote the file")
+	}
+}
