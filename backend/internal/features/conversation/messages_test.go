@@ -504,3 +504,239 @@ func TestForkPendingStatusBecomesInterruptedAndHistoryChecks(t *testing.T) {
 	e.DB.Create(&asst)
 	e.expectErr("POST", "/conversations/"+deep+"/messages/"+asst.PublicID+"/fork", e.u1, nil, 400, "conversation.message_fork_history_incomplete")
 }
+
+func uiPath(conv, msg string) string {
+	return "/conversations/" + conv + "/messages/" + msg + "/ui-state"
+}
+
+func TestUIState(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	u, a := pair(e.send(e.u1, id, "q", nil))
+	path := uiPath(id, str(a, "publicID"))
+	m := e.ok("PUT", path, e.u1, map[string]any{"blocks": map[string]any{"quiz-1": map[string]any{"answers": []int{1, 2}}}})
+	st := m["uiState"].(map[string]any)
+	if str(m, "messagePublicID") != str(a, "publicID") || num(m, "messageID") != num(a, "id") || fmt.Sprint(st["quiz-1"]) != "map[answers:[1 2]]" {
+		t.Fatalf("stored: %v", m)
+	}
+	// stored compactly without HTML escaping
+	m = e.ok("PUT", path, e.u1, map[string]any{"blocks": map[string]any{"html_b": map[string]any{"t": "<b>&</b>"}}})
+	var row UIState
+	e.DB.Where("block_id = ?", "html_b").First(&row)
+	if row.StateJSON != `{"t":"<b>&</b>"}` {
+		t.Fatalf("compact no-escape: %q", row.StateJSON)
+	}
+	if len(m["uiState"].(map[string]any)) != 2 {
+		t.Fatalf("response has the full map: %v", m["uiState"])
+	}
+	// enriched in lists (assistant only)
+	rows := e.list(id)
+	if rows[1]["uiState"] == nil || rows[0]["uiState"] != nil {
+		t.Fatalf("uiState enrichment: %v / %v", rows[0]["uiState"], rows[1]["uiState"])
+	}
+	// null, empty and {} clear
+	for _, v := range []any{nil, map[string]any{}} {
+		e.ok("PUT", path, e.u1, map[string]any{"blocks": map[string]any{"quiz-1": v}})
+	}
+	var n int64
+	e.DB.Model(&UIState{}).Where("block_id = ?", "quiz-1").Count(&n)
+	if n != 0 {
+		t.Fatal("block must be removed")
+	}
+	m = e.ok("PUT", path, e.u1, map[string]any{"blocks": map[string]any{"html_b": nil}})
+	if len(m["uiState"].(map[string]any)) != 0 {
+		t.Fatalf("all cleared: %v", m)
+	}
+	// validation
+	bad := func(blocks map[string]any, status int, code string) {
+		t.Helper()
+		e.expectErr("PUT", path, e.u1, map[string]any{"blocks": blocks}, status, code)
+	}
+	bad(map[string]any{"bad id!": map[string]any{"a": 1}}, 400, "message.invalid_ui_state")
+	bad(map[string]any{strings.Repeat("a", 65): map[string]any{"a": 1}}, 400, "message.invalid_ui_state")
+	bad(map[string]any{"b": map[string]any{"bad key": 1}}, 400, "message.invalid_ui_state")
+	// levels: scalar = 1, so four nested objects around a scalar are five levels
+	bad(map[string]any{"b": map[string]any{"k": map[string]any{"k": map[string]any{"k": map[string]any{"k": 1}}}}}, 400, "message.invalid_ui_state")
+	bad(map[string]any{"b": map[string]any{"k": map[string]any{"k": map[string]any{"k": 1}}}}, 200, "")
+	bad(map[string]any{"b": map[string]any{"k": strings.Repeat("v", 4100)}}, 400, "message.invalid_ui_state")
+	bad(map[string]any{"b": []int{1}}, 400, "message.invalid_ui_state")
+	bad(map[string]any{"b": "str"}, 400, "message.invalid_ui_state")
+	// too many blocks in the request -> body validation
+	many := map[string]any{}
+	for i := 0; i < 33; i++ {
+		many[fmt.Sprintf("b%d", i)] = map[string]any{"a": 1}
+	}
+	bad(many, 400, "request.invalid_body")
+	bad(map[string]any{}, 400, "request.invalid_body")
+	e.expectErr("PUT", path, e.u1, map[string]any{}, 400, "request.invalid_body")
+	// targets
+	e.expectErr("PUT", uiPath(id, str(u, "publicID")), e.u1, map[string]any{"blocks": map[string]any{"b": map[string]any{"a": 1}}}, 400, "message.ui_state_target_invalid")
+	pend := e.seedMsg(e.convRow(id), roleAssistant, "", msgPending, nil)
+	e.expectErr("PUT", uiPath(id, pend.PublicID), e.u1, map[string]any{"blocks": map[string]any{"b": map[string]any{"a": 1}}}, 400, "message.ui_state_target_invalid")
+	e.expectErr("PUT", uiPath(id, "zzz"), e.u1, map[string]any{"blocks": map[string]any{"b": map[string]any{"a": 1}}}, 404, "message.not_found")
+	e.expectErr("PUT", uiPath("nope", str(a, "publicID")), e.u1, map[string]any{"blocks": map[string]any{"b": map[string]any{"a": 1}}}, 404, "conversation.not_found")
+	e.expectErr("PUT", path, e.u2, map[string]any{"blocks": map[string]any{"b": map[string]any{"a": 1}}}, 404, "conversation.not_found")
+}
+
+func TestUIStateStoredBlockCap(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	_, a := pair(e.send(e.u1, id, "q", nil))
+	path := uiPath(id, str(a, "publicID"))
+	for batch := 0; batch < 2; batch++ {
+		blocks := map[string]any{}
+		for i := 0; i < 16; i++ {
+			blocks[fmt.Sprintf("b%d_%d", batch, i)] = map[string]any{"a": 1}
+		}
+		e.ok("PUT", path, e.u1, map[string]any{"blocks": blocks})
+	}
+	e.expectErr("PUT", path, e.u1, map[string]any{"blocks": map[string]any{"one_more": map[string]any{"a": 1}}}, 400, "message.invalid_ui_state")
+	// updating an existing block is still fine; clearing then adding too
+	e.ok("PUT", path, e.u1, map[string]any{"blocks": map[string]any{"b0_0": map[string]any{"a": 2}}})
+	e.ok("PUT", path, e.u1, map[string]any{"blocks": map[string]any{"b0_0": nil, "fresh": map[string]any{"a": 1}}})
+}
+
+func TestUIStateDuplicateBlockIDsRejected(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	_, a := pair(e.send(e.u1, id, "q", nil))
+	raw := `{"blocks":{"dup":{"a":1},"dup":{"a":2}}}`
+	e.expectErr("PUT", uiPath(id, str(a, "publicID")), e.u1, raw, 400, "message.invalid_ui_state")
+}
+
+func TestRunsListAndStatuses(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	_, a1 := pair(e.send(e.u1, id, "a", map[string]any{"clientRunID": "r1"}))
+	_, a2 := pair(e.send(e.u1, id, "b", map[string]any{"clientRunID": "r2"}))
+	w := e.call("GET", "/conversations/"+id+"/runs", e.u1, nil)
+	total, res := results(t, w)
+	if total != 2 || len(res) != 2 {
+		t.Fatalf("runs: %d", total)
+	}
+	e.expectErr("GET", "/conversations/"+id+"/runs", e.u2, nil, 404, "conversation.not_found")
+	other := e.newConv(e.u2, "o", "gpt-4o")
+	_, ao := pair(e.send(e.u2, other, "x", nil))
+
+	body := map[string]any{"runIDs": []string{str(a1, "runID"), str(a2, "runID"), str(a1, "runID"), str(ao, "runID"), "run_unknown", " "}}
+	m := dataList(t, e.call("POST", "/conversation-runs/statuses", e.u1, body))
+	if len(m) != 2 {
+		t.Fatalf("own runs only, duplicates/blank/unknown ignored: %v", m)
+	}
+	got := map[string]string{}
+	for _, r := range m {
+		got[str(r, "runID")] = str(r, "status")
+	}
+	if got["run_r1"] != "success" || got["run_r2"] != "success" {
+		t.Fatalf("statuses: %v", got)
+	}
+	for _, bad := range []any{map[string]any{}, map[string]any{"runIDs": []string{}}, map[string]any{"runIDs": make([]string, 101)},
+		map[string]any{"runIDs": []string{""}}, map[string]any{"runIDs": []string{strings.Repeat("r", 65)}}, "garbage", ""} {
+		e.expectErr("POST", "/conversation-runs/statuses", e.u1, bad, 400, "request.invalid_run_ids")
+	}
+}
+
+func TestExportConversation(t *testing.T) {
+	e := newEnv(t)
+	e.gen.set(traceGenerator())
+	id := e.newConv(e.u1, "Exp", "gpt-4o")
+	_, a := pair(e.send(e.u1, id, "q", nil))
+	e.ok("PUT", "/messages/"+str(a, "publicID")+"/feedback", e.u1, map[string]string{"feedback": "up"})
+	m := e.ok("GET", "/conversations/"+id+"/export", e.u1, nil)
+	if num(m, "version") != 1 || str(m, "exportScope") != "full" || m["exportedAt"] == nil || num(m, "totalMessages") != 2 || num(m, "totalRuns") != 1 {
+		t.Fatalf("export header: %v", m)
+	}
+	comp := m["compatibility"].(map[string]any)
+	if str(comp, "format") != "riochat.conversation.export" || str(comp, "notes") != "Full backup export. Import compatibility is not guaranteed." {
+		t.Fatalf("compat: %v", comp)
+	}
+	if len(m["defaultMessagePublicIDs"].([]any)) != 2 || len(m["messages"].([]any)) != 2 || len(m["runs"].([]any)) != 1 {
+		t.Fatalf("export body: %v", m)
+	}
+	if str(m["conversation"].(map[string]any), "title") != "Exp" {
+		t.Fatalf("conversation: %v", m["conversation"])
+	}
+	am := m["messages"].([]any)[1].(map[string]any)
+	if str(am, "myFeedback") != "up" || am["processTrace"] == nil {
+		t.Fatalf("export message enrichment: %v", am)
+	}
+	e.expectErr("GET", "/conversations/"+id+"/export", e.u2, nil, 404, "conversation.not_found")
+	if a := e.audit.find("export_conversation"); a == nil || num2(a.Detail["message_count"]) != 2 {
+		t.Fatalf("audit: %+v", a)
+	}
+}
+
+func num2(v any) int {
+	switch x := v.(type) {
+	case int:
+		return x
+	case int64:
+		return int(x)
+	case float64:
+		return int(x)
+	}
+	return -1
+}
+
+func TestExportDefaultBranchIsNewestChild(t *testing.T) {
+	e := newEnv(t)
+	id := e.newConv(e.u1, "t", "gpt-4o")
+	u1, a1 := pair(e.send(e.u1, id, "q", nil))
+	_, a2 := pair(e.send(e.u1, id, "q", map[string]any{"sourceMessagePublicID": str(a1, "publicID"), "parentMessagePublicID": str(u1, "publicID"), "branchReason": "retry"}))
+	m := e.ok("GET", "/conversations/"+id+"/export", e.u1, nil)
+	ids := m["defaultMessagePublicIDs"].([]any)
+	if len(ids) != 2 || ids[0] != str(u1, "publicID") || ids[1] != str(a2, "publicID") {
+		t.Fatalf("latest branch: %v (want %s)", ids, str(a2, "publicID"))
+	}
+	if num(m, "totalMessages") != 3 {
+		t.Fatalf("total: %v", m["totalMessages"])
+	}
+}
+
+func TestExportAllStream(t *testing.T) {
+	e := newEnv(t)
+	for i := 0; i < 3; i++ {
+		id := e.newConv(e.u1, fmt.Sprintf("c%d", i), "gpt-4o")
+		e.send(e.u1, id, "hi", nil)
+	}
+	e.newConv(e.u2, "theirs", "")
+	w := e.call("GET", "/conversations/export", e.u1, nil)
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/x-ndjson" {
+		t.Fatalf("content type: %q", ct)
+	}
+	cd := w.Header().Get("Content-Disposition")
+	if !strings.HasPrefix(cd, `attachment; filename="my-conversations-20260301-090`) || !strings.HasSuffix(cd, `.jsonl"`) {
+		t.Fatalf("content disposition: %q", cd)
+	}
+	if w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("cache control: %q", w.Header().Get("Cache-Control"))
+	}
+	lines := ndjson(t, w)
+	if len(lines) != 4 {
+		t.Fatalf("lines: %d", len(lines))
+	}
+	man := lines[len(lines)-1]
+	if man["_type"] != "export_manifest" || man["complete"] != true || num(man, "exported") != 3 || num(man, "failed") != 0 {
+		t.Fatalf("manifest: %v", man)
+	}
+	if num(lines[0], "version") != 1 || lines[0]["conversation"] == nil {
+		t.Fatalf("conversation line: %v", lines[0])
+	}
+	// empty account still gets a manifest
+	w = e.call("GET", "/conversations/export", e.Bearer(userClaims(55)), nil)
+	lines = ndjson(t, w)
+	if len(lines) != 1 || lines[0]["_type"] != "export_manifest" || lines[0]["complete"] != true || num(lines[0], "exported") != 0 {
+		t.Fatalf("empty manifest: %v", lines)
+	}
+	if e.audit.find("export_all_conversations") == nil {
+		t.Fatal("audit")
+	}
+}
+
+func TestInvalidJSONHelpersCompile(t *testing.T) {
+	var v any
+	_ = json.Unmarshal([]byte("{}"), &v)
+}
