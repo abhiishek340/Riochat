@@ -161,3 +161,182 @@ function BlocksView({ blocks, streaming, tailOpen }: { blocks: readonly Block[];
 function sigOf(b: Block): string {
   return `${b.type}|${b.raw}|${"closed" in b ? String(b.closed) : ""}`;
 }
+
+const BlockView = memo(
+  function BlockView({ block, tail, streaming }: BlockProps) {
+    const ctx = useMarkdownContext();
+    const line = block.line + 1;
+    switch (block.type) {
+      case "paragraph": {
+        const kids = block.children;
+        if (kids.length === 1 && (kids[0]?.type === "image" || (kids[0]?.type === "link" && kids[0].children.length === 1 && kids[0].children[0]?.type === "image"))) {
+          return (
+            <div data-source-line={line}>
+              <InlineNodes nodes={kids} />
+            </div>
+          );
+        }
+        return (
+          <p data-source-line={line}>
+            <InlineNodes nodes={kids} />
+          </p>
+        );
+      }
+      case "heading": {
+        const Tag = `h${block.level}` as "h1";
+        return (
+          <Tag id={`${ctx.scope}-${block.id}`} data-source-line={line} data-heading-level={block.level}>
+            <InlineNodes nodes={block.children} />
+          </Tag>
+        );
+      }
+      case "code": {
+        if (block.lang === "riochat-ui") return <UiBlockHost code={block.code} closed={block.closed && !tail} />;
+        if (block.lang === "riochat-widget") return <WidgetHost code={block.code} closed={block.closed} />;
+        return (
+          <div data-source-line={line}>
+            <CodeBlock code={block.code} lang={block.lang} closed={block.closed || !streaming} />
+          </div>
+        );
+      }
+      case "math":
+        return (
+          <div data-source-line={line}>
+            <MathView tex={block.tex} display />
+          </div>
+        );
+      case "quote":
+        return (
+          <blockquote data-source-line={line}>
+            <BlocksView blocks={block.children} streaming={streaming} tailOpen={tail} />
+          </blockquote>
+        );
+      case "list": {
+        const Tag = block.ordered ? "ol" : "ul";
+        const task = block.items.some((i) => i.checked !== null);
+        return (
+          <Tag className={cn(task && "task")} start={block.ordered && block.start !== 1 ? block.start : undefined} data-source-line={line}>
+            {block.items.map((item, i) => (
+              <li key={i}>
+                {item.checked !== null ? <input type="checkbox" checked={item.checked} disabled readOnly aria-hidden className="mt-1.5 shrink-0" /> : null}
+                <div className={task ? "min-w-0 flex-1" : undefined}>
+                  {block.tight ? <TightItem blocks={item.children} streaming={streaming} tail={tail && i === block.items.length - 1} /> : <BlocksView blocks={item.children} streaming={streaming} tailOpen={tail && i === block.items.length - 1} />}
+                </div>
+              </li>
+            ))}
+          </Tag>
+        );
+      }
+      case "table":
+        return (
+          <div data-source-line={line}>
+            <MdTable header={block.header} align={block.align} rows={block.rows} streaming={streaming && !block.complete} renderCell={renderCell} />
+          </div>
+        );
+      case "hr":
+        return <hr data-source-line={line} />;
+      case "footnotes":
+        return (
+          <section className="footnotes" aria-label="footnotes">
+            <ol>
+              {block.items.map((item) => (
+                <li key={item.id} id={`${ctx.scope}-fn-${item.id}`}>
+                  <TightItem blocks={item.children} streaming={false} tail={false} />{" "}
+                  <a
+                    href={`#${ctx.scope}-fnref-${item.id}`}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      document.getElementById(`${ctx.scope}-fnref-${item.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+                    }}
+                  >
+                    ↩
+                  </a>
+                </li>
+              ))}
+            </ol>
+          </section>
+        );
+    }
+  },
+  (a, b) => a.sig === b.sig && a.tail === b.tail && a.streaming === b.streaming,
+);
+
+/** A tight list item shows its first paragraph without paragraph spacing. */
+function TightItem({ blocks, streaming, tail }: { blocks: readonly Block[]; streaming: boolean; tail: boolean }) {
+  return (
+    <>
+      {blocks.map((b, i) =>
+        b.type === "paragraph" ? (
+          <Fragment key={i}>
+            <InlineNodes nodes={b.children} />
+            {i < blocks.length - 1 ? null : null}
+          </Fragment>
+        ) : (
+          <BlockView key={`${i}:${b.type}`} block={b} sig={sigOf(b)} tail={tail && i === blocks.length - 1} streaming={streaming} />
+        ),
+      )}
+    </>
+  );
+}
+
+// --- the component --------------------------------------------------------------------------------
+
+export interface MarkdownProps extends MarkdownActions {
+  content: unknown;
+  variant?: Variant;
+  streaming?: boolean;
+  className?: string;
+  /** Prefix for heading ids; unique per message. */
+  scope?: string;
+  readOnly?: boolean;
+  /** Open thinking segments by default while they stream. */
+  autoExpandThinking?: boolean;
+}
+
+export const Markdown = memo(function Markdown({
+  content,
+  variant = "default",
+  streaming = false,
+  className,
+  scope = "md",
+  readOnly = false,
+  autoExpandThinking = true,
+  openCode,
+  imageEditable,
+  editImage,
+  blocks,
+}: MarkdownProps) {
+  const text = useMemo(() => normalizeContent(content, { variant }), [content, variant]);
+  const { think, rest } = useMemo(() => (variant === "thinking" ? { think: null, rest: text } : splitThinking(text)), [text, variant]);
+  const parsed = useMemo(() => parseBlocks(rest, { streaming }), [rest, streaming]);
+  const ctxValue = useMemo(() => ({ scope, streaming, readOnly, openCode, imageEditable, editImage, blocks }), [scope, streaming, readOnly, openCode, imageEditable, editImage, blocks]);
+
+  return (
+    <MarkdownContext.Provider value={ctxValue}>
+      <div className={cn("rio-md", variant === "thinking" && "compact", variant === "user" && "user", className)}>
+        {think ? <ThinkSegment text={think.text} complete={think.complete} streaming={streaming} auto={autoExpandThinking} /> : null}
+        <BlocksView blocks={parsed} streaming={streaming} tailOpen={streaming} />
+      </div>
+    </MarkdownContext.Provider>
+  );
+});
+
+function ThinkSegment({ text, complete, streaming, auto }: { text: string; complete: boolean; streaming: boolean; auto: boolean }) {
+  const t = useT();
+  const active = streaming && !complete;
+  const [manual, setManual] = useState<boolean | null>(null);
+  const open = manual ?? (active && auto);
+  return (
+    <div className="my-2 rounded-xl border bg-muted/40">
+      <button type="button" onClick={() => setManual(!open)} aria-expanded={open} className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-xs font-medium text-muted-foreground">
+        <ChevronRight className={cn("size-3.5 transition-transform", open && "rotate-90")} />
+        {active ? t("chatRich.md.thinking.active") : t("chatRich.md.thinking.done")}
+      </button>
+      {open ? (
+        <div className="border-t px-3 pb-2">
+          <Markdown content={text} variant="thinking" streaming={active} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
