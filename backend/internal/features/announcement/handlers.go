@@ -159,3 +159,157 @@ func failField(c *gin.Context, field, rule, msg string) {
 			"fieldErrors": []httpx.FieldError{{Field: field, Rule: rule, Message: msg}},
 		}))
 }
+
+func (h *handlers) dismissToday(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	version, ok := bindChoice(c)
+	if !ok {
+		return
+	}
+	if err := h.svc.DismissToday(c.Request.Context(), middleware.MustPrincipal(c).UserID, id, version); err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"dismissed": true})
+}
+
+func (h *handlers) close(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	version, ok := bindChoice(c)
+	if !ok {
+		return
+	}
+	if err := h.svc.Close(c.Request.Context(), middleware.MustPrincipal(c).UserID, id, version); err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"closed": true})
+}
+
+// ---- administrator endpoints ----
+
+func (h *handlers) adminList(c *gin.Context) {
+	f := adminFilter{
+		Status:  c.Query("status"),
+		Type:    c.Query("type"),
+		Keyword: c.Query("q"),
+	}
+	if v, ok := parseBool(c.Query("pinned")); ok {
+		f.Pinned = &v
+	}
+	rows, total, err := h.svc.AdminList(c.Request.Context(), f, pagination.FromRequest(c.Request))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	out := make([]view, 0, len(rows))
+	for i := range rows {
+		out = append(out, toView(&rows[i], nil))
+	}
+	httpx.Paged(c, total, out)
+}
+
+type createRequest struct {
+	Title           string     `json:"title" binding:"required,min=1,max=120"`
+	ContentMarkdown string     `json:"contentMarkdown" binding:"required,min=1,max=20000"`
+	Status          string     `json:"status" binding:"omitempty,oneof=active inactive"`
+	Type            string     `json:"type" binding:"omitempty,oneof=critical warning info normal general"`
+	Pinned          bool       `json:"pinned"`
+	Priority        int        `json:"priority"`
+	StartsAt        *time.Time `json:"startsAt"`
+	ExpiresAt       *time.Time `json:"expiresAt"`
+}
+
+func (h *handlers) adminCreate(c *gin.Context) {
+	var req createRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	row, err := h.svc.Create(c.Request.Context(), middleware.MustPrincipal(c).UserID, createInput{
+		Title: req.Title, ContentMarkdown: req.ContentMarkdown, Status: req.Status, Type: req.Type,
+		Pinned: req.Pinned, Priority: req.Priority, StartsAt: req.StartsAt, ExpiresAt: req.ExpiresAt,
+	})
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"announcement": toView(row, nil)})
+}
+
+// optionalTime decodes a timestamp field that distinguishes "absent" (the
+// field is never visited), "cleared" (null or a blank string) and "set" (an
+// RFC 3339 string).
+type optionalTime struct {
+	patch timePatch
+}
+
+func (o *optionalTime) UnmarshalJSON(b []byte) error {
+	raw := bytes.TrimSpace(b)
+	o.patch = timePatch{Set: true}
+	if string(raw) == "null" {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return &json.UnmarshalTypeError{Value: "non-string", Type: reflect.TypeOf(time.Time{})}
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return &json.UnmarshalTypeError{Value: "string", Type: reflect.TypeOf(time.Time{})}
+	}
+	o.patch.Value = &t
+	return nil
+}
+
+type patchRequest struct {
+	Title           *string      `json:"title" binding:"omitnil,min=1,max=120"`
+	ContentMarkdown *string      `json:"contentMarkdown" binding:"omitnil,min=1,max=20000"`
+	Status          *string      `json:"status" binding:"omitnil,oneof=active inactive"`
+	Type            *string      `json:"type" binding:"omitnil,oneof=critical warning info normal general"`
+	Pinned          *bool        `json:"pinned"`
+	Priority        *int         `json:"priority"`
+	StartsAt        optionalTime `json:"startsAt"`
+	ExpiresAt       optionalTime `json:"expiresAt"`
+}
+
+func (h *handlers) adminUpdate(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var req patchRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	row, err := h.svc.Update(c.Request.Context(), id, updateInput{
+		Title: req.Title, ContentMarkdown: req.ContentMarkdown, Status: req.Status, Type: req.Type,
+		Pinned: req.Pinned, Priority: req.Priority, StartsAt: req.StartsAt.patch, ExpiresAt: req.ExpiresAt.patch,
+	})
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"announcement": toView(row, nil)})
+}
+
+func (h *handlers) adminDelete(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.svc.Delete(c.Request.Context(), id); err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"deleted": true})
+}
