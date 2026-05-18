@@ -145,3 +145,196 @@ export interface ConsumeOptions {
   resume?: boolean;
   status?: number;
 }
+
+/**
+ * Reads a generation stream to its end and applies the outcome rules:
+ * moderation block -> ApiError `content_moderation.blocked`; completion ->
+ * its data; terminal error -> interruption callback (with data) or ApiError;
+ * otherwise an error about the missing final payload.
+ */
+export async function consumeConversationStream<T = unknown>(
+  response: Response,
+  handlers: ConversationStreamHandlers = {},
+  options: ConsumeOptions = {},
+): Promise<T | undefined> {
+  const status = options.status ?? response.status;
+  if (!response.body) {
+    if (options.resume) return undefined;
+    throw new ApiError({ message: "Stream body is empty", status });
+  }
+  let completed: { data: unknown } | null = null;
+  let blocked: Extract<StreamEvent, { type: "moderation_blocked" }> | null = null;
+
+  for await (const raw of readJsonDocuments(response)) {
+    if (!isRecord(raw) || typeof raw.type !== "string") throw new StreamProtocolError("stream event without a type");
+    const event = raw as StreamEvent;
+    handlers.onEvent?.(event);
+    if (typeof event.seq === "number" && event.seq > 0) handlers.onSeq?.(event.seq);
+
+    if (!KNOWN.has(event.type)) {
+      throw new ApiError({ message: `Unknown stream event: ${event.type}`, status });
+    }
+    switch (event.type) {
+      case "delta":
+        if (event.replace === true) handlers.onSnapshot?.(event.delta ?? "");
+        else handlers.onDelta?.(event.delta ?? "");
+        break;
+      case "moderation_blocked":
+        blocked = event;
+        break;
+      case "completed":
+        completed = { data: event.data };
+        break;
+      case "error": {
+        if (event.data !== undefined && event.data !== null) {
+          handlers.onInterrupted?.(event.data, event);
+          return event.data as T;
+        }
+        throw new ApiError({
+          message: event.message || "Stream failed",
+          status: typeof event.status === "number" ? event.status : status,
+          errorCode: event.errorCode,
+          requestId: event.requestId,
+          details: event.debug,
+        });
+      }
+      default:
+        break;
+    }
+  }
+
+  if (blocked) {
+    throw new ApiError({
+      message: "Content blocked by moderation",
+      status,
+      errorCode: "content_moderation.blocked",
+      details: { eventID: blocked.eventID, direction: blocked.direction, categories: blocked.categories },
+    });
+  }
+  if (completed) return completed.data as T;
+  if (options.resume) return undefined;
+  throw new ApiError({ message: "Stream completed without final payload", status });
+}
+
+export interface StreamPostOptions extends ConversationStreamHandlers {
+  signal?: AbortSignal;
+  query?: RequestOptions["query"];
+}
+
+/** POST a JSON body (or FormData) to a generation endpoint and consume its stream. */
+export async function postConversationStream<T = unknown>(
+  path: string,
+  body: unknown,
+  options: StreamPostOptions = {},
+): Promise<T | undefined> {
+  const { signal, query, ...handlers } = options;
+  const response = await api.raw(path, {
+    method: "POST",
+    body,
+    signal,
+    query,
+    headers: { Accept: "application/x-ndjson" },
+  });
+  return consumeConversationStream<T>(response, handlers);
+}
+
+/** Re-attach to a run: GET /conversation-runs/{id}/stream?snapshot=true[&after=seq]. */
+export async function resumeRunStream<T = unknown>(
+  runID: string,
+  options: StreamPostOptions & { after?: number } = {},
+): Promise<T | undefined> {
+  const { signal, after, ...handlers } = options;
+  const response = await api.raw(`/conversation-runs/${encodeURIComponent(runID)}/stream`, {
+    signal,
+    query: { snapshot: "true", after: after && after > 0 ? Math.floor(after) : undefined },
+    headers: { Accept: "application/x-ndjson" },
+  });
+  return consumeConversationStream<T>(response, handlers, { resume: true });
+}
+
+// --- Server-Sent Events ------------------------------------------------------
+
+/**
+ * Yields the joined `data:` payload of each SSE frame. Frames end at a blank
+ * line (CRLF or LF); comment lines and empty frames are skipped. A buffered
+ * remainder is processed when the stream ends.
+ */
+export async function* readSseData(response: Response): AsyncGenerator<string> {
+  let buffer = "";
+  const flush = function* (frame: string): Generator<string> {
+    const lines: string[] = [];
+    for (const line of frame.split(/\r?\n/)) {
+      if (line.startsWith("data:")) lines.push(line.slice(5).trimStart());
+    }
+    const data = lines.join("\n").trim();
+    if (data) yield data;
+  };
+  for await (const chunk of decodeChunks(response)) {
+    buffer += chunk;
+    for (;;) {
+      const match = /\r?\n\r?\n/.exec(buffer);
+      if (!match) break;
+      const frame = buffer.slice(0, match.index);
+      buffer = buffer.slice(match.index + match[0].length);
+      yield* flush(frame);
+    }
+  }
+  if (buffer.trim()) yield* flush(buffer);
+}
+
+export interface ActiveRun {
+  runID: string;
+  conversationPublicID: string;
+}
+
+export type ActiveRunEvent =
+  | { type: "snapshot"; runs: ActiveRun[] }
+  | { type: "started" | "finished"; runID: string; conversationPublicID?: string };
+
+/** Parses one SSE payload; malformed or unrecognised events yield null so the connection survives. */
+export function parseActiveRunEvent(data: string): ActiveRunEvent | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (!isRecord(value)) return null;
+  if (value.type === "snapshot") {
+    if (!Array.isArray(value.runs)) return null;
+    const runs: ActiveRun[] = [];
+    for (const item of value.runs) {
+      if (!isRecord(item) || typeof item.runID !== "string" || !item.runID) return null; // discard the whole snapshot
+      runs.push({
+        runID: item.runID,
+        conversationPublicID: typeof item.conversationPublicID === "string" ? item.conversationPublicID : "",
+      });
+    }
+    return { type: "snapshot", runs };
+  }
+  if ((value.type === "started" || value.type === "finished") && typeof value.runID === "string" && value.runID) {
+    return {
+      type: value.type,
+      runID: value.runID,
+      conversationPublicID: typeof value.conversationPublicID === "string" ? value.conversationPublicID : undefined,
+    };
+  }
+  return null;
+}
+
+/**
+ * Follows GET /conversation-runs/stream until `signal` aborts or the server
+ * closes it. Resolves when the stream ends; callers decide about reconnecting.
+ */
+export async function followActiveRuns(onEvent: (event: ActiveRunEvent) => void, signal: AbortSignal): Promise<void> {
+  const response = await api.raw("/conversation-runs/stream", { signal, headers: { Accept: "text/event-stream" } });
+  if (!response.body) throw new ApiError({ message: "Active-run stream is unavailable", status: response.status });
+  try {
+    for await (const data of readSseData(response)) {
+      const event = parseActiveRunEvent(data);
+      if (event) onEvent(event);
+    }
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+  }
+}
