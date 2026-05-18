@@ -185,3 +185,183 @@ func revokeFileRow(tx *gorm.DB, f FileObject) error {
 	}
 	return nil
 }
+
+// StaleRuns lists up to a batch of runs still pending or moderating whose last
+// update is older than cutoff.
+func (b *ModerationBridge) StaleRuns(ctx context.Context, cutoff time.Time) ([]StaleRun, error) {
+	var runs []Run
+	err := b.s.db.WithContext(ctx).
+		Where("moderation_state IN ? AND updated_at < ?", []string{"moderating", "pending"}, cutoff).
+		Order("id ASC").Limit(moderationStaleBatch).Find(&runs).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]StaleRun, 0, len(runs))
+	for _, r := range runs {
+		ref := StaleRun{RunID: r.RunID, UserID: r.UserID, ConversationID: r.ConversationID}
+		var m Message
+		if e := b.s.db.WithContext(ctx).Where("run_id = ? AND role = ?", r.RunID, roleAssistant).Order("id ASC").First(&m).Error; e == nil {
+			ref.MessageID, ref.MessagePublicID = m.ID, m.PublicID
+		}
+		out = append(out, ref)
+	}
+	return out, nil
+}
+
+// LoadFile returns the stored bytes and detected MIME type of an active file
+// row. Files that are not images answer ErrModerationNotImage without being
+// read; a missing or withdrawn row answers ErrFileNotFound.
+func (b *ModerationBridge) LoadFile(ctx context.Context, id uint) ([]byte, string, error) {
+	var f FileObject
+	if err := b.s.db.WithContext(ctx).Where("id = ? AND status = ?", id, fileStatusActive).First(&f).Error; err != nil {
+		if database.IsNotFound(err) {
+			return nil, "", ErrFileNotFound
+		}
+		return nil, "", err
+	}
+	mime := strings.ToLower(strings.TrimSpace(f.DetectedMIME))
+	if mime == "" {
+		mime = strings.ToLower(strings.TrimSpace(f.MimeType))
+	}
+	if !strings.HasPrefix(mime, "image/") {
+		return nil, mime, ErrModerationNotImage
+	}
+	if f.SizeBytes > moderationMaxImageBytes {
+		return nil, mime, ErrModerationFileTooLarge
+	}
+	data, err := b.s.readBytes(ctx, f.StoragePath)
+	if err != nil {
+		return nil, mime, err
+	}
+	return data, mime, nil
+}
+
+// RevokeFile withdraws one file from its owner: status moderation_blocked,
+// owner 0, attachments deleted.
+func (b *ModerationBridge) RevokeFile(ctx context.Context, id uint) error {
+	return b.s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var f FileObject
+		if err := tx.Where("id = ?", id).First(&f).Error; err != nil {
+			if database.IsNotFound(err) {
+				return ErrFileNotFound
+			}
+			return err
+		}
+		return revokeFileRow(tx, f)
+	})
+}
+
+// DeleteFileObjects removes the stored objects of withdrawn files and clears
+// their stored path only after the delete succeeded. A failure on one file
+// does not stop the others; the first error is returned.
+func (b *ModerationBridge) DeleteFileObjects(ctx context.Context, ids []uint) error {
+	var first error
+	for _, id := range ids {
+		var f FileObject
+		err := b.s.db.WithContext(ctx).Unscoped().Where("id = ?", id).First(&f).Error
+		if err != nil {
+			if database.IsNotFound(err) {
+				continue // the record is gone: nothing left to delete
+			}
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		if err := b.purgeBlockedFile(ctx, f); err != nil {
+			b.s.log.Warn("conversation_blocked_file_delete_failed", logx.F("file_id", f.ID), logx.Err(err))
+			if first == nil {
+				first = err
+			}
+		}
+	}
+	return first
+}
+
+// RetryBlockedDeletes retries, in ascending id order, the physical delete of
+// moderation-blocked files that still carry a storage path.
+func (b *ModerationBridge) RetryBlockedDeletes(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		limit = 200
+	}
+	var files []FileObject
+	err := b.s.db.WithContext(ctx).Unscoped().
+		Where("status = ? AND storage_path <> ?", fileStatusModerationBlocked, "").
+		Order("id ASC").Limit(limit).Find(&files).Error
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		if err := b.purgeBlockedFile(ctx, f); err != nil {
+			b.s.log.Warn("conversation_blocked_file_retry_failed", logx.F("file_id", f.ID), logx.Err(err))
+		}
+	}
+	return nil
+}
+
+// purgeBlockedFile deletes the object of a blocked file and then clears the
+// stored path. The status stays moderation_blocked.
+func (b *ModerationBridge) purgeBlockedFile(ctx context.Context, f FileObject) error {
+	if f.StoragePath == "" {
+		return nil
+	}
+	if err := b.s.db.WithContext(ctx).Model(&Attachment{}).Where("file_id = ? AND status <> ?", f.FileID, fileStatusDeleted).
+		UpdateColumn("status", fileStatusDeleted).Error; err != nil {
+		return err
+	}
+	if err := b.s.deleteBytes(ctx, f.StoragePath); err != nil {
+		return err
+	}
+	return b.s.db.WithContext(ctx).Unscoped().Model(&FileObject{}).Where("id = ?", f.ID).UpdateColumn("storage_path", "").Error
+}
+
+// Emit publishes a moderation event to the run's resumable stream when this
+// process owns the active generation; otherwise the event is dropped, as there
+// is nobody to deliver to. A blocked event is held back while the run's own
+// job is going to publish the terminal event itself (with the final result).
+func (b *ModerationBridge) Emit(_ context.Context, runID, typ string, fields map[string]any) {
+	lr := b.s.hub.get(runID)
+	if lr == nil {
+		return
+	}
+	lr.mu.Lock()
+	closed := lr.done || lr.terminal
+	hold := typ == evModerationBlocked && lr.holdBlocked
+	lr.mu.Unlock()
+	if closed || hold {
+		return
+	}
+	b.s.hub.publish(lr, typ, fields)
+}
+
+// retainedTypes are the stream events that carry withdrawn content.
+var retainedTypes = map[string]bool{
+	"delta": true, "upstream_think_delta": true, "media": true, "media_delta": true, "thinking": true,
+}
+
+// DiscardRetained drops the buffered text deltas, thinking and media of a run
+// so that a client reconnecting with an earlier cursor cannot replay withdrawn
+// content. Other events (progress, usage) stay.
+func (b *ModerationBridge) DiscardRetained(ctx context.Context, runID string) {
+	lr := b.s.hub.get(runID)
+	if lr == nil {
+		return
+	}
+	lr.mu.Lock()
+	kept := lr.events[:0:0]
+	var dropped []int
+	for _, ev := range lr.events {
+		if retainedTypes[ev.Type] {
+			dropped = append(dropped, ev.Seq)
+			continue
+		}
+		kept = append(kept, ev)
+	}
+	lr.events = kept
+	lr.content.Reset()
+	lr.think.Reset()
+	lr.mu.Unlock()
+	for _, seq := range dropped {
+		_ = b.s.cache.Delete(ctx, runKey(runID, "ev:"+strconv.Itoa(seq)))
+	}
+}
