@@ -215,3 +215,58 @@ export function ConversationSearchDialog({ open, onOpenChange }: { open: boolean
     </DialogPrimitive.Root>
   );
 }
+
+function ResultRow({
+  id,
+  item,
+  active,
+  now,
+  locale,
+  onSelect,
+  onHover,
+}: {
+  id: string;
+  item: SearchItem;
+  active: boolean;
+  now: Date;
+  locale: string;
+  onSelect: () => void;
+  onHover: () => void;
+}) {
+  const { t } = useI18n();
+  const archived = item.status === "archived";
+  return (
+    <li
+      id={id}
+      role="option"
+      aria-selected={active}
+      onMouseMove={onHover}
+      onClick={onSelect}
+      className={cn("group flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-sm", active && "bg-accent text-accent-foreground")}
+    >
+      <span className="min-w-0 flex-1 truncate">{item.title.trim() || t("shellX.search.untitled")}</span>
+      {item.projectName ? (
+        <span className="hidden shrink-0 items-center gap-1 rounded-full bg-secondary px-2 py-0.5 text-xs text-secondary-foreground sm:inline-flex">
+          <FolderClosed className="size-3" />
+          <span className="max-w-24 truncate">{item.projectName}</span>
+        </span>
+      ) : null}
+      {item.isStarred ? (
+        <>
+          <Star className="size-3.5 shrink-0 fill-warning text-warning" aria-hidden />
+          <span className="sr-only">{t("shellX.search.starred")}</span>
+        </>
+      ) : null}
+      {archived ? (
+        <>
+          <Archive className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+          <span className="sr-only">{t("shellX.search.archived")}</span>
+        </>
+      ) : null}
+      <span className="relative ml-1 shrink-0 text-xs tabular-nums text-muted-foreground">
+        <span className={cn("transition-opacity", active ? "opacity-0" : "group-hover:opacity-0")}>{formatUpdatedLabel(item.updatedAt, now, locale)}</span>
+        <ArrowRight className={cn("absolute right-0 top-1/2 size-3.5 -translate-y-1/2 opacity-0 transition-opacity", active ? "opacity-100" : "group-hover:opacity-100")} />
+      </span>
+    </li>
+  );
+}
