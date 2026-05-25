@@ -134,3 +134,140 @@ func lenientBool(raw string) *bool {
 	}
 	return &v
 }
+
+func one(c *gin.Context, row *UIComponent) { httpx.OK(c, gin.H{"component": toView(row)}) }
+
+func (h *handlers) record(c *gin.Context, action string, id uint, detail map[string]any) {
+	var d any
+	if detail != nil {
+		d = detail
+	}
+	h.audit.RecordRequest(c, action, auditResource, strconv.FormatUint(uint64(id), 10), d)
+}
+
+// --- user routes ---
+
+func (h *handlers) listVisible(c *gin.Context) {
+	rows, total, err := h.svc.listVisible(c.Request.Context(), caller(c), strings.TrimSpace(c.Query("q")), pagination.FromRequest(c.Request))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, toViews(rows))
+}
+
+func (h *handlers) listMine(c *gin.Context) {
+	f := listFilter{Keyword: strings.TrimSpace(c.Query("q")), Enabled: lenientBool(c.Query("enabled"))}
+	rows, total, err := h.svc.listMine(c.Request.Context(), caller(c), f, pagination.FromRequest(c.Request))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, toViews(rows))
+}
+
+func (h *handlers) createMine(c *gin.Context) {
+	var req createRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	uid := caller(c)
+	row, err := h.svc.create(c.Request.Context(), userBucket(uid), uid, req.raw())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	one(c, row)
+}
+
+func (h *handlers) updateMine(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var req patchRequest
+	if !bindPatch(c, &req) {
+		return
+	}
+	uid := caller(c)
+	row, err := h.svc.update(c.Request.Context(), userTarget(uid), uid, id, req.raw())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	one(c, row)
+}
+
+func (h *handlers) deleteMine(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.svc.removeOwn(c.Request.Context(), caller(c), id); err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"deleted": true})
+}
+
+// --- administrator routes ---
+
+func (h *handlers) adminList(c *gin.Context) {
+	scope := c.Query("scope")
+	if scope != "" && scope != ScopeBuiltin && scope != ScopePlatform {
+		httpx.Fail(c, http.StatusBadRequest, ErrInvalid)
+		return
+	}
+	f := listFilter{Keyword: strings.TrimSpace(c.Query("q")), Enabled: lenientBool(c.Query("enabled")), Scope: scope}
+	rows, total, err := h.svc.listAdmin(c.Request.Context(), f, pagination.FromRequest(c.Request))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, toViews(rows))
+}
+
+func (h *handlers) adminCreate(c *gin.Context) {
+	var req createRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	row, err := h.svc.create(c.Request.Context(), platformBucket, caller(c), req.raw())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	h.record(c, actionCreatePlatf, row.ID, map[string]any{"name": row.Name})
+	one(c, row)
+}
+
+func (h *handlers) adminUpdate(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var req patchRequest
+	if !bindPatch(c, &req) {
+		return
+	}
+	row, err := h.svc.update(c.Request.Context(), adminTarget, caller(c), id, req.raw())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	h.record(c, actionUpdate, row.ID, map[string]any{"name": row.Name, "scope": row.Scope})
+	one(c, row)
+}
+
+func (h *handlers) adminDelete(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.svc.removePlatform(c.Request.Context(), id); err != nil {
+		fail(c, err)
+		return
+	}
+	h.record(c, actionDeletePlatf, id, nil)
+	httpx.OK(c, gin.H{"deleted": true})
+}
