@@ -250,3 +250,272 @@ func (s *service) adminEvents(ctx context.Context, f AdminEventFilter, p paginat
 	out, err := s.completeEvents(ctx, rows, false)
 	return out, total, err
 }
+
+// adminEvent returns one event in full.
+func (s *service) adminEvent(ctx context.Context, id uint) (*AdminEvent, error) {
+	var rows []adminEventRow
+	if err := s.eventQuery(ctx, AdminEventFilter{}).Select(eventSelect).Where("e.id = ?", id).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, ErrEventNotFound
+	}
+	out, err := s.completeEvents(ctx, rows, true)
+	if err != nil {
+		return nil, err
+	}
+	return &out[0], nil
+}
+
+// completeEvents adds the message ids and user names to event rows.
+func (s *service) completeEvents(ctx context.Context, rows []adminEventRow, bodies bool) ([]AdminEvent, error) {
+	out := make([]AdminEvent, 0, len(rows))
+	runSet, userSet := map[string]bool{}, map[uint]bool{}
+	for _, r := range rows {
+		runSet[r.RunID] = true
+		if r.RunUserID != 0 {
+			userSet[r.RunUserID] = true
+		}
+	}
+	messages := map[string]uint{}
+	if len(runSet) > 0 {
+		runs := make([]string, 0, len(runSet))
+		for id := range runSet {
+			runs = append(runs, id)
+		}
+		var found []struct {
+			RunID string
+			ID    uint
+		}
+		err := s.db.WithContext(ctx).Model(&Message{}).Select("run_id, MIN(id) AS id").
+			Where("run_id IN ? AND role = ?", runs, roleAssistant).Group("run_id").Scan(&found).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range found {
+			messages[m.RunID] = m.ID
+		}
+	}
+	ids := make([]uint, 0, len(userSet))
+	for id := range userSet {
+		ids = append(ids, id)
+	}
+	names, err := s.userNames(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		ev := s.fillAdminEvent(r, bodies)
+		ev.MessageID = messages[r.RunID]
+		if n, ok := names[r.RunUserID]; ok {
+			ev.Username, ev.UserDisplayName, ev.UserLabel = n.Username, n.DisplayName, n.label()
+		}
+		out = append(out, ev)
+	}
+	return out, nil
+}
+
+// ---- export ------------------------------------------------------------------------------
+
+const blockedMarker = "[blocked by content moderation"
+
+func blockedText(eventID string) string {
+	if eventID = strings.TrimSpace(eventID); eventID != "" {
+		return blockedMarker + "; event " + eventID + "]"
+	}
+	return blockedMarker + "]"
+}
+
+// redactBlocked replaces what a blocked message carried. runEvents maps a run
+// id to its moderation event id, used when the message has none of its own.
+func redactBlocked(msgs []MessageDTO, runEvents map[string]string) {
+	for i := range msgs {
+		m := &msgs[i]
+		if !strings.EqualFold(strings.TrimSpace(m.Status), msgBlocked) {
+			continue
+		}
+		eventID := ""
+		if m.Moderation != nil {
+			eventID = m.Moderation.EventID
+		}
+		if eventID == "" {
+			eventID = runEvents[m.RunID]
+		}
+		switch m.Role {
+		case roleUser:
+			m.Content = blockedText(eventID)
+			m.Attachments = "[]"
+		case roleAssistant:
+			m.Content = ""
+			m.Attachments = "[]"
+			m.ProcessTrace = nil
+			m.KnowledgeSources = nil
+			m.UIState = nil
+			if strings.TrimSpace(m.ErrorMessage) == "" {
+				m.ErrorMessage = blockedText(eventID)
+			}
+		}
+	}
+}
+
+const adminExportNotes = "Admin export redacts blocked content. Originals are only available via content moderation event APIs."
+
+// adminExportDoc builds the export document of one conversation of any user.
+func (s *service) adminExportDoc(ctx context.Context, conv *Conversation) (*ExportDoc, error) {
+	msgs, err := s.loadConversationMessages(ctx, conv.ID)
+	if err != nil {
+		return nil, err
+	}
+	dtos, err := s.enrich(ctx, msgs, enrichOpts{userID: conv.UserID, conv: conv})
+	if err != nil {
+		return nil, err
+	}
+	runs := []Run{}
+	if conv.UserID != 0 {
+		if err := s.db.WithContext(ctx).Where("conversation_id = ?", conv.ID).Order("id ASC").Find(&runs).Error; err != nil {
+			runs = []Run{}
+		}
+	}
+	events := map[string]string{}
+	runDTOs := make([]RunDTO, 0, len(runs))
+	for _, r := range runs {
+		events[r.RunID] = r.ModerationEventID
+		runDTOs = append(runDTOs, toRunDTO(r))
+	}
+	redactBlocked(dtos, events)
+	cd, err := s.conversationDTO(ctx, conv)
+	if err != nil {
+		return nil, err
+	}
+	return &ExportDoc{
+		Version: 1, ExportScope: "full", ExportedAt: s.now().UTC(), Conversation: *cd, Messages: dtos, Runs: runDTOs,
+		TotalMessages: len(dtos), TotalRuns: len(runDTOs), DefaultMessagePublicIDs: latestVisibleBranch(msgs),
+		Compatibility: ExportCompat{Format: "riochat.conversation.export", Notes: adminExportNotes},
+	}, nil
+}
+
+// streamAdminExport writes one line per conversation of every user, then the
+// manifest. write returns false once the client is gone.
+func (s *service) streamAdminExport(ctx context.Context, write func(line []byte) bool) {
+	man := exportManifest{Type: "export_manifest", Complete: true}
+	var last uint
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		var batch []Conversation
+		if err := s.db.WithContext(ctx).Where("id > ?", last).Order("id ASC").Limit(exportBatch).Find(&batch).Error; err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			man.Complete, man.Error = false, "failed to list conversations"
+			break
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for i := range batch {
+			conv := batch[i]
+			last = conv.ID
+			doc, err := s.adminExportDoc(ctx, &conv)
+			var raw []byte
+			if err == nil {
+				raw, err = json.Marshal(doc)
+			}
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				man.Failed++
+				man.FailedIDs = append(man.FailedIDs, conv.ID)
+				s.log.Warn("conversation_admin_export_item_failed", logErr(err))
+				continue
+			}
+			if !write(raw) {
+				return
+			}
+			man.Exported++
+		}
+	}
+	raw, _ := json.Marshal(man)
+	write(raw)
+}
+
+// ---- handlers ------------------------------------------------------------------------------
+
+func (a *api) adminEventList(c *gin.Context) {
+	q := c.Request.URL.Query()
+	f := AdminEventFilter{
+		Query: q.Get("query"), EventScope: q.Get("event_scope"), EventType: q.Get("event_type"),
+		Status: q.Get("status"), Sort: q.Get("sort"),
+	}
+	positive := func(name string) (uint, bool) {
+		raw := strings.TrimSpace(q.Get(name))
+		if raw == "" {
+			return 0, true
+		}
+		n, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil || n == 0 || uint64(uint(n)) != n {
+			httpx.InvalidQuery(c, name)
+			return 0, false
+		}
+		return uint(n), true
+	}
+	moment := func(name string) (*time.Time, bool) {
+		raw := strings.TrimSpace(q.Get(name))
+		if raw == "" {
+			return nil, true
+		}
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			httpx.InvalidQuery(c, name)
+			return nil, false
+		}
+		return &t, true
+	}
+	var ok bool
+	if f.UserID, ok = positive("user_id"); !ok {
+		return
+	}
+	if f.ConversationID, ok = positive("conversation_id"); !ok {
+		return
+	}
+	if f.From, ok = moment("created_from"); !ok {
+		return
+	}
+	if f.To, ok = moment("created_to"); !ok {
+		return
+	}
+	list, total, err := a.s.adminEvents(c.Request.Context(), f, pagination.FromRequest(c.Request))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, list)
+}
+
+func (a *api) adminEventGet(c *gin.Context) {
+	n, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || n == 0 || uint64(uint(n)) != n {
+		httpx.Fail(c, http.StatusBadRequest, ErrInvalidEventID)
+		return
+	}
+	ev, err := a.s.adminEvent(c.Request.Context(), uint(n))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	httpx.OK(c, ev)
+}
+
+func (a *api) adminExport(c *gin.Context) {
+	a.s.auditEntry(c, uid(c), "admin_export_conversations", "conversation", "", nil)
+	h := c.Writer.Header()
+	h.Set("Content-Type", "application/x-ndjson")
+	h.Set("Content-Disposition", `attachment; filename="conversations-export-`+a.s.now().UTC().Format("20060102-150405")+`.jsonl"`)
+	h.Set("Cache-Control", "no-store")
+	c.Status(http.StatusOK)
+	c.Writer.WriteHeaderNow()
+	w := &lineWriter{c: c}
+	a.s.streamAdminExport(c.Request.Context(), func(line []byte) bool { return w.write(line) })
+}
