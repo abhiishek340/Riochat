@@ -208,3 +208,214 @@ func TestReferences(t *testing.T) {
 		t.Error("FormatReference")
 	}
 }
+
+func TestPublicID(t *testing.T) {
+	id, err := newPublicID()
+	if err != nil || !validPublicID(id) {
+		t.Fatalf("generated id %q: %v", id, err)
+	}
+	for _, bad := range []string{"", "short", "UPPERCASE1", "has-hyphen1", strings.Repeat("a", 33), "ünicode12"} {
+		if validPublicID(bad) {
+			t.Errorf("%q invalid", bad)
+		}
+	}
+	if !validPublicID("abcd1234") || !validPublicID(strings.Repeat("z", 32)) {
+		t.Error("bounds 8 and 32 are valid")
+	}
+}
+
+func TestKeyBinding(t *testing.T) {
+	if got := keyBinding(42, "abcd1234"); got != "personal_provider.api_key:42:abcd1234" {
+		t.Fatalf("binding format is frozen: %q", got)
+	}
+}
+
+func TestProviderProtocolList(t *testing.T) {
+	want := []string{"openai_chat_completions", "openai_responses", "anthropic_messages", "google_generate_content",
+		"gemini_interactions", "xai_responses", "openrouter_chat_completions", "openrouter_responses"}
+	if strings.Join(ProviderProtocols(), ",") != strings.Join(want, ",") {
+		t.Fatalf("provider protocols: %v", ProviderProtocols())
+	}
+	wantModel := []string{"openai_chat_completions", "openai_responses", "openai_image_generations", "openai_image_edits",
+		"anthropic_messages", "google_generate_content", "google_image_generation", "gemini_interactions", "xai_responses",
+		"xai_image", "xai_image_edits", "xai_video", "xai_video_extensions", "openrouter_chat_completions",
+		"openrouter_responses", "openrouter_images"}
+	if strings.Join(ModelProtocols(), ",") != strings.Join(wantModel, ",") {
+		t.Fatalf("model protocols: %v", ModelProtocols())
+	}
+	if p, err := normalizeProviderProtocol("  OpenAI_Chat_Completions "); err != nil || p != "openai_chat_completions" {
+		t.Errorf("normalize: %q %v", p, err)
+	}
+	for _, bad := range []string{"", "openai_image_generations", "xai_video", "nope"} {
+		if _, err := normalizeProviderProtocol(bad); !errors.Is(err, ErrInvalidProtocol) {
+			t.Errorf("%q: %v", bad, err)
+		}
+	}
+}
+
+func TestNormalizeModelProtocols(t *testing.T) {
+	ok := []struct{ in, want []string }{
+		{[]string{" OpenAI_Responses "}, []string{"openai_responses"}},
+		{[]string{"openai_chat_completions", "openai_chat_completions"}, []string{"openai_chat_completions"}},
+		{[]string{"openai_image_edits", "openai_image_generations"}, []string{"openai_image_generations", "openai_image_edits"}},
+		{[]string{"xai_image", "xai_image_edits"}, []string{"xai_image", "xai_image_edits"}},
+		{[]string{"xai_video_extensions", "xai_video"}, []string{"xai_video", "xai_video_extensions"}},
+	}
+	for _, c := range ok {
+		got, err := normalizeModelProtocols(c.in)
+		if err != nil || strings.Join(got, ",") != strings.Join(c.want, ",") {
+			t.Errorf("%v -> %v, %v", c.in, got, err)
+		}
+	}
+	bad := [][]string{
+		nil, {}, {""}, {"nope"}, {"openai_chat_completions", "anthropic_messages"},
+		{"openai_image_generations", "xai_image_edits"}, {"openai_chat_completions", "openai_image_edits"},
+		{"xai_video", "xai_image"}, {"a", "b", "c"},
+		{"openai_image_generations", "openai_image_edits", "openai_responses"},
+	}
+	for _, in := range bad {
+		if _, err := normalizeModelProtocols(in); !errors.Is(err, ErrInvalidModelProto) {
+			t.Errorf("%v: %v", in, err)
+		}
+	}
+}
+
+func TestSuggestProtocols(t *testing.T) {
+	cases := []struct {
+		provider, model string
+		want            string
+	}{
+		{ProtoOpenAIChat, "gpt-4o", "openai_chat_completions"},
+		{ProtoAnthropic, "claude-sonnet", "anthropic_messages"},
+		{ProtoOpenAIChat, "gpt-image-1", "openai_image_generations,openai_image_edits"},
+		{ProtoOpenAIChat, "dall-e-3", "openai_image_generations"},
+		{ProtoOpenAIResponses, "dall-e-2", "openai_image_generations,openai_image_edits"},
+		{ProtoOpenAIChat, "grok-imagine-image", "xai_image,xai_image_edits"},
+		{ProtoOpenAIChat, "grok-imagine-video", "xai_video,xai_video_extensions"},
+		{ProtoXAIResponses, "grok-4", "xai_responses"},
+		{ProtoXAIResponses, "grok-imagine-image", "xai_image,xai_image_edits"},
+		{ProtoGoogleGenerate, "imagen-4", "google_image_generation"},
+		{ProtoGoogleGenerate, "gemini-2.5-pro", "google_generate_content"},
+		{ProtoOpenRouterChat, "openai/gpt-image-1", "openrouter_images"},
+		{ProtoOpenRouterChat, "anthropic/claude", "openrouter_chat_completions"},
+		{ProtoOpenAIChat, "sora-2", "openai_chat_completions"},
+	}
+	for _, c := range cases {
+		got := strings.Join(suggestProtocols(c.provider, c.model), ",")
+		if got != c.want {
+			t.Errorf("suggest(%s, %s) = %s, want %s", c.provider, c.model, got, c.want)
+		}
+		if _, err := normalizeModelProtocols(suggestProtocols(c.provider, c.model)); err != nil {
+			t.Errorf("suggestion for %s is not a valid combination: %v", c.model, err)
+		}
+	}
+}
+
+func TestProtocolForTask(t *testing.T) {
+	pair := []string{ProtoOpenAIImageGen, ProtoOpenAIImageEdit}
+	if p, ok := ProtocolForTask(pair, TaskImageGeneration); !ok || p != ProtoOpenAIImageGen {
+		t.Errorf("gen: %q %v", p, ok)
+	}
+	if p, ok := ProtocolForTask(pair, TaskImageEdit); !ok || p != ProtoOpenAIImageEdit {
+		t.Errorf("edit: %q %v", p, ok)
+	}
+	if _, ok := ProtocolForTask(pair, TaskChat); ok {
+		t.Error("image pair cannot chat")
+	}
+	if p, ok := ProtocolForTask([]string{ProtoAnthropic}, ""); !ok || p != ProtoAnthropic {
+		t.Errorf("empty task is chat: %q %v", p, ok)
+	}
+	if _, ok := ProtocolForTask([]string{ProtoAnthropic}, TaskVideoGeneration); ok {
+		t.Error("no video")
+	}
+}
+
+func TestDecodeModels(t *testing.T) {
+	const p = "openai_chat_completions"
+	got := decodeModels(`["m1","m2"]`, p)
+	if len(got) != 2 || got[0].Name != "m1" || got[1].Protocols[0] != p {
+		t.Fatalf("legacy strings: %+v", got)
+	}
+	got = decodeModels(`[{"name":"a","protocols":["xai_image","xai_image_edits"]},{"name":"b","protocols":[]},{"name":"c"},{"name":""},7,null,"",{"name":" d "}]`, p)
+	names := ""
+	for _, m := range got {
+		names += m.Name + ":" + strings.Join(m.Protocols, "+") + ";"
+	}
+	if names != "a:xai_image+xai_image_edits;b:"+p+";c:"+p+";d:"+p+";" {
+		t.Fatalf("mixed: %s", names)
+	}
+	for _, raw := range []string{"", "not json", "{}", "null", `"x"`} {
+		got := decodeModels(raw, p)
+		if got == nil || len(got) != 0 {
+			t.Errorf("%q should decode to an empty non-nil list, got %#v", raw, got)
+		}
+	}
+	if encodeModels(nil) != "[]" || encodeModels([]EnabledModel{}) != "[]" {
+		t.Error("empty encodes as []")
+	}
+}
+
+func TestSelectModels(t *testing.T) {
+	catalog := []string{"a", "b", "gpt-image-1"}
+	got, err := selectModels([]ModelInput{{Name: "a"}, {Name: "a"}, {Name: "gpt-image-1"}}, catalog, ProtoOpenAIChat)
+	if err != nil || len(got) != 2 || got[0].Protocols[0] != ProtoOpenAIChat || len(got[1].Protocols) != 2 {
+		t.Fatalf("defaults and de-dup: %+v %v", got, err)
+	}
+	if got, err := selectModels(nil, catalog, ProtoOpenAIChat); err != nil || got == nil || len(got) != 0 {
+		t.Errorf("nothing selected is fine: %#v %v", got, err)
+	}
+	if _, err := selectModels([]ModelInput{{Name: "zzz"}}, catalog, ProtoOpenAIChat); !errors.Is(err, ErrInvalidModels) {
+		t.Errorf("unknown model: %v", err)
+	}
+	for _, bad := range []string{" a", "a ", "a\n", "\ta"} {
+		if _, err := selectModels([]ModelInput{{Name: bad}}, catalog, ProtoOpenAIChat); !errors.Is(err, ErrInvalidModels) {
+			t.Errorf("name with surrounding whitespace %q must be rejected: %v", bad, err)
+		}
+	}
+	if _, err := selectModels([]ModelInput{{Name: "a b"}}, []string{"a b"}, ProtoOpenAIChat); !errors.Is(err, ErrInvalidModels) {
+		t.Errorf("invalid name even when in catalog: %v", err)
+	}
+	if _, err := selectModels([]ModelInput{{Name: "a", Protocols: []string{"nope"}}}, catalog, ProtoOpenAIChat); !errors.Is(err, ErrInvalidModelProto) {
+		t.Errorf("bad protocol: %v", err)
+	}
+	many := make([]ModelInput, 201)
+	for i := range many {
+		many[i] = ModelInput{Name: "a"}
+	}
+	if _, err := selectModels(many, catalog, ProtoOpenAIChat); !errors.Is(err, ErrInvalidModels) {
+		t.Errorf("201 entries: %v", err)
+	}
+	if got, err := selectModels(many[:200], catalog, ProtoOpenAIChat); err != nil || len(got) != 1 {
+		t.Errorf("200 entries collapse: %v %v", got, err)
+	}
+}
+
+func TestSettingsNormalized(t *testing.T) {
+	if (Settings{MaxPerUser: 0}).normalized().MaxPerUser != 10 || (Settings{MaxPerUser: -3}).normalized().MaxPerUser != 10 || (Settings{MaxPerUser: 4}).normalized().MaxPerUser != 4 {
+		t.Error("non-positive falls back to 10")
+	}
+}
+
+func TestClassifyUpstream(t *testing.T) {
+	cases := []struct {
+		err  error
+		want *error
+	}{}
+	_ = cases
+	for _, st := range []int{401, 403} {
+		if err := classifyUpstream(&UpstreamStatusError{Status: st}); !errors.Is(err, ErrUpstreamRejected) {
+			t.Errorf("%d: %v", st, err)
+		}
+	}
+	for _, st := range []int{400, 404, 429, 500, 502} {
+		if err := classifyUpstream(&UpstreamStatusError{Status: st}); !errors.Is(err, ErrUpstreamDown) {
+			t.Errorf("%d: %v", st, err)
+		}
+	}
+	if err := classifyUpstream(errors.New("dial tcp: boom")); !errors.Is(err, ErrUpstreamDown) {
+		t.Errorf("network: %v", err)
+	}
+	if err := classifyUpstream(errors.New("secret-key-123 leaked")); strings.Contains(ErrUpstreamDown.Message, "secret") || !errors.Is(err, ErrUpstreamDown) {
+		t.Error("public message must be static")
+	}
+}
