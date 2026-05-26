@@ -210,3 +210,208 @@ func ValidateBlockedHosts(raw string) error {
 	}
 	return nil
 }
+
+// ValidateMaxPerUser is the validator of the max_per_user setting.
+func ValidateMaxPerUser(n int) error {
+	if n < 1 || n > 50 {
+		return fmt.Errorf("max_per_user must be between 1 and 50")
+	}
+	return nil
+}
+
+// denyList is a parsed blocked_hosts value.
+type denyList struct {
+	exact    map[string]bool
+	suffixes []string // ".example.com" for "*.example.com"
+}
+
+func parseDenyList(raw string) denyList {
+	d := denyList{exact: map[string]bool{}}
+	for _, e := range splitHostList(raw) {
+		e = strings.ToLower(strings.TrimSuffix(e, "."))
+		if strings.HasPrefix(e, "*.") {
+			if rest := e[2:]; rest != "" {
+				d.suffixes = append(d.suffixes, "."+rest)
+			}
+			continue
+		}
+		if e != "" {
+			d.exact[e] = true
+		}
+	}
+	return d
+}
+
+// matches reports whether host (any case, optional trailing dot) is denied. A
+// wildcard entry matches subdomains at any depth but never the bare domain.
+func (d denyList) matches(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if host == "" {
+		return false
+	}
+	if d.exact[host] {
+		return true
+	}
+	for _, s := range d.suffixes {
+		if strings.HasSuffix(host, s) && len(host) > len(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// ---- base URL ------------------------------------------------------------------
+
+// parsedURL is a normalized provider address.
+type parsedURL struct {
+	BaseURL string // https://host[:port]/path
+	Host    string // lower-case host name, no port, no brackets, no trailing dot
+}
+
+// parseBaseURL applies the syntactic rules and normalization of a base URL.
+// Every failure is ErrInvalidBaseURL. Policy checks are separate.
+func parseBaseURL(raw string) (parsedURL, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" || utf8.RuneCountInString(s) > maxBaseURLLen {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	if strings.ContainsAny(s, "?#\\") {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	for _, r := range s {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return parsedURL{}, ErrInvalidBaseURL
+		}
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Opaque != "" || u.Host == "" {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	port := u.Port()
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return parsedURL{}, ErrInvalidBaseURL
+		}
+		port = strconv.Itoa(n)
+	}
+	if len(host) > maxHostLen {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	hostPart := host
+	if strings.Contains(host, ":") {
+		hostPart = "[" + host + "]"
+	}
+	if port != "" {
+		hostPart += ":" + port
+	}
+	path := strings.TrimRight(u.EscapedPath(), "/")
+	out := "https://" + hostPart + path
+	if utf8.RuneCountInString(out) > maxBaseURLLen {
+		return parsedURL{}, ErrInvalidBaseURL
+	}
+	return parsedURL{BaseURL: out, Host: host}, nil
+}
+
+// ---- outbound address policy ----------------------------------------------------
+
+// OutboundPolicy decides whether a host may be called on behalf of a user.
+type OutboundPolicy interface {
+	// CheckHost returns an error when host (lower case, no port) must never be
+	// contacted, for example a loopback, private or metadata address.
+	CheckHost(host string) error
+}
+
+// PublicOnlyPolicy refuses literal internal addresses and host names that are
+// internal by convention. Resolved addresses are checked again at connect
+// time by the default HTTP client.
+type PublicOnlyPolicy struct{}
+
+var internalSuffixes = []string{
+	".localhost", ".local", ".internal", ".localdomain", ".home.arpa", ".lan", ".intranet", ".corp", ".private",
+}
+
+// CheckHost implements OutboundPolicy.
+func (PublicOnlyPolicy) CheckHost(host string) error {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if host == "" {
+		return ErrBlockedHost
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if forbiddenIP(ip) {
+			return ErrBlockedHost
+		}
+		return nil
+	}
+	if host == "localhost" || host == "metadata" || !strings.Contains(host, ".") {
+		return ErrBlockedHost
+	}
+	for _, s := range internalSuffixes {
+		if strings.HasSuffix(host, s) {
+			return ErrBlockedHost
+		}
+	}
+	// A final label made of digits or a hex prefix is an alternate spelling of
+	// an IP address that resolvers accept ("2130706433", "0x7f.1").
+	last := host[strings.LastIndex(host, ".")+1:]
+	if last == "" || strings.HasPrefix(last, "0x") {
+		return ErrBlockedHost
+	}
+	allDigits := true
+	for i := 0; i < len(last); i++ {
+		if last[i] < '0' || last[i] > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return ErrBlockedHost
+	}
+	return nil
+}
+
+var forbiddenNets = mustCIDRs(
+	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+	"172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15",
+	"198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+	"::/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64", "2001::/32", "2001:db8::/32", "2002::/16",
+	"fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+)
+
+func mustCIDRs(list ...string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(list))
+	for _, c := range list {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// forbiddenIP reports whether ip is outside the public internet.
+func forbiddenIP(ip net.IP) bool {
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	for _, n := range forbiddenNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
