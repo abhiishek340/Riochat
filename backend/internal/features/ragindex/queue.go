@@ -161,3 +161,177 @@ func (s *Service) retryOrFail(ctx context.Context, j *Job, err error) {
 	s.failFile(ctx, j.FileObjID, j.Signature, err)
 	s.deleteJob(ctx, j.ID)
 }
+
+// handleExtract runs one re-extraction message: the text is extracted again and
+// the pending index request on the file is then honoured.
+func (s *Service) handleExtract(ctx context.Context, j *Job) {
+	defer s.deleteJob(ctx, j.ID)
+	var f File
+	if err := s.files(ctx).Where("id = ? AND status = ?", j.FileObjID, fileActive).Take(&f).Error; err != nil {
+		return
+	}
+	if s.content == nil {
+		s.failProcessing(ctx, f, "extract_unavailable", "text extraction is unavailable")
+		return
+	}
+	if err := s.files(ctx).Where("id = ?", f.ID).UpdateColumns(map[string]any{
+		"processing_status": procExtracting, "updated_at": s.now(),
+	}).Error; err != nil {
+		return
+	}
+	text, err := s.content.Text(ctx, f)
+	if err != nil {
+		s.log.Warn("rag_reextract_failed", logx.F("file_id", f.FileID), logx.Err(err))
+		s.failProcessing(ctx, f, "extract_failed", "text extraction failed")
+		return
+	}
+	set := map[string]any{
+		"processing_status": procReady, "processing_ready": true, "processing_error_code": "",
+		"processing_error_message": "", "extract_status": extractReady, "extract_text": text, "updated_at": s.now(),
+	}
+	if strings.TrimSpace(text) == "" {
+		set["extract_status"], set["processing_ready"], set["extract_text"] = extractEmpty, false, ""
+	}
+	if err := s.files(ctx).Where("id = ?", f.ID).UpdateColumns(set).Error; err != nil {
+		return
+	}
+	s.afterProcessing(ctx, f.ID, true, true)
+}
+
+// failProcessing records a failed text extraction and reverts a pending index
+// request to "never indexed".
+func (s *Service) failProcessing(ctx context.Context, f File, code, msg string) {
+	sc, cancel := settleCtx(ctx)
+	defer cancel()
+	s.files(sc).Where("id = ?", f.ID).UpdateColumns(map[string]any{
+		"processing_status": procFailed, "processing_ready": false, "processing_error_code": code,
+		"processing_error_message": msg, "updated_at": s.now(),
+	})
+	s.files(sc).Where("id = ? AND embed_status = ?", f.ID, StateQueued).
+		UpdateColumns(map[string]any{"embed_status": StateNone, "embed_error": ""})
+}
+
+// AfterProcessing is called when text processing of a file finished (ok) or
+// failed. It starts the background index when auto-indexing applies, or honours
+// an explicit index request left on the file. It never blocks.
+func (s *Service) AfterProcessing(ctx context.Context, fileObjID uint, ok bool) {
+	s.afterProcessing(ctx, fileObjID, ok, false)
+}
+
+// afterProcessing is AfterProcessing; inline runs the index in the caller
+// (a queue worker) instead of a background task.
+func (s *Service) afterProcessing(ctx context.Context, fileObjID uint, ok, inline bool) {
+	var f File
+	if err := s.files(ctx).Where("id = ? AND status = ?", fileObjID, fileActive).Take(&f).Error; err != nil {
+		return
+	}
+	requested := f.state() == StateQueued && f.EmbedSignature != ""
+	if !ok {
+		if requested {
+			sc, cancel := settleCtx(ctx)
+			defer cancel()
+			s.files(sc).Where("id = ? AND embed_status = ?", f.ID, StateQueued).
+				UpdateColumns(map[string]any{"embed_status": StateNone, "embed_error": ""})
+		}
+		return
+	}
+	cfg := s.config(ctx)
+	sig := cfg.Signature()
+	switch {
+	case requested:
+		if av := s.availabilityFor(ctx, cfg); !av.OK {
+			msg := errServiceDownMsg
+			if av.NotConfigured {
+				msg = errServiceConf
+			}
+			s.files(ctx).Where("id = ? AND embed_status = ?", f.ID, StateQueued).
+				UpdateColumns(map[string]any{"embed_status": StateFailed, "embed_error": msg, "updated_at": s.now()})
+			return
+		}
+		if f.EmbedSignature != sig {
+			s.files(ctx).Where("id = ? AND embed_status = ?", f.ID, StateQueued).
+				UpdateColumns(map[string]any{"embed_status": StateStale, "embed_error": errConfigResubmit, "updated_at": s.now()})
+			return
+		}
+	case cfg.TriggerOnUpload && f.state() == StateNone:
+		if !s.availabilityFor(ctx, cfg).OK || !s.indexable(f, cfg) {
+			return
+		}
+	default:
+		return
+	}
+	run := func(rctx context.Context) { s.runAfterUpload(rctx, f.ID, sig, cfg.Host) }
+	if inline {
+		run(ctx)
+		return
+	}
+	if s.life != nil {
+		s.life.Detach(ctx, "rag-index-after-upload", runLimit+time.Minute, run)
+		return
+	}
+	run(context.WithoutCancel(ctx))
+}
+
+// runAfterUpload indexes one file in the background after its text became
+// available. A failure leaves the text processing ready with the retrieval
+// flag off and the summary as the processing error.
+func (s *Service) runAfterUpload(ctx context.Context, id uint, sig, host string) {
+	if !s.acquire(ctx) {
+		return
+	}
+	defer s.release()
+	rctx, cancel := context.WithTimeout(ctx, runLimit)
+	defer cancel()
+	_, err := s.runIndex(rctx, id, sig, host, runOpts{fromUpload: true})
+	if err != nil {
+		s.failFile(ctx, id, sig, err)
+		s.endUploadRun(ctx, id, summarize(err))
+		return
+	}
+	s.endUploadRun(ctx, id, "")
+}
+
+// Sweep fails every file that has been processing for longer than the run
+// limit plus a minute (its worker died). A file whose text processing was still
+// "embedding" returns to ready with the embed_failed error code. It returns the
+// number of files recovered.
+func (s *Service) Sweep(ctx context.Context) (int, error) {
+	cutoff := s.now().Add(-stallSweepAge)
+	var rows []File
+	if err := s.files(ctx).Select("id", "embed_signature", "processing_status").
+		Where("status = ? AND embed_status = ? AND updated_at < ?", fileActive, StateProcessing, cutoff).
+		Find(&rows).Error; err != nil {
+		return 0, database.Translate(err)
+	}
+	n := 0
+	for _, f := range rows {
+		ok, err := s.transition(ctx, nil, f.ID, f.EmbedSignature, []string{StateProcessing}, map[string]any{
+			"embed_status": StateFailed, "embed_error": errStalled,
+		})
+		if err != nil {
+			return n, err
+		}
+		if !ok {
+			continue
+		}
+		n++
+		if f.ProcessingStatus == procEmbedding {
+			s.endUploadRun(ctx, f.ID, errStalled)
+		}
+	}
+	return n, nil
+}
+
+// Reconcile marks every active file whose index belongs to another vector
+// space as stale: a queued, processing or ready file without a chunk carrying
+// the current signature. Files queued or processing under the current
+// signature are in-flight tasks of this space and stay. It is idempotent.
+func (s *Service) Reconcile(ctx context.Context) error {
+	sig := s.config(ctx).Signature()
+	noChunk := "NOT EXISTS (SELECT 1 FROM file_chunks c WHERE c.file_obj_id = file_objects.id AND c.embedding_signature = ?)"
+	return s.files(ctx).
+		Where("status = ? AND embed_status IN ?", fileActive, []string{StateQueued, StateProcessing, StateReady}).
+		Where(noChunk, sig).
+		Where("(embed_status = ? OR COALESCE(embed_signature,'') <> ?)", StateReady, sig).
+		UpdateColumns(map[string]any{"embed_status": StateStale, "embed_error": errReindexRequired, "updated_at": s.now()}).Error
+}
