@@ -308,3 +308,341 @@ func (s *Service) decryptKey(p *Provider) (string, error) {
 type ProbeInput struct {
 	Protocol, BaseURL, APIKey string
 }
+
+// Probe lists the models of an endpoint without saving anything.
+func (s *Service) Probe(ctx context.Context, userID uint, in ProbeInput) ([]CatalogModel, error) {
+	st, err := s.requireEnabled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	protocol, err := normalizeProviderProtocol(in.Protocol)
+	if err != nil {
+		return nil, err
+	}
+	u, err := s.checkURL(in.BaseURL, st)
+	if err != nil {
+		return nil, err
+	}
+	key, err := normalizeAPIKey(in.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	names, err := s.fetchCatalog(ctx, protocol, u.BaseURL, key)
+	if err != nil {
+		return nil, err
+	}
+	return catalogViews(protocol, names), nil
+}
+
+// ---- create ---------------------------------------------------------------------------
+
+// CreateInput is a new provider request.
+type CreateInput struct {
+	Name, Icon, Protocol, BaseURL, APIKey, Source string
+	Models                                        []ModelInput
+}
+
+// Create validates, probes and stores a provider for userID.
+func (s *Service) Create(ctx context.Context, userID uint, in CreateInput) (*Provider, error) {
+	st, err := s.requireEnabled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	protocol, err := normalizeProviderProtocol(in.Protocol)
+	if err != nil {
+		return nil, err
+	}
+	u, err := s.checkURL(in.BaseURL, st)
+	if err != nil {
+		return nil, err
+	}
+	key, err := normalizeAPIKey(in.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	icon, err := normalizeIcon(in.Icon)
+	if err != nil {
+		return nil, err
+	}
+	name, err := normalizeName(in.Name)
+	if err != nil {
+		return nil, err
+	}
+	if name == "" {
+		name = u.Host
+		if utf8.RuneCountInString(name) > maxNameRunes {
+			name = string([]rune(name)[:maxNameRunes])
+		}
+	}
+	source := SourceManual
+	if strings.TrimSpace(in.Source) == SourceLink {
+		source = SourceLink
+	}
+
+	if err := s.checkQuota(ctx, userID, u.BaseURL, key, st.MaxPerUser); err != nil {
+		return nil, err
+	}
+	names, err := s.fetchCatalog(ctx, protocol, u.BaseURL, key)
+	if err != nil {
+		return nil, err
+	}
+	models, err := selectModels(in.Models, names, protocol)
+	if err != nil {
+		return nil, err
+	}
+
+	now := s.now()
+	row := &Provider{
+		UserID: userID, Name: name, Icon: icon, Protocol: protocol, BaseURL: u.BaseURL, Host: u.Host,
+		KeyHint: keyHint(key), EnabledModels: encodeModels(models), Status: StatusActive, Source: source,
+		LastCheckedAt: &now,
+	}
+	row.CreatedAt, row.UpdatedAt = now, now
+
+	for attempt := 0; attempt < 5; attempt++ {
+		id, err := newPublicID()
+		if err != nil {
+			return nil, err
+		}
+		row.PublicID = id
+		row.ID = 0
+		enc, err := s.secrets.EncryptBound(key, keyBinding(userID, id))
+		if err != nil {
+			return nil, err
+		}
+		row.APIKeyEncrypted = enc
+
+		unlock := s.lockUser(userID)
+		err = s.checkQuota(ctx, userID, u.BaseURL, key, st.MaxPerUser)
+		if err == nil {
+			err = database.Translate(s.db.WithContext(ctx).Create(row).Error)
+		}
+		unlock()
+		if err == nil {
+			return row, nil
+		}
+		if !database.IsDuplicate(err) {
+			return nil, err
+		}
+	}
+	return nil, errors.New("personalprovider: could not allocate a public id")
+}
+
+// checkQuota enforces the per-user cap and the (address, key) uniqueness.
+func (s *Service) checkQuota(ctx context.Context, userID uint, baseURL, key string, max int) error {
+	var count int64
+	if err := s.db.WithContext(ctx).Model(&Provider{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+		return database.Translate(err)
+	}
+	if count >= int64(max) {
+		return ErrLimitReached
+	}
+	var same []Provider
+	if err := s.db.WithContext(ctx).Where("user_id = ? AND base_url = ?", userID, baseURL).Find(&same).Error; err != nil {
+		return database.Translate(err)
+	}
+	for i := range same {
+		existing, err := s.decryptKey(&same[i])
+		if err != nil {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(existing), []byte(key)) == 1 {
+			return ErrDuplicate
+		}
+	}
+	return nil
+}
+
+// ---- update ---------------------------------------------------------------------------
+
+// UpdateInput is a partial update; nil fields are left alone.
+type UpdateInput struct {
+	Name    *string
+	Icon    *string
+	APIKey  *string
+	Models  *[]ModelInput
+	Enabled *bool
+}
+
+// UpdateResult tells the caller what changed, for the audit trail.
+type UpdateResult struct {
+	Provider       *Provider
+	KeyRotated     bool
+	ModelsChanged  bool
+	EnabledChanged bool
+}
+
+// Update applies a partial update to the caller's provider.
+func (s *Service) Update(ctx context.Context, userID uint, publicID string, in UpdateInput) (*UpdateResult, error) {
+	st, err := s.requireEnabled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.find(ctx, userID, publicID)
+	if err != nil {
+		return nil, err
+	}
+	if in.Enabled != nil && p.Status == StatusSuspended {
+		return nil, ErrSuspended
+	}
+
+	changes := map[string]any{}
+	res := &UpdateResult{Provider: p}
+	if in.Name != nil {
+		name, err := normalizeName(*in.Name)
+		if err != nil {
+			return nil, err
+		}
+		if name == "" {
+			return nil, ErrInvalidName
+		}
+		changes["name"] = name
+	}
+	if in.Icon != nil {
+		icon, err := normalizeIcon(*in.Icon)
+		if err != nil {
+			return nil, err
+		}
+		changes["icon"] = icon
+	}
+	var newKey string
+	if in.APIKey != nil {
+		if newKey, err = normalizeAPIKey(*in.APIKey); err != nil {
+			return nil, err
+		}
+	}
+
+	if in.APIKey != nil || in.Models != nil {
+		if _, err := s.checkURL(p.BaseURL, st); err != nil {
+			return nil, err
+		}
+		key := newKey
+		if in.APIKey == nil {
+			if key, err = s.decryptKey(p); err != nil {
+				return nil, ErrModelUnavailable.WithCause(err)
+			}
+		}
+		names, err := s.fetchCatalog(ctx, p.Protocol, p.BaseURL, key)
+		if err != nil {
+			return nil, err
+		}
+		var models []EnabledModel
+		if in.Models != nil {
+			models, err = selectModels(*in.Models, names, p.Protocol)
+		} else {
+			models, err = revalidateSaved(p.Models(), names)
+		}
+		if err != nil {
+			return nil, err
+		}
+		encoded := encodeModels(models)
+		res.ModelsChanged = in.Models != nil && encoded != encodeModels(p.Models())
+		changes["enabled_models"] = encoded
+		now := s.now()
+		changes["last_checked_at"] = now
+		changes["last_error"] = ""
+		if in.APIKey != nil {
+			enc, err := s.secrets.EncryptBound(key, keyBinding(p.UserID, p.PublicID))
+			if err != nil {
+				return nil, err
+			}
+			changes["api_key_encrypted"] = enc
+			changes["key_hint"] = keyHint(key)
+			res.KeyRotated = true
+		}
+	}
+	if in.Enabled != nil {
+		next := StatusDisabled
+		if *in.Enabled {
+			next = StatusActive
+		}
+		res.EnabledChanged = next != p.Status
+		changes["status"] = next
+	}
+	if len(changes) == 0 {
+		return res, nil
+	}
+	changes["updated_at"] = s.now()
+	tx := s.db.WithContext(ctx).Model(&Provider{}).Where("id = ? AND user_id = ?", p.ID, userID).Updates(changes)
+	if tx.Error != nil {
+		return nil, database.Translate(tx.Error)
+	}
+	if tx.RowsAffected == 0 {
+		return nil, ErrNotFound
+	}
+	fresh, err := s.find(ctx, userID, publicID)
+	if err != nil {
+		return nil, err
+	}
+	res.Provider = fresh
+	return res, nil
+}
+
+// ---- delete ---------------------------------------------------------------------------
+
+// Delete hard-deletes the caller's provider. It works with the feature off.
+func (s *Service) Delete(ctx context.Context, userID uint, publicID string) (*Provider, error) {
+	p, err := s.find(ctx, userID, publicID)
+	if err != nil {
+		return nil, err
+	}
+	tx := s.db.WithContext(ctx).Where("id = ? AND user_id = ?", p.ID, userID).Delete(&Provider{})
+	if tx.Error != nil {
+		return nil, database.Translate(tx.Error)
+	}
+	if tx.RowsAffected == 0 {
+		return nil, ErrNotFound
+	}
+	return p, nil
+}
+
+// ---- models of a saved provider ---------------------------------------------------------
+
+// Models fetches the live catalog of a saved provider and records the outcome
+// on the provider (a failure to record never fails the call).
+func (s *Service) Models(ctx context.Context, userID uint, publicID string) ([]CatalogModel, *Provider, error) {
+	st, err := s.requireEnabled(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	p, err := s.find(ctx, userID, publicID)
+	if err != nil {
+		return nil, nil, err
+	}
+	names, err := s.checkAndFetch(ctx, p, st)
+	s.recordCheck(ctx, p, err)
+	if err != nil {
+		return nil, p, err
+	}
+	return catalogViews(p.Protocol, names), p, nil
+}
+
+func (s *Service) checkAndFetch(ctx context.Context, p *Provider, st Settings) ([]string, error) {
+	if _, err := s.checkURL(p.BaseURL, st); err != nil {
+		return nil, err
+	}
+	key, err := s.decryptKey(p)
+	if err != nil {
+		return nil, ErrModelUnavailable.WithCause(err)
+	}
+	return s.fetchCatalog(ctx, p.Protocol, p.BaseURL, key)
+}
+
+func (s *Service) recordCheck(ctx context.Context, p *Provider, checkErr error) {
+	code := ""
+	if checkErr != nil {
+		code = "internal.error"
+		if te, ok := asTyped(checkErr); ok {
+			code = te
+		}
+		if len(code) > maxLastErrorLen {
+			code = code[:maxLastErrorLen]
+		}
+	}
+	now := s.now()
+	err := s.db.WithContext(ctx).Model(&Provider{}).Where("id = ? AND user_id = ?", p.ID, p.UserID).
+		Updates(map[string]any{"last_error": code, "last_checked_at": now, "updated_at": now}).Error
+	if err != nil {
+		s.log.Warn("personal_provider_record_check_failed", logx.Err(err))
+	}
+}
