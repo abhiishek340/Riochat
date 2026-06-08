@@ -204,3 +204,204 @@ func DedupHits(seen map[string]bool, hits []Hit) []Hit {
 	}
 	return out
 }
+
+// cacheKey hashes everything that decides a retrieval's result: the user, the
+// whitespace-collapsed query, the embedding endpoint, model and retrieval
+// settings, and for every file its identity and index state.
+func cacheKey(cfg Config, userID uint, query string, files []SearchFile) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%d|%s|%s|%s|%t|%d|%g|%d|%d|%d", cacheVersion, userID, collapseSpace(query), cfg.host(), cfg.model(),
+		cfg.Hybrid, cfg.topK(), cfg.minSimilarity(), cfg.tokenBudget(), cfg.fetchMultiplier(), cfg.Dimensions)
+	parts := make([]string, 0, len(files))
+	for _, f := range files {
+		parts = append(parts, fmt.Sprintf("%d:%s:%d:%s:%d", f.ObjectID, f.FileID, f.ChunkCount, f.State, f.UpdatedAt.UnixNano()))
+	}
+	sort.Strings(parts)
+	for _, p := range parts {
+		h.Write([]byte("|"))
+		h.Write([]byte(p))
+	}
+	return "ragindex:retrieval:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// cachedResult is what the retrieval cache stores.
+type cachedResult struct {
+	Hits       []Hit   `json:"hits"`
+	Candidates int     `json:"candidates"`
+	Filtered   int     `json:"filtered"`
+	MaxScore   float64 `json:"maxScore"`
+}
+
+// Retrieve searches the files for passages that answer the query. It never
+// returns an error: failures are reported through the result status.
+func (s *Service) Retrieve(ctx context.Context, req SearchRequest) SearchResult {
+	cfg := s.config(ctx)
+	if !cfg.RAGEnabled || !cfg.Enabled || cfg.model() == "" {
+		return SearchResult{Status: StatusUnavailable}
+	}
+	query := strings.TrimSpace(req.Query)
+	if query == "" || len(req.Files) == 0 {
+		return SearchResult{Status: StatusEmpty}
+	}
+	useCache := !req.Ephemeral && cfg.CacheTTLSeconds > 0 && s.kv != nil
+	var key string
+	if useCache {
+		key = cacheKey(cfg, req.UserID, query, req.Files)
+		if raw, ok, err := s.kv.Get(ctx, key); err == nil && ok {
+			var c cachedResult
+			if json.Unmarshal(raw, &c) == nil && len(c.Hits) > 0 {
+				return SearchResult{Status: StatusHit, Reason: ReasonCacheHit, Hits: c.Hits, Cached: true,
+					Candidates: c.Candidates, Filtered: c.Filtered, MaxScore: c.MaxScore}
+			}
+		}
+	}
+
+	vecs, err := s.embedBatches(ctx, cfg, PurposeQuery, []EmbedInput{{Text: query}})
+	if err == nil && (len(vecs) != 1 || len(vecs[0]) == 0) {
+		err = errors.New("ragindex: empty query embedding")
+	}
+	if err != nil {
+		return failedSearch(ctx, err)
+	}
+	qvec := vecs[0]
+
+	sig := cfg.Signature()
+	ids := make([]uint, 0, len(req.Files))
+	order := make(map[uint]int, len(req.Files))
+	names := make(map[uint]SearchFile, len(req.Files))
+	for i, f := range req.Files {
+		if f.ObjectID == 0 {
+			continue
+		}
+		if _, dup := names[f.ObjectID]; dup {
+			continue
+		}
+		ids = append(ids, f.ObjectID)
+		order[f.ObjectID] = i
+		names[f.ObjectID] = f
+	}
+	readable, err := s.readableFiles(ctx, req.UserID, ids, sig)
+	if err != nil {
+		return failedSearch(ctx, err)
+	}
+	topK, minSim := cfg.topK(), cfg.minSimilarity()
+	fetch := topK * cfg.fetchMultiplier()
+
+	var ranked []scored
+	if cfg.Hybrid {
+		ranked, err = s.hybridSearch(ctx, readable, sig, qvec, query, fetch, minSim)
+	} else {
+		ranked, err = s.vectorSearch(ctx, readable, sig, qvec, fetch)
+	}
+	if err != nil {
+		return failedSearch(ctx, err)
+	}
+	res := SearchResult{Candidates: len(ranked)}
+	if len(ranked) == 0 {
+		res.Status, res.Reason = StatusEmpty, ReasonNoCandidates
+		return res
+	}
+	for _, r := range ranked {
+		if r.Score > res.MaxScore {
+			res.MaxScore = r.Score
+		}
+	}
+	kept := ranked
+	if !cfg.Hybrid {
+		kept = kept[:0:0]
+		for _, r := range ranked {
+			if r.Score >= minSim {
+				kept = append(kept, r)
+			}
+		}
+	}
+	res.Filtered = len(kept)
+	if len(kept) == 0 {
+		res.Status, res.Reason = StatusLowScore, ReasonBelowMin
+		return res
+	}
+	hits, err := s.loadHits(ctx, kept, names)
+	if err != nil {
+		return failedSearch(ctx, err)
+	}
+	picked := selectHits(hits, topK, cfg.tokenBudget(), order)
+	if len(picked) == 0 {
+		res.Status, res.Reason = StatusEmpty, ReasonBudget
+		return res
+	}
+	res.Status, res.Reason, res.Hits = StatusHit, ReasonMatched, picked
+	if useCache {
+		if raw, err := json.Marshal(cachedResult{Hits: picked, Candidates: res.Candidates, Filtered: res.Filtered, MaxScore: res.MaxScore}); err == nil {
+			if err := s.kv.Set(ctx, key, raw, time.Duration(cfg.CacheTTLSeconds)*time.Second); err != nil {
+				s.log.Debug("rag_cache_set_failed", logx.Err(err))
+			}
+		}
+	}
+	return res
+}
+
+// failedSearch maps a failure to the error or timeout status.
+func failedSearch(ctx context.Context, err error) SearchResult {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return SearchResult{Status: StatusTimeout, Reason: ReasonDeadline, Err: err}
+	}
+	return SearchResult{Status: StatusError, Reason: ReasonRetrievalError, Err: err}
+}
+
+// hybridSearch runs the vector and keyword searches in parallel and fuses
+// them. Vector hits below the minimum similarity are dropped before fusion;
+// keyword hits are not thresholded; a keyword failure leaves the vector side.
+func (s *Service) hybridSearch(ctx context.Context, files []uint, sig string, qvec []float32, query string, fetch int, minSim float64) ([]scored, error) {
+	var (
+		wg           sync.WaitGroup
+		vec, kw      []scored
+		vecErr, kwEr error
+	)
+	wg.Add(2)
+	go func() { defer wg.Done(); vec, vecErr = s.vectorSearch(ctx, files, sig, qvec, fetch) }()
+	go func() { defer wg.Done(); kw, kwEr = s.keywords(ctx, files, sig, query, fetch) }()
+	wg.Wait()
+	if vecErr != nil {
+		return nil, vecErr
+	}
+	if kwEr != nil {
+		s.log.Warn("rag_keyword_search_failed", logx.Err(kwEr))
+		kw = nil
+	}
+	kept := vec[:0:0]
+	for _, v := range vec {
+		if v.Score >= minSim {
+			kept = append(kept, v)
+		}
+	}
+	return fuse(kept, kw, fetch), nil
+}
+
+// loadHits reads the chunk rows of the ranked ids, in rank order.
+func (s *Service) loadHits(ctx context.Context, ranked []scored, files map[uint]SearchFile) ([]Hit, error) {
+	ids := make([]uint, len(ranked))
+	for i, r := range ranked {
+		ids[i] = r.ChunkID
+	}
+	var rows []Chunk
+	if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	byID := make(map[uint]Chunk, len(rows))
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	out := make([]Hit, 0, len(ranked))
+	for _, r := range ranked {
+		c, ok := byID[r.ChunkID]
+		if !ok {
+			continue
+		}
+		f := files[c.FileObjID]
+		out = append(out, Hit{
+			ChunkID: c.ID, FileObjectID: c.FileObjID, FileID: f.FileID, FileName: f.Name, ChunkIndex: c.ChunkIndex,
+			Modality: c.Modality, Content: c.Content, TokenCount: c.TokenCount, Score: r.Score,
+		})
+	}
+	return out, nil
+}
