@@ -235,3 +235,226 @@ func TestTieredSelection(t *testing.T) {
 		t.Fatalf("limit is inclusive: %+v", mc)
 	}
 }
+
+func TestTieredAllBoundedFallsBackToLast(t *testing.T) {
+	tc, err := parseTiersJSON(`{"tiers":[{"upToTokens":100,"inputUSDPerMTokens":1},{"upToTokens":500,"inputUSDPerMTokens":2}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mc, _ := priceUsage(priceSpec{Mode: PricingTiered, Tiers: tc}, usageCounts{Input: 10_000}, "", "", one)
+	if mc.TierFrom != 100 || mc.TierUpTo != nil {
+		t.Fatalf("overflow tier: from=%d upTo=%v", mc.TierFrom, mc.TierUpTo)
+	}
+}
+
+func TestTierValidation(t *testing.T) {
+	bad := []string{
+		``, `{}`, `{"tiers":[]}`, `not json`,
+		`{"tiers":[{"upToTokens":100},{"upToTokens":100}]}`,
+		`{"tiers":[{"upToTokens":100},{"upToTokens":50}]}`,
+		`{"tiers":[{"upToTokens":0},{"upToTokens":100}]}`,
+		`{"tiers":[{"upToTokens":100,"inputUSDPerMTokens":-1}]}`,
+	}
+	for _, b := range bad {
+		if _, err := parseTiersJSON(b); err == nil {
+			t.Errorf("accepted %q", b)
+		}
+	}
+	var many []TierRate
+	for i := 1; i <= 101; i++ {
+		v := int64(i * 10)
+		many = append(many, TierRate{UpToTokens: &v})
+	}
+	if _, err := normalizeTiers(&TierConfig{Tiers: many}); err == nil {
+		t.Error("101 tiers accepted")
+	}
+	if _, err := normalizeTiers(&TierConfig{Tiers: many[:100]}); err != nil {
+		t.Errorf("100 tiers rejected: %v", err)
+	}
+}
+
+func TestCallAndDurationPricing(t *testing.T) {
+	call, _ := priceUsage(priceSpec{Mode: PricingCall, Call: 7_000_000}, usageCounts{Calls: 0}, "", "", one)
+	if call.Call != 7_000_000 {
+		t.Errorf("call minimum is one: %d", call.Call)
+	}
+	call, _ = priceUsage(priceSpec{Mode: PricingCall, Call: 7_000_000}, usageCounts{Calls: 3}, "", "", ratio{2, 1})
+	if call.Call != 42_000_000 {
+		t.Errorf("3 calls x2 = %d", call.Call)
+	}
+	dur, _ := priceUsage(priceSpec{Mode: PricingDuration, Duration: 100_000_000}, usageCounts{Seconds: 8}, "", "", one)
+	if dur.Duration != 800_000_000 {
+		t.Errorf("duration = %d", dur.Duration)
+	}
+}
+
+func TestScheduleValidation(t *testing.T) {
+	overlap := `{"periods":[
+		{"name":"a","weekdays":[1,2,3,4,5],"start":"09:00","end":"18:00","ratePercent":150},
+		{"name":"b","weekdays":[1,2,3,4,5],"start":"08:00","end":"10:00","ratePercent":120}]}`
+	if _, err := parseScheduleJSON(overlap); err == nil {
+		t.Error("overlapping periods accepted")
+	}
+	cases := map[string]string{
+		"rate 0":      `{"periods":[{"name":"a","weekdays":[1],"start":"09:00","end":"10:00","ratePercent":0}]}`,
+		"rate 10001":  `{"periods":[{"name":"a","weekdays":[1],"start":"09:00","end":"10:00","ratePercent":10001}]}`,
+		"empty name":  `{"periods":[{"name":"  ","weekdays":[1],"start":"09:00","end":"10:00","ratePercent":100}]}`,
+		"long name":   `{"periods":[{"name":"123456789012345678901234567890123","weekdays":[1],"start":"09:00","end":"10:00","ratePercent":100}]}`,
+		"no weekdays": `{"periods":[{"name":"a","weekdays":[],"start":"09:00","end":"10:00","ratePercent":100}]}`,
+		"dup days":    `{"periods":[{"name":"a","weekdays":[1,1],"start":"09:00","end":"10:00","ratePercent":100}]}`,
+		"bad day":     `{"periods":[{"name":"a","weekdays":[7],"start":"09:00","end":"10:00","ratePercent":100}]}`,
+		"bad time":    `{"periods":[{"name":"a","weekdays":[1],"start":"25:00","end":"10:00","ratePercent":100}]}`,
+		"bad format":  `{"periods":[{"name":"a","weekdays":[1],"start":"9am","end":"10:00","ratePercent":100}]}`,
+		"start=end":   `{"periods":[{"name":"a","weekdays":[1],"start":"09:00","end":"09:00","ratePercent":100}]}`,
+	}
+	for name, js := range cases {
+		if _, err := parseScheduleJSON(js); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	var b = `{"periods":[`
+	for i := 0; i < 33; i++ {
+		if i > 0 {
+			b += ","
+		}
+		b += `{"name":"p","weekdays":[1],"start":"01:00","end":"02:00","ratePercent":100}`
+	}
+	b += `]}`
+	if _, err := parseScheduleJSON(b); err == nil {
+		t.Error("33 periods accepted")
+	}
+	for _, off := range []string{``, `{}`, `{"periods":[]}`, `null`} {
+		sc, err := parseScheduleJSON(off)
+		if err != nil || sc != nil {
+			t.Errorf("%q should be disabled: %v %v", off, sc, err)
+		}
+		if marshalSchedule(sc) != "{}" {
+			t.Error("disabled schedule stores {}")
+		}
+	}
+}
+
+func TestScheduleNormalizationAndMatching(t *testing.T) {
+	sc, err := parseScheduleJSON(`{"periods":[{"name":" Night ","weekdays":[5],"start":"22:00","end":"6:00","ratePercent":80}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.Periods[0].Name != "Night" || sc.Periods[0].End != "06:00" {
+		t.Fatalf("normalized %+v", sc.Periods[0])
+	}
+	// 2026-03-06 is a Friday.
+	fri := func(h, m int) time.Time { return time.Date(2026, 3, 6, h, m, 0, 0, time.UTC) }
+	sat := func(h, m int) time.Time { return time.Date(2026, 3, 7, h, m, 0, 0, time.UTC) }
+	if sc.match(fri(21, 59)) != nil {
+		t.Error("before start")
+	}
+	if p := sc.match(fri(22, 0)); p == nil || p.RatePercent != 80 {
+		t.Error("Friday 22:00 should match")
+	}
+	if sc.match(sat(5, 59)) == nil {
+		t.Error("Saturday 05:59 belongs to Friday's span")
+	}
+	if sc.match(sat(6, 0)) != nil {
+		t.Error("end is exclusive")
+	}
+	if sc.match(time.Date(2026, 3, 5, 23, 0, 0, 0, time.UTC)) != nil {
+		t.Error("Thursday must not match")
+	}
+}
+
+func TestScheduleWrapsSundayNightIntoMonday(t *testing.T) {
+	sc, err := parseScheduleJSON(`{"periods":[{"name":"w","weekdays":[0],"start":"23:00","end":"01:00","ratePercent":50}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sun := time.Date(2026, 3, 1, 23, 30, 0, 0, time.UTC)
+	mon := time.Date(2026, 3, 2, 0, 30, 0, 0, time.UTC)
+	if sc.match(sun) == nil || sc.match(mon) == nil {
+		t.Error("Sunday night must reach Monday")
+	}
+	// A Saturday-night period wraps to Sunday; combined with the above they do not overlap.
+	if _, err := parseScheduleJSON(`{"periods":[
+		{"name":"a","weekdays":[6],"start":"23:00","end":"02:00","ratePercent":50},
+		{"name":"b","weekdays":[0],"start":"01:00","end":"03:00","ratePercent":50}]}`); err == nil {
+		t.Error("Saturday-night span overlaps Sunday 01:00")
+	}
+	// Midnight crossing from Sunday collides with an early Monday period.
+	if _, err := parseScheduleJSON(`{"periods":[
+		{"name":"a","weekdays":[0],"start":"23:00","end":"02:00","ratePercent":50},
+		{"name":"b","weekdays":[1],"start":"01:00","end":"03:00","ratePercent":50}]}`); err == nil {
+		t.Error("Sunday-night span overlaps Monday 01:00")
+	}
+}
+
+func TestScheduleAppliesToPriceOnlyWhenNotFree(t *testing.T) {
+	sc, _ := parseScheduleJSON(`{"periods":[{"name":"all","weekdays":[0,1,2,3,4,5,6],"start":"00:00","end":"23:59","ratePercent":200}]}`)
+	at := time.Date(2026, 3, 2, 10, 0, 0, 0, time.UTC)
+	if (priceSpec{Schedule: sc}).scheduleAt(at, time.UTC) == nil {
+		t.Error("paid price should see the period")
+	}
+	if (priceSpec{Schedule: sc, IsFree: true}).scheduleAt(at, time.UTC) != nil {
+		t.Error("free price must ignore schedules")
+	}
+}
+
+func TestNativeToolCatalog(t *testing.T) {
+	if e, ok := nativeEntryFor("anthropic_messages", "web_search"); !ok || e.Key != "anthropic.web_search_20260209" || e.DefaultPrice != 10_000_000 {
+		t.Errorf("anthropic: %+v %v", e, ok)
+	}
+	if e, ok := nativeEntryFor("openai_responses", "web_search_preview"); !ok || e.DefaultPrice != 25_000_000 {
+		t.Errorf("openai preview: %+v", e)
+	}
+	if e, ok := nativeEntryFor("openai_responses", "image_generation"); !ok || e.DefaultPrice != 0 {
+		t.Errorf("image generation is unmetered: %+v", e)
+	}
+	if e, ok := nativeEntryFor("xai_responses", "x_search"); !ok || e.DefaultPrice != 5_000_000 {
+		t.Errorf("xai x search: %+v", e)
+	}
+	if e, ok := nativeEntryFor("xai_responses", "attachment_search"); !ok || e.DefaultPrice != 10_000_000 {
+		t.Errorf("xai attachment: %+v", e)
+	}
+	if e, ok := nativeEntryFor("xai_responses", "collections_search"); !ok || e.DefaultPrice != 2_500_000 {
+		t.Errorf("xai collections: %+v", e)
+	}
+	if _, ok := nativeEntryFor("mystery", "web_search"); ok {
+		t.Error("unknown protocol must not resolve")
+	}
+	keys := map[string]bool{}
+	for _, e := range nativeToolCatalog {
+		if keys[e.Key] {
+			t.Errorf("duplicate catalog key %q", e.Key)
+		}
+		keys[e.Key] = true
+	}
+}
+
+func TestNativeOverridesNormalization(t *testing.T) {
+	in := map[string]NativeToolOverride{"openai.web_search": {PriceNanousd: 1, Unit: "weird", PriceLabel: "x", Billable: false}}
+	out, err := normalizeNativeOverrides(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ov := out["openai.web_search"]
+	if ov.Unit != "call" || ov.PriceLabel != "" || !ov.Billable || ov.PriceNanousd != 1 {
+		t.Errorf("normalized %+v", ov)
+	}
+	if _, err := normalizeNativeOverrides(map[string]NativeToolOverride{"nope": {}}); err == nil {
+		t.Error("unknown key accepted")
+	}
+	if _, err := normalizeNativeOverrides(map[string]NativeToolOverride{"openai.web_search": {PriceNanousd: -1}}); err == nil {
+		t.Error("negative price accepted")
+	}
+	if nativePricingSource(map[string]NativeToolOverride{}) != "provider_official_defaults" {
+		t.Error("empty overrides are defaults")
+	}
+	if nativePricingSource(defaultNativeOverrides()) != "provider_official_defaults" {
+		t.Error("explicit defaults are defaults")
+	}
+	if nativePricingSource(map[string]NativeToolOverride{"openai.web_search": {PriceNanousd: 1}}) != "admin_configured" {
+		t.Error("override must be admin_configured")
+	}
+	parsed, err := parseNativeOverrides(defaultNativePricingJSON())
+	if err != nil || len(parsed) != len(nativeToolCatalog)-len(nativeUsageOnly) {
+		t.Errorf("default table round trip: %v %d", err, len(parsed))
+	}
+}
