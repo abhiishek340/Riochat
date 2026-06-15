@@ -264,3 +264,289 @@ func normalizeCompatible(raw string) (string, error) {
 	}
 	return c, nil
 }
+
+// CreateUpstream creates an upstream.
+func (s *Service) CreateUpstream(ctx context.Context, req createUpstreamReq) (*UpstreamView, error) {
+	baseURL, err := validateUpstreamBaseURL(req.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	style, err := normalizeCompatible(req.Compatible)
+	if err != nil {
+		return nil, err
+	}
+	var defaults string
+	if strings.TrimSpace(req.ProtocolDefaultsJSON) == "" {
+		defaults = fallbackDefaultsJSON(style)
+	} else {
+		d, err := parseProtocolDefaultsStrict(req.ProtocolDefaultsJSON)
+		if err != nil {
+			return nil, err
+		}
+		defaults = d.json()
+	}
+	doc, err := parseAndValidateKeys(req.APIKeys)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateHeadersJSON(req.HeadersJSON); err != nil {
+		return nil, err
+	}
+	enc, err := s.encryptKeys(doc)
+	if err != nil {
+		return nil, err
+	}
+	status := normalizeStatus(req.Status)
+	if !validWritableStatus(status) {
+		return nil, badRequest(apperr.ErrInvalidBody)
+	}
+	up := Upstream{
+		Name: strings.TrimSpace(req.Name), BaseURL: baseURL, Compatible: style, ProtocolDefaultsJSON: defaults,
+		Status: status, ConnectTimeoutMS: timeoutOrDefault(req.ConnectTimeoutMS, defaultConnectTimeoutMS),
+		ReadTimeoutMS:       timeoutOrDefault(req.ReadTimeoutMS, defaultReadTimeoutMS),
+		StreamIdleTimeoutMS: timeoutOrDefault(req.StreamIdleTimeoutMS, defaultStreamIdleMS),
+		APIKeysEnc:          enc, CBFailureThreshold: req.CBFailureThreshold, CBModelThreshold: req.CBModelThreshold,
+		CBThresholdLogic: normalizeThresholdLogic(req.CBThresholdLogic), CBDurationMin: req.CBDurationMin,
+		CBWindowMin: req.CBWindowMin, HeadersJSON: req.HeadersJSON,
+	}
+	if err := s.db.WithContext(ctx).Create(&up).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	s.invalidateCatalog()
+	return s.GetUpstream(ctx, up.ID)
+}
+
+// UpdateUpstream applies a partial update.
+func (s *Service) UpdateUpstream(ctx context.Context, id uint, req updateUpstreamReq) (*UpstreamView, error) {
+	up, err := s.loadUpstream(ctx, s.db, id)
+	if err != nil {
+		return nil, err
+	}
+	statusChanged := false
+	if req.Name != nil {
+		n := strings.TrimSpace(*req.Name)
+		if runeLen(n) < 2 || runeLen(n) > 128 {
+			return nil, badRequest(apperr.ErrInvalidBody)
+		}
+		up.Name = n
+	}
+	if req.BaseURL != nil {
+		u, err := validateUpstreamBaseURL(*req.BaseURL)
+		if err != nil {
+			return nil, err
+		}
+		up.BaseURL = u
+	}
+	styleChanged := false
+	if req.Compatible != nil {
+		style, err := normalizeCompatible(*req.Compatible)
+		if err != nil {
+			return nil, err
+		}
+		styleChanged = true
+		up.Compatible = style
+	}
+	if req.ProtocolDefaultsJSON != nil {
+		if strings.TrimSpace(*req.ProtocolDefaultsJSON) == "" {
+			if styleChanged {
+				up.ProtocolDefaultsJSON = fallbackDefaultsJSON(up.Compatible)
+			} else {
+				up.ProtocolDefaultsJSON = "{}"
+			}
+		} else {
+			d, err := parseProtocolDefaultsStrict(*req.ProtocolDefaultsJSON)
+			if err != nil {
+				return nil, err
+			}
+			up.ProtocolDefaultsJSON = d.json()
+		}
+	}
+	if req.APIKeys != nil {
+		doc, err := parseAndValidateKeys(*req.APIKeys)
+		if err != nil {
+			return nil, err
+		}
+		if up.APIKeysEnc, err = s.encryptKeys(doc); err != nil {
+			return nil, err
+		}
+	} else if req.AddAPIKeys != nil || len(req.DeleteAPIKeyIDs) > 0 {
+		doc, err := s.decryptKeys(up)
+		if err != nil {
+			return nil, ErrInvalidAPIKeys
+		}
+		var added []keyEntry
+		if req.AddAPIKeys != nil {
+			addDoc, err := parseKeyDoc(*req.AddAPIKeys)
+			if err != nil || len(addDoc.Keys) == 0 {
+				return nil, ErrInvalidAPIKeys
+			}
+			added = addDoc.Keys
+		}
+		if err := doc.applyEdit(s.keyHash, req.DeleteAPIKeyIDs, added); err != nil {
+			return nil, err
+		}
+		if up.APIKeysEnc, err = s.encryptKeys(doc); err != nil {
+			return nil, err
+		}
+	}
+	if req.Status != nil {
+		st := normalizeStatus(*req.Status)
+		if !validWritableStatus(st) {
+			return nil, badRequest(apperr.ErrInvalidBody)
+		}
+		statusChanged = st != up.Status
+		up.Status = st
+	}
+	if req.ConnectTimeoutMS != nil {
+		up.ConnectTimeoutMS = timeoutOrDefault(*req.ConnectTimeoutMS, defaultConnectTimeoutMS)
+	}
+	if req.ReadTimeoutMS != nil {
+		up.ReadTimeoutMS = timeoutOrDefault(*req.ReadTimeoutMS, defaultReadTimeoutMS)
+	}
+	if req.StreamIdleTimeoutMS != nil {
+		up.StreamIdleTimeoutMS = timeoutOrDefault(*req.StreamIdleTimeoutMS, defaultStreamIdleMS)
+	}
+	if req.CBFailureThreshold != nil {
+		up.CBFailureThreshold = *req.CBFailureThreshold
+	}
+	if req.CBModelThreshold != nil {
+		up.CBModelThreshold = *req.CBModelThreshold
+	}
+	if req.CBThresholdLogic != nil {
+		up.CBThresholdLogic = normalizeThresholdLogic(*req.CBThresholdLogic)
+	}
+	if req.CBDurationMin != nil {
+		up.CBDurationMin = *req.CBDurationMin
+	}
+	if req.CBWindowMin != nil {
+		up.CBWindowMin = *req.CBWindowMin
+	}
+	if req.HeadersJSON != nil {
+		if err := validateHeadersJSON(*req.HeadersJSON); err != nil {
+			return nil, err
+		}
+		up.HeadersJSON = *req.HeadersJSON
+	}
+	if err := s.db.WithContext(ctx).Save(up).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	if statusChanged {
+		s.invalidateCatalog()
+	}
+	return s.GetUpstream(ctx, id)
+}
+
+// ---- delete ------------------------------------------------------------------------------
+
+// DeleteUpstream removes an upstream with its upstream models, their routes and
+// the access rules that point at it. Platform models stay.
+func (s *Service) DeleteUpstream(ctx context.Context, id uint) error {
+	var codes []string
+	err := s.tx(ctx, func(tx *gorm.DB) error {
+		var up Upstream
+		if err := tx.First(&up, id).Error; err != nil {
+			if isNotFound(err) {
+				return ErrUpstreamNotFound
+			}
+			return err
+		}
+		var ums []UpstreamModel
+		if err := tx.Where("upstream_id = ?", id).Find(&ums).Error; err != nil {
+			return err
+		}
+		umIDs := make([]uint, 0, len(ums))
+		for _, um := range ums {
+			umIDs = append(umIDs, um.ID)
+			codes = append(codes, um.BindingCode)
+		}
+		if len(umIDs) > 0 {
+			if err := tx.Where("upstream_model_id IN ?", umIDs).Delete(&ModelRoute{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("upstream_id = ?", id).Delete(&UpstreamModel{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("rule_type = ? AND value = ?", RuleUpstream, strconv.FormatUint(uint64(id), 10)).Delete(&PermissionGroupModelRule{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&Upstream{}, id).Error
+	})
+	if err != nil {
+		return err
+	}
+	s.circuits.forgetCounter(id)
+	s.clearUpstreamState(ctx, id, codes)
+	s.invalidateCatalog()
+	return nil
+}
+
+func (s *Service) clearUpstreamState(ctx context.Context, id uint, codes []string) {
+	if err := s.circuits.reset(ctx, upstreamPrefix(id), true); err != nil {
+		s.log.Warn("llm_circuit_cleanup_failed", logx.Err(err))
+	}
+	for _, c := range codes {
+		_ = s.circuits.reset(ctx, bindingPrefix(id, c), false)
+	}
+}
+
+// BatchDeleteUpstreams deletes sequentially and independently.
+func (s *Service) BatchDeleteUpstreams(ctx context.Context, ids []uint) BatchResult {
+	return s.batchDelete(ids, func(id uint) error { return s.DeleteUpstream(ctx, id) }, ErrUpstreamNotFound)
+}
+
+func (s *Service) batchDelete(ids []uint, del func(uint) error, notFound error) BatchResult {
+	res := BatchResult{Total: len(ids), Results: []BatchItem{}}
+	for _, id := range ids {
+		err := del(id)
+		switch {
+		case err == nil:
+			res.SuccessCount++
+			res.Results = append(res.Results, BatchItem{ID: id, Status: "deleted"})
+		case errors.Is(err, notFound):
+			res.NotFoundCount++
+			res.Results = append(res.Results, BatchItem{ID: id, Status: "not_found"})
+		default:
+			res.FailedCount++
+			msg := "batch delete failed"
+			if te, ok := apperr.Find(err); ok && apperr.Registered(te.Code) && te.Message != "" {
+				msg = te.Message
+			}
+			res.Results = append(res.Results, BatchItem{ID: id, Status: "failed", Error: msg})
+		}
+	}
+	return res
+}
+
+// ---- manual circuit control ---------------------------------------------------------------
+
+// OpenUpstreamCircuit opens an upstream circuit for 24 hours.
+func (s *Service) OpenUpstreamCircuit(ctx context.Context, id uint) error {
+	if _, err := s.loadUpstream(ctx, s.db, id); err != nil {
+		return err
+	}
+	if !s.BreakerEnabled(ctx) {
+		return ErrBreakerDisabled
+	}
+	return s.circuits.openManual(ctx, upstreamPrefix(id))
+}
+
+// ResetUpstreamCircuit clears an upstream's circuit and counters.
+func (s *Service) ResetUpstreamCircuit(ctx context.Context, id uint) error {
+	if _, err := s.loadUpstream(ctx, s.db, id); err != nil {
+		return err
+	}
+	return s.circuits.reset(ctx, upstreamPrefix(id), true)
+}
+
+// sortedUpstreamIDs is a small helper for deterministic iteration.
+func sortedUpstreamIDs(m map[uint]*Upstream) []uint {
+	ids := make([]uint, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+var _ = time.Second
