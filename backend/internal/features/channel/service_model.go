@@ -486,3 +486,241 @@ func (s *Service) CreateModel(ctx context.Context, req createModelReq) (*ModelVi
 }
 
 // ---- update ---------------------------------------------------------------------------
+
+// UpdateModel applies a partial update to a platform model.
+func (s *Service) UpdateModel(ctx context.Context, id uint, req updateModelReq) (*ModelView, error) {
+	err := s.tx(ctx, func(tx *gorm.DB) error {
+		m, err := s.loadModel(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		oldName, oldVendor := m.Name, m.Vendor
+		if req.PlatformModelName != nil {
+			name, err := normalizePlatformName(*req.PlatformModelName)
+			if err != nil {
+				return err
+			}
+			if name != m.Name {
+				var n int64
+				if err := tx.Model(&PlatformModel{}).Where("name = ? AND id <> ?", name, m.ID).Count(&n).Error; err != nil {
+					return err
+				}
+				if n > 0 {
+					return ErrPlatformNameExists
+				}
+				m.Name = name
+			}
+		}
+		nameChanged := m.Name != oldName
+		if req.Vendor != nil {
+			if strings.TrimSpace(*req.Vendor) == "" {
+				m.Vendor = deriveVendor("", m.Name)
+			} else if m.Vendor, err = normalizeVendorKey(*req.Vendor); err != nil {
+				return err
+			}
+		} else if nameChanged {
+			if v := deriveVendor("", m.Name); v != m.Vendor {
+				m.Vendor = v
+			}
+		}
+		if m.Vendor != oldVendor {
+			if err := s.requireVendor(ctx, tx, m.Vendor); err != nil {
+				return err
+			}
+		}
+		identityChanged := nameChanged || m.Vendor != oldVendor
+		if req.DisplayGroupID != nil {
+			if *req.DisplayGroupID == 0 {
+				m.DisplayGroupID = nil
+			} else {
+				if err := s.requireGroup(ctx, tx, *req.DisplayGroupID); err != nil {
+					return err
+				}
+				m.DisplayGroupID = ptr(*req.DisplayGroupID)
+			}
+		}
+		if req.KindsJSON != nil {
+			if strings.TrimSpace(*req.KindsJSON) == "" {
+				m.KindsJSON = kindsJSON([]string{KindChat})
+			} else {
+				kinds, err := normalizeKinds(*req.KindsJSON)
+				if err != nil {
+					return err
+				}
+				m.KindsJSON = kindsJSON(kinds)
+			}
+		}
+		switch {
+		case req.Icon != nil:
+			ref, err := parseIconRef(*req.Icon)
+			if err != nil {
+				return err
+			}
+			if ref.AssetID != "" {
+				if err := s.reserveIcon(ctx, tx, ref.AssetID); err != nil {
+					return asBadRequest(err)
+				}
+			}
+			m.Icon = ref.Value
+			if m.Icon == "" {
+				m.Icon = autoIcon("", m.Name, m.Vendor)
+			}
+		case identityChanged && (m.Icon == "" || m.Icon == autoIcon("", oldName, oldVendor)):
+			m.Icon = autoIcon("", m.Name, m.Vendor)
+		}
+		if req.CapabilitiesJSON != nil {
+			caps := strings.TrimSpace(*req.CapabilitiesJSON)
+			if err := validateCapabilitiesText(caps); err != nil {
+				return err
+			}
+			m.CapabilitiesJSON = caps
+		} else if identityChanged {
+			m.CapabilitiesJSON = stripAutoWindow(m.CapabilitiesJSON)
+		}
+		if req.SystemPrompt != nil {
+			if m.SystemPrompt, err = validateSystemPrompt(*req.SystemPrompt); err != nil {
+				return err
+			}
+		}
+		if req.AccessScope != nil {
+			if m.AccessScope, err = normalizeAccessScope(*req.AccessScope); err != nil {
+				return err
+			}
+		}
+		if req.Status != nil {
+			st := normalizeStatus(*req.Status)
+			if !validWritableStatus(st) {
+				return badRequest(apperr.ErrInvalidBody)
+			}
+			m.Status = st
+		}
+		if req.Description != nil {
+			m.Description = *req.Description
+		}
+		if req.CBPolicyMode != nil {
+			m.CBPolicyMode = normalizeCBPolicyMode(*req.CBPolicyMode)
+		}
+		if req.CBFailureThreshold != nil {
+			m.CBFailureThreshold = nonNegative(*req.CBFailureThreshold)
+		}
+		if req.CBDurationMin != nil {
+			m.CBDurationMin = nonNegative(*req.CBDurationMin)
+		}
+		if req.CBWindowMin != nil {
+			m.CBWindowMin = nonNegative(*req.CBWindowMin)
+		}
+		// Save writes every column, including a cleared display group.
+		if err := tx.Save(m).Error; err != nil {
+			if database.IsDuplicate(err) {
+				return ErrPlatformNameExists
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateCatalog()
+	return s.GetModel(ctx, id)
+}
+
+// ---- delete / order / grouping -------------------------------------------------------------
+
+// DeleteModel removes a model with its routes and manual access links.
+func (s *Service) DeleteModel(ctx context.Context, id uint) error {
+	err := s.tx(ctx, func(tx *gorm.DB) error {
+		if _, err := s.loadModel(ctx, tx, id); err != nil {
+			return err
+		}
+		if err := tx.Where("platform_model_id = ?", id).Delete(&ModelRoute{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("platform_model_id = ?", id).Delete(&PermissionGroupModelAccess{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&PlatformModel{}, id).Error
+	})
+	if err != nil {
+		return err
+	}
+	s.invalidateCatalog()
+	return nil
+}
+
+// BatchDeleteModels deletes sequentially and independently.
+func (s *Service) BatchDeleteModels(ctx context.Context, ids []uint) BatchResult {
+	return s.batchDelete(ids, func(id uint) error { return s.DeleteModel(ctx, id) }, ErrModelNotFound)
+}
+
+// ReorderModels renumbers the submitted models: the i-th gets i*100.
+func (s *Service) ReorderModels(ctx context.Context, ids []uint) error {
+	seen := map[uint]bool{}
+	for _, id := range ids {
+		if id == 0 || seen[id] {
+			return ErrInvalidModelOrder
+		}
+		seen[id] = true
+	}
+	err := s.tx(ctx, func(tx *gorm.DB) error {
+		var n int64
+		if err := tx.Model(&PlatformModel{}).Where("id IN ?", ids).Count(&n).Error; err != nil {
+			return err
+		}
+		if int(n) != len(ids) {
+			return ErrModelNotFound
+		}
+		for i, id := range ids {
+			if err := tx.Model(&PlatformModel{}).Where("id = ?", id).Update("sort_order", (i+1)*100).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.invalidateCatalog()
+	return nil
+}
+
+// AssignDisplayGroup moves many models into a display group (0 clears).
+func (s *Service) AssignDisplayGroup(ctx context.Context, modelIDs []uint, groupID uint) error {
+	ids := uniqueUints(modelIDs)
+	for _, id := range ids {
+		if id == 0 {
+			return ErrInvalidDisplayGroup
+		}
+	}
+	if len(ids) == 0 {
+		return ErrInvalidDisplayGroup
+	}
+	err := s.tx(ctx, func(tx *gorm.DB) error {
+		if groupID > 0 {
+			var n int64
+			if err := tx.Model(&ModelDisplayGroup{}).Where("id = ?", groupID).Count(&n).Error; err != nil {
+				return err
+			}
+			if n == 0 {
+				return ErrGroupNotFound
+			}
+		}
+		var n int64
+		if err := tx.Model(&PlatformModel{}).Where("id IN ?", ids).Count(&n).Error; err != nil {
+			return err
+		}
+		if int(n) != len(ids) {
+			return ErrInvalidDisplayGroup
+		}
+		var val any
+		if groupID > 0 {
+			val = groupID
+		}
+		return tx.Model(&PlatformModel{}).Where("id IN ?", ids).Update("display_group_id", val).Error
+	})
+	if err != nil {
+		return err
+	}
+	s.invalidateCatalog()
+	return nil
+}
