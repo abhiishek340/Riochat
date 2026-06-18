@@ -1,0 +1,41 @@
+export const desktopSetup = {
+  title: "Where is your {brand}?",
+  subtitle: "Choose how this app gets its conversations.",
+  local: {
+    use: "Use on this computer",
+    starting: "Starting…",
+    disabled: "Your organisation does not allow the built-in server on this computer.",
+  },
+  remote: {
+    connect: "Connect to a server",
+    address: "Server address",
+    managed: "This address is set by your organisation.",
+    checking: "Checking…",
+    submit: "Connect",
+  },
+  errors: {
+    alreadyOpen: "That server is already open in another tab.",
+    localDisabled: "Your organisation does not allow the built-in server.",
+    serverLocked: "Your organisation fixes the server address for this app.",
+    localFailed: "The built-in server could not start.",
+    invalidUrl: "Enter a full address such as https://chat.example.com, without a path.",
+    timeout: "The server did not answer within {seconds} seconds.",
+    network: "The server could not be reached. Check the address and your connection.",
+    status: "The server answered with status {status}.",
+    bootstrapFailed: "The saved server could not be opened.",
+  },
+  update: {
+    available: "Version {version} is available",
+    install: "Update",
+    download: "Download",
+    downloading: "Downloading the update…",
+    installed: "Update installed. Relaunch to use it.",
+    relaunch: "Relaunch",
+    failed: "The update could not be installed.",
+    openFailed: "The releases page could not be opened.",
+  },
+  download: {
+    saved: "Saved {fileName} to Downloads",
+    failed: "Could not save {fileName}",
+  },
+} as const;
