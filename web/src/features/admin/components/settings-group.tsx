@@ -160,3 +160,103 @@ export function FieldControl({ field, form, disabled, onChange }: FieldControlPr
       );
   }
 }
+
+/** Label, hint, unsaved badge and control for one setting. */
+export function FieldRow({ field, form, disabled, onChange }: FieldControlProps) {
+  const t = useT();
+  const id = fieldId(field);
+  const dirty = form.dirtyOf([field]).length > 0;
+  const wide = field.type === "textarea" || field.type === "json";
+  const hint = field.hint ? t(field.hint) : "";
+  const label = (
+    <div className="min-w-0">
+      <label htmlFor={`f-${id}`} className="flex flex-wrap items-center gap-2 text-sm font-medium">
+        {t(field.label)}
+        {dirty ? <Badge tone="warning">{t("adminCommon.settings.unsaved")}</Badge> : null}
+      </label>
+      {hint ? <p className="mt-0.5 text-[13px] text-muted-foreground">{hint}</p> : null}
+    </div>
+  );
+  if (wide) {
+    return (
+      <div className="space-y-2 py-3">
+        {label}
+        <FieldControl field={field} form={form} disabled={disabled} onChange={onChange} />
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+      <div className="sm:max-w-[55%]">{label}</div>
+      <div className="flex min-w-0 shrink-0 items-center gap-2 sm:justify-end">
+        <FieldControl field={field} form={form} disabled={disabled} onChange={onChange} />
+      </div>
+    </div>
+  );
+}
+
+export interface SettingsGroupProps {
+  form: SettingsForm;
+  fields: readonly FieldDef[];
+  title?: ReactNode;
+  description?: ReactNode;
+  save?: SaveOptions;
+  /** Called after a successful save with the fields that were sent. */
+  onSaved?: (sent: FieldDef[]) => void;
+  onChange?: (id: string, value: string) => void;
+  /** Extra content shown under the fields (probes, hints). */
+  children?: ReactNode;
+  /** Rendered between the title and the fields. */
+  before?: ReactNode;
+  actions?: ReactNode;
+  disabled?: boolean;
+  /** Disables single fields, for example while a parent switch is off. */
+  fieldDisabled?: (field: FieldDef, draft: Record<string, string>) => boolean;
+  className?: string;
+}
+
+/** A card of settings with its own save bar, shown only while something changed. */
+export function SettingsGroup({ form, fields, title, description, save, onSaved, onChange, children, before, actions, disabled, fieldDisabled, className }: SettingsGroupProps) {
+  const t = useT();
+  const visible = fields.filter((f) => isVisible(f, form.draft));
+  const dirty = form.dirtyOf(fields);
+  return (
+    <Section title={title} description={description} actions={actions} className={className}>
+      {before}
+      {form.failed && !form.loading ? (
+        // Never offer blank fields after a failed read: saving them would overwrite the server's values.
+        <LoadError message={t("adminCommon.settings.loadFailed")} onRetry={form.reload} />
+      ) : form.loading ? (
+        <div className="space-y-3 py-2">
+          {Array.from({ length: Math.min(4, Math.max(2, fields.length)) }, (_, i) => (
+            <Skeleton key={i} className="h-9 w-full" />
+          ))}
+        </div>
+      ) : (
+        <div className="divide-y">
+          {visible.map((f) => (
+            <FieldRow key={fieldId(f)} field={f} form={form} disabled={disabled || fieldDisabled?.(f, form.draft)} onChange={onChange} />
+          ))}
+        </div>
+      )}
+      {form.failed && !form.loading ? null : children}
+      {dirty.length > 0 ? (
+        <div className="mt-4 flex flex-wrap items-center justify-end gap-2 border-t pt-4">
+          <span className="mr-auto text-sm text-muted-foreground">{t("adminCommon.settings.unsaved")}</span>
+          <Button variant="outline" disabled={form.saving} onClick={() => form.revert(fields)}>
+            {t("adminCommon.settings.revert")}
+          </Button>
+          <Button
+            loading={form.saving}
+            onClick={async () => {
+              const result = await form.save(fields, save);
+              if (result.ok && result.sent.length > 0) onSaved?.(result.sent);
+            }}
+          >
+            {t("adminCommon.settings.save")}
+          </Button>
+        </div>
+      ) : null}
+    </Section>
+  );
+}
