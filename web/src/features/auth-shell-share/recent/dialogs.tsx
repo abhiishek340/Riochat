@@ -211,3 +211,178 @@ export function LabelsDialog({
     </Dialog>
   );
 }
+
+export function shareLink(shareID: string): string {
+  return `${publicWebOrigin(resolveApiBase())}/share?conversation_id=${encodeURIComponent(shareID)}`;
+}
+
+export function ShareDialog({
+  row,
+  open,
+  onOpenChange,
+  onChanged,
+}: {
+  row: ConversationRow | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** `null` means sharing was turned off. */
+  onChanged: (id: string, share: ShareInfo | null) => void;
+}) {
+  const t = useT();
+  const errorMessage = useErrorMessage();
+  const [state, setState] = useState<{ phase: "loading" } | { phase: "ready"; share: ShareInfo | null } | { phase: "failed" }>({ phase: "loading" });
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const id = row?.publicID ?? "";
+
+  useEffect(() => {
+    if (!open || !id) return;
+    let live = true;
+    setState({ phase: "loading" });
+    fetchShare(id).then(
+      (share) => live && setState({ phase: "ready", share: share && share.status === "active" ? share : null }),
+      () => live && setState({ phase: "failed" }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [open, id, attempt]);
+
+  if (!row) return null;
+  const current = state.phase === "ready" ? state.share : null;
+
+  const mutate = async (action: () => Promise<ShareInfo | null>) => {
+    setBusy(true);
+    try {
+      const share = await action();
+      setState({ phase: "ready", share });
+      onChanged(row.publicID, share);
+    } catch (error) {
+      toast.error(t("recentAll.share.failed"), { description: errorMessage(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async () => {
+    if (!current) return;
+    if (await copyText(shareLink(current.shareID))) {
+      setCopied(true);
+      toast.success(t("recentAll.share.copied"));
+      setTimeout(() => setCopied(false), 1800);
+    } else toast.error(t("common.errors.copyFailed"));
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t("recentAll.share.title")}</DialogTitle>
+          <DialogDescription>{t("recentAll.share.description")}</DialogDescription>
+        </DialogHeader>
+        {state.phase === "loading" ? (
+          <div role="status" className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+            <Spinner />
+            {t("common.states.loading")}
+          </div>
+        ) : state.phase === "failed" ? (
+          <div role="alert" className="grid justify-items-start gap-2">
+            <FieldError>{t("recentAll.share.loadFailed")}</FieldError>
+            <Button type="button" variant="outline" size="sm" onClick={() => setAttempt((n) => n + 1)}>
+              {t("common.actions.retry")}
+            </Button>
+          </div>
+        ) : current ? (
+          <div className="grid gap-3">
+            <div className="flex gap-2">
+              <Input readOnly value={shareLink(current.shareID)} aria-label={t("recentAll.share.link")} onFocus={(e) => e.currentTarget.select()} />
+              <Button type="button" variant="outline" size="icon" onClick={() => void copy()} aria-label={t("common.actions.copy")}>
+                {copied ? <Check /> : <Copy />}
+              </Button>
+            </div>
+            <p className="text-[13px] text-muted-foreground">{t("recentAll.share.snapshotNote")}</p>
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" variant="outline" size="sm" loading={busy} onClick={() => void mutate(() => createShare(row.publicID, true))}>
+                <RefreshCw />
+                {t("recentAll.share.regenerate")}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                onClick={() =>
+                  void mutate(async () => {
+                    await revokeShare(row.publicID);
+                    return null;
+                  })
+                }
+              >
+                {t("recentAll.share.stop")}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <Button type="button" loading={busy} onClick={() => void mutate(() => createShare(row.publicID, false))}>
+            <Link2 />
+            {t("recentAll.share.create")}
+          </Button>
+        )}
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+            {t("common.actions.close")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Asks before deleting; the "also delete files" box starts from the user's chat preference. */
+export function DeleteDialog({
+  open,
+  onOpenChange,
+  description,
+  defaultDeleteFiles,
+  pending,
+  onConfirm,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  description: string;
+  defaultDeleteFiles: boolean;
+  pending: boolean;
+  onConfirm: (deleteFiles: boolean) => Promise<void>;
+}) {
+  const t = useT();
+  const [deleteFiles, setDeleteFiles] = useState(defaultDeleteFiles);
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    if (open && !wasOpen.current) setDeleteFiles(defaultDeleteFiles);
+    wasOpen.current = open;
+  }, [open, defaultDeleteFiles]);
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !pending && onOpenChange(next)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t("recentAll.delete.title")}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        <label className="flex items-center gap-2.5 text-sm">
+          <Checkbox checked={deleteFiles} onChange={(e) => setDeleteFiles(e.target.checked)} disabled={pending} />
+          {t("recentAll.delete.alsoFiles")}
+        </label>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
+            {t("common.actions.cancel")}
+          </Button>
+          <Button type="button" variant="destructive" loading={pending} onClick={() => void onConfirm(deleteFiles)}>
+            {pending ? t("recentAll.processing") : t("common.actions.delete")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
