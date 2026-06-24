@@ -126,3 +126,137 @@ export function safeUrl(raw: string): string {
 }
 
 const INLINE = /(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)|!\[([^\]]*)\]\(([^()\s]*(?:\([^()\s]*\)[^()\s]*)*)(?:\s+"[^"]*")?\)|\[([^\]]+)\]\(([^()\s]*(?:\([^()\s]*\)[^()\s]*)*)(?:\s+"[^"]*")?\)|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*\s][^*]*)\*|(?<![\w])_([^_\s][^_]*)_(?![\w])|(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"])|\n/g;
+
+export function parseInline(text: string): Inline[] {
+  const out: Inline[] = [];
+  let last = 0;
+  for (const m of text.matchAll(INLINE)) {
+    const at = m.index ?? 0;
+    if (at > last) out.push({ type: "text", text: text.slice(last, at) });
+    last = at + m[0].length;
+    if (m[0] === "\n") out.push({ type: "br" });
+    else if (m[2] !== undefined) out.push({ type: "code", text: m[2].trim() });
+    else if (m[4] !== undefined) {
+      const src = safeUrl(m[4]);
+      if (src) out.push({ type: "image", src, alt: m[3] ?? "" });
+      else out.push({ type: "text", text: m[3] ?? "" });
+    } else if (m[6] !== undefined) {
+      const href = safeUrl(m[6]);
+      const children = parseInline(m[5] ?? "");
+      out.push(href ? { type: "link", href, children } : { type: "text", text: m[5] ?? "" });
+    } else if (m[7] !== undefined) out.push({ type: "strong", children: parseInline(m[7]) });
+    else if (m[8] !== undefined) out.push({ type: "strong", children: parseInline(m[8]) });
+    else if (m[9] !== undefined) out.push({ type: "del", children: parseInline(m[9]) });
+    else if (m[10] !== undefined) out.push({ type: "em", children: parseInline(m[10]) });
+    else if (m[11] !== undefined) out.push({ type: "em", children: parseInline(m[11]) });
+    else if (m[12] !== undefined) out.push({ type: "link", href: m[12], children: [{ type: "text", text: m[12] }] });
+  }
+  if (last < text.length) out.push({ type: "text", text: text.slice(last) });
+  return out;
+}
+
+function renderInline(nodes: Inline[]): ReactNode {
+  return nodes.map((node, index) => {
+    switch (node.type) {
+      case "text":
+        return <Fragment key={index}>{node.text}</Fragment>;
+      case "br":
+        return <br key={index} />;
+      case "code":
+        return (
+          <code key={index} className="rounded bg-muted px-1 py-0.5 font-mono text-[0.9em]">
+            {node.text}
+          </code>
+        );
+      case "strong":
+        return <strong key={index}>{renderInline(node.children)}</strong>;
+      case "em":
+        return <em key={index}>{renderInline(node.children)}</em>;
+      case "del":
+        return <del key={index}>{renderInline(node.children)}</del>;
+      case "link":
+        return (
+          <a key={index} href={absolutizeApiPath(node.href)} target="_blank" rel="noopener noreferrer" className="text-primary underline underline-offset-2">
+            {renderInline(node.children)}
+          </a>
+        );
+      case "image":
+        return (
+          // eslint-disable-next-line @next/next/no-img-element -- snapshot images come from the share-scoped file endpoint or the web
+          <img key={index} src={absolutizeApiPath(node.src)} alt={node.alt} loading="lazy" className="my-2 max-h-96 max-w-full rounded-lg border" />
+        );
+    }
+  });
+}
+
+function renderBlocks(blocks: Block[]): ReactNode {
+  return blocks.map((block, index) => {
+    switch (block.type) {
+      case "heading": {
+        const size = ["text-xl", "text-lg", "text-base", "text-base", "text-sm", "text-sm"][block.level - 1] ?? "text-base";
+        return (
+          <p key={index} role="heading" aria-level={block.level} className={cn("mt-4 font-semibold first:mt-0", size)}>
+            {renderInline(parseInline(block.text))}
+          </p>
+        );
+      }
+      case "paragraph":
+        return <p key={index}>{renderInline(parseInline(block.text))}</p>;
+      case "code":
+        return (
+          <pre key={index} className="overflow-x-auto rounded-lg border bg-muted/60 p-3 font-mono text-[13px] leading-relaxed">
+            <code data-lang={block.lang || undefined}>{block.text}</code>
+          </pre>
+        );
+      case "quote":
+        return (
+          <blockquote key={index} className="grid gap-2 border-l-2 pl-3 text-muted-foreground">
+            {renderBlocks(block.blocks)}
+          </blockquote>
+        );
+      case "list": {
+        const Tag = block.ordered ? "ol" : "ul";
+        return (
+          <Tag key={index} className={cn("grid gap-1 pl-5", block.ordered ? "list-decimal" : "list-disc")}>
+            {block.items.map((item, n) => (
+              <li key={n}>{renderInline(parseInline(item))}</li>
+            ))}
+          </Tag>
+        );
+      }
+      case "table":
+        return (
+          <div key={index} className="overflow-x-auto">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr>
+                  {block.head.map((cell, n) => (
+                    <th key={n} className="border-b px-3 py-1.5 text-left font-semibold">
+                      {renderInline(parseInline(cell))}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {block.rows.map((row, r) => (
+                  <tr key={r}>
+                    {row.map((cell, n) => (
+                      <td key={n} className="border-b px-3 py-1.5 align-top">
+                        {renderInline(parseInline(cell))}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      case "rule":
+        return <hr key={index} className="my-2 border-border" />;
+    }
+  });
+}
+
+export function MiniMarkdown({ source, className }: { source: string; className?: string }) {
+  return <div className={cn("grid gap-3 break-words text-[15px] leading-relaxed", className)}>{renderBlocks(parseBlocks(source))}</div>;
+}
