@@ -133,3 +133,143 @@ func (s *Service) StoreVector(ctx context.Context, userID uint, key, expectedVal
 	}
 	return s.store.setVector(ctx, userID, strings.TrimSpace(key), expectedValue, vector, clip(signature, maxSignatureChars))
 }
+
+// Search returns the user's entries closest to the query vector, best first, at
+// most topK, each with cosine similarity at least minSimilarity. Only vectors
+// stored under the same signature are considered. Timestamps are not filled.
+func (s *Service) Search(ctx context.Context, userID uint, query []float32, signature string, topK int, minSimilarity float64) ([]Entry, error) {
+	signature = strings.TrimSpace(signature)
+	if len(query) == 0 || signature == "" || topK <= 0 || !finiteVector(query) {
+		return []Entry{}, nil
+	}
+	out, err := s.store.search(ctx, userID, query, clip(signature, maxSignatureChars), topK, minSimilarity)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []Entry{}
+	}
+	return out, nil
+}
+
+// PurgeUser hard-deletes all memory rows and vectors of a user, including
+// soft-deleted rows. Use it when the account is permanently removed.
+func (s *Service) PurgeUser(ctx context.Context, userID uint) error {
+	return s.PurgeUserTx(s.store.db.WithContext(ctx), userID)
+}
+
+// PurgeUserTx is PurgeUser inside a caller-owned transaction.
+func (s *Service) PurgeUserTx(tx *gorm.DB, userID uint) error {
+	if err := s.store.purgeUser(tx, userID); err != nil {
+		return err
+	}
+	s.cache.invalidate(userID)
+	return nil
+}
+
+func (s *Service) changed(userID uint) {
+	s.cache.invalidate(userID)
+	if s.opts.OnChange != nil {
+		s.opts.OnChange(userID)
+	}
+}
+
+// indexAsync generates the vector for a freshly written entry. Failures are
+// swallowed: the entry stays valid as text and recall falls back to keywords.
+func (s *Service) indexAsync(ctx context.Context, userID uint, key, value string) {
+	if s.embed == nil || !s.embed.Enabled() || key == "" || value == "" {
+		return
+	}
+	work := func(bg context.Context) {
+		bg, cancel := context.WithTimeout(context.WithoutCancel(bg), embedTimeout)
+		defer cancel()
+		vec, sig, err := s.embed.Embed(bg, value)
+		if err != nil || len(vec) == 0 {
+			s.log.Debug("memory_embed_skipped", logx.F("user_id", userID))
+			return
+		}
+		if err := s.StoreVector(bg, userID, key, value, vec, sig); err != nil {
+			s.log.Debug("memory_vector_store_failed", logx.F("user_id", userID))
+		}
+	}
+	if s.detach != nil {
+		s.detach(ctx, "memory-embed", embedTimeout, work)
+		return
+	}
+	// Without a lifecycle-managed detacher the work still must not delay the
+	// caller or die with the request.
+	go work(context.WithoutCancel(ctx))
+}
+
+// clip cuts s to at most n characters.
+func clip(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:n])
+}
+
+type cacheItem struct {
+	entries []Entry
+	expires time.Time
+}
+
+// chatCache keeps one list per user for a few minutes. A generation counter,
+// bumped by every invalidation, stops a load that raced with a write from
+// storing stale data.
+type chatCache struct {
+	mu    sync.Mutex
+	clk   clock.Clock
+	ttl   time.Duration
+	items map[uint]cacheItem
+	gen   uint64
+}
+
+func newChatCache(clk clock.Clock, ttl time.Duration) *chatCache {
+	return &chatCache{clk: clk, ttl: ttl, items: map[uint]cacheItem{}}
+}
+
+func (c *chatCache) get(userID uint, load func() ([]Entry, error)) ([]Entry, error) {
+	now := c.clk.Now()
+	c.mu.Lock()
+	if it, ok := c.items[userID]; ok && now.Before(it.expires) {
+		out := append([]Entry(nil), it.entries...)
+		c.mu.Unlock()
+		return out, nil
+	}
+	gen := c.gen
+	c.mu.Unlock()
+
+	entries, err := load()
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.gen == gen {
+		c.items[userID] = cacheItem{entries: append([]Entry(nil), entries...), expires: now.Add(c.ttl)}
+	}
+	c.mu.Unlock()
+	return entries, nil
+}
+
+func (c *chatCache) invalidate(userID uint) {
+	c.mu.Lock()
+	delete(c.items, userID)
+	c.gen++
+	c.mu.Unlock()
+}
+
+func (c *chatCache) sweep() int {
+	now := c.clk.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for id, it := range c.items {
+		if !now.Before(it.expires) {
+			delete(c.items, id)
+			n++
+		}
+	}
+	return n
+}
