@@ -209,3 +209,196 @@ func (m *catalogManager) status(ctx context.Context) CatalogStatus {
 	}
 	return st
 }
+
+// maybeRefresh starts a background refresh when the catalog is stale and no
+// recent attempt was made.
+func (m *catalogManager) maybeRefresh(ctx context.Context) {
+	if m.fetcher == nil {
+		return
+	}
+	now := m.svc.now()
+	m.mu.Lock()
+	stale := m.view == nil || now.Sub(m.fetchedAt) > catalogStaleAfter
+	due := m.lastAttempt.IsZero() || now.Sub(m.lastAttempt) > catalogRetryAfter
+	if m.refreshing || !stale || !due {
+		m.mu.Unlock()
+		return
+	}
+	m.refreshing = true
+	m.lastAttempt = now
+	m.mu.Unlock()
+	m.svc.life.Detach(ctx, "llm-catalog-refresh", catalogRefreshTO, func(dctx context.Context) {
+		if err := m.fetchAndApply(dctx); err != nil {
+			m.svc.log.Warn("llm_catalog_refresh_failed", logx.Err(err))
+		}
+	})
+}
+
+// refresh performs a synchronous refresh.
+func (m *catalogManager) refresh(ctx context.Context) error {
+	if m.fetcher == nil {
+		m.setError(errors.New("no catalog fetcher configured"))
+		return ErrCatalogFetchFailed
+	}
+	m.mu.Lock()
+	m.refreshing = true
+	m.lastAttempt = m.svc.now()
+	m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, catalogRefreshTO)
+	defer cancel()
+	if err := m.fetchAndApply(ctx); err != nil {
+		return ErrCatalogFetchFailed.WithCause(err)
+	}
+	return nil
+}
+
+func (m *catalogManager) setError(err error) {
+	msg := err.Error()
+	if len(msg) > 500 {
+		msg = msg[:500]
+	}
+	m.mu.Lock()
+	m.lastError = msg
+	m.mu.Unlock()
+}
+
+// fetchAndApply downloads, parses and installs the catalog. Concurrent fetches
+// are serialized.
+func (m *catalogManager) fetchAndApply(ctx context.Context) (err error) {
+	m.fetchMu.Lock()
+	defer m.fetchMu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.refreshing = false
+		m.mu.Unlock()
+		if err != nil {
+			m.setError(err)
+		}
+	}()
+	raw, err := m.fetcher.Fetch(ctx)
+	if err != nil {
+		return err
+	}
+	entries, err := parseModelsDev(raw)
+	if err != nil {
+		return err
+	}
+	snap := &catalogSnapshot{Version: snapshotVersion, Source: "models.dev", Origin: "remote",
+		FetchedAt: m.svc.now().UTC(), Models: entries}
+	if werr := m.writeStored(snap); werr != nil {
+		m.svc.log.Warn("llm_catalog_write_failed", logx.Err(werr))
+	}
+	m.apply(snap, "remote")
+	m.mu.Lock()
+	m.lastError = ""
+	m.mu.Unlock()
+	return nil
+}
+
+// EncodeCatalogSnapshot converts a models.dev api.json document into the gzip
+// snapshot form shipped inside the binary. It refuses to produce fewer than
+// MinSnapshotEntries entries. It backs the `catalog-snapshot` command.
+func EncodeCatalogSnapshot(apiJSON []byte, fetchedAt time.Time) ([]byte, int, error) {
+	entries, err := parseModelsDev(apiJSON)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(entries) < MinSnapshotEntries {
+		return nil, len(entries), errors.New("catalog snapshot has too few entries")
+	}
+	data, err := encodeSnapshot(catalogSnapshot{Source: "models.dev", Origin: "builtin", FetchedAt: fetchedAt.UTC(), Models: entries}, true)
+	return data, len(entries), err
+}
+
+// ---- resolution (admin form helper) -----------------------------------------------
+
+// CatalogResolution is the answer of POST /admin/llm/model-catalog/resolve.
+type CatalogResolution struct {
+	Matched           bool                `json:"matched"`
+	Provider          *string             `json:"provider"`
+	ModelID           *string             `json:"modelId"`
+	InputModalities   []string            `json:"inputModalities"`
+	OutputModalities  []string            `json:"outputModalities"`
+	ContextWindow     *int                `json:"contextWindow"`
+	Reasoning         *ResolvedReasoning  `json:"reasoning"`
+	ReasoningTemplate *ReasoningTemplateV `json:"reasoningTemplate"`
+}
+
+// ResolvedReasoning is the reasoning a model would get ignoring any explicit
+// declaration.
+type ResolvedReasoning struct {
+	Format  string   `json:"format"`
+	Levels  []string `json:"levels"`
+	Default string   `json:"default"`
+	Source  string   `json:"source"`
+}
+
+// ReasoningTemplateV is the admin form template of a reasoning declaration.
+type ReasoningTemplateV struct {
+	Format  string         `json:"format"`
+	Levels  []string       `json:"levels"`
+	Budgets map[string]int `json:"budgets"`
+}
+
+// CatalogStatus returns the status and nudges a refresh when stale.
+func (s *Service) CatalogStatus(ctx context.Context) CatalogStatus { return s.catalog.status(ctx) }
+
+// RefreshCatalog performs a synchronous refresh.
+func (s *Service) RefreshCatalog(ctx context.Context) (CatalogStatus, error) {
+	err := s.catalog.refresh(ctx)
+	st := s.catalog.status(ctx)
+	return st, err
+}
+
+// ResolveCatalog matches a model against the catalog. It never fails for
+// unknown models.
+func (s *Service) ResolveCatalog(ctx context.Context, req resolveCatalogReq) CatalogResolution {
+	s.catalog.maybeRefresh(ctx)
+	out := CatalogResolution{InputModalities: []string{}, OutputModalities: []string{}}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return out
+	}
+	view := s.catalog.current()
+	vendor := lower(req.Vendor)
+	if v := canonicalVendor(vendor); v != "" {
+		vendor = v
+	}
+	pkeys := protocolKeys(req.Protocols)
+	mod := view.matchModality(name, vendor, pkeys)
+	rea := view.matchReasoning(name, vendor, pkeys)
+	if mod != nil || rea != nil {
+		out.Matched = true
+		head := mod
+		if head == nil {
+			head = rea
+		}
+		out.Provider, out.ModelID = ptr(head.Provider), ptr(head.ID)
+	}
+	if mod != nil {
+		out.InputModalities = append([]string{}, mod.Inputs...)
+		out.OutputModalities = append([]string{}, mod.Outputs...)
+		if mod.Context >= minContextWindow && mod.Context <= maxContextWindow {
+			out.ContextWindow = ptr(mod.Context)
+		}
+	}
+	caps := parseCapsLenient(req.CapabilitiesJSON)
+	ignoring := capsMap{}
+	for k, v := range caps {
+		if k != "reasoning" {
+			ignoring[k] = v
+		}
+	}
+	if c := resolveReasoning(ignoring, req.Protocols, vendor, rea); c != nil {
+		out.Reasoning = &ResolvedReasoning{Format: c.Format, Levels: c.Levels, Default: c.Default, Source: c.Source}
+	}
+	effective := resolveReasoning(caps, req.Protocols, vendor, rea)
+	if t := buildReasoningTemplate(effective, rea, req.Protocols, vendor); t != nil {
+		levels := t.Levels
+		if levels == nil {
+			levels = []string{}
+		}
+		out.ReasoningTemplate = &ReasoningTemplateV{Format: t.Format, Levels: levels, Budgets: t.Budgets}
+	}
+	return out
+}
