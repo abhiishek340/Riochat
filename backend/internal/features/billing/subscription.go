@@ -248,3 +248,301 @@ func normalizeInterval(v string) string {
 	}
 	return IntervalMonth
 }
+
+// SubscribeFree activates a zero-priced price for the user.
+func (s *Service) SubscribeFree(ctx context.Context, userID, priceID uint, cycles int) (*Subscription, error) {
+	if cycles < 1 {
+		cycles = 1
+	}
+	var price Price
+	if err := s.db.WithContext(ctx).First(&price, priceID).Error; err != nil {
+		if database.IsNotFound(err) {
+			return nil, ErrPlanNotFound
+		}
+		return nil, err
+	}
+	var plan Plan
+	if err := s.db.WithContext(ctx).First(&plan, price.PlanID).Error; err != nil {
+		if database.IsNotFound(err) {
+			return nil, ErrPlanNotFound
+		}
+		return nil, err
+	}
+	if !price.IsActive || !plan.IsActive {
+		return nil, ErrPlanNotFound
+	}
+	if price.AmountCents > 0 {
+		return nil, ErrPaymentRequired.WithStatus(http.StatusBadRequest)
+	}
+	now := s.now()
+	var created Subscription
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if plan.Code == PlanFree {
+			plans, err := s.loadPlansByID(ctx, tx)
+			if err != nil {
+				return err
+			}
+			var active []Subscription
+			if err := tx.Where("user_id = ? AND status = ?", userID, SubActive).Find(&active).Error; err != nil {
+				return err
+			}
+			for _, sub := range active {
+				p := plans[sub.PlanID]
+				if p.Code != PlanFree && (sub.CurrentPeriodEndAt == nil || sub.CurrentPeriodEndAt.After(now)) {
+					return ErrEntitlementActive
+				}
+			}
+		}
+		interval := normalizeInterval(price.BillingInterval)
+		end, finite := addInterval(now, interval, cycles)
+		created = Subscription{UserID: userID, PlanID: plan.ID, PriceID: price.ID, Status: SubActive, StartAt: now,
+			CurrentPeriodStartAt: now, AutoRenew: finite}
+		if finite {
+			created.CurrentPeriodEndAt = utcPtr(end)
+		}
+		return replaceActiveSubscriptions(tx, userID, now, &created)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &created, nil
+}
+
+// replaceActiveSubscriptions expires every active subscription of the user and
+// inserts next.
+func replaceActiveSubscriptions(tx *gorm.DB, userID uint, now time.Time, next *Subscription) error {
+	if err := tx.Model(&Subscription{}).Where("user_id = ? AND status = ?", userID, SubActive).
+		Updates(map[string]any{"status": SubExpired, "auto_renew": false, "current_period_end_at": now}).Error; err != nil {
+		return err
+	}
+	return database.Translate(tx.Create(next).Error)
+}
+
+// AssignUserPlan sets a user's plan by code (administrator action). An empty
+// code means the free plan. Non-free plans need an expiry in the future.
+func (s *Service) AssignUserPlan(ctx context.Context, userID uint, planCode string, expiresAt *time.Time) error {
+	if s.currentMode(ctx) != ModePeriod {
+		return ErrPaymentRequired
+	}
+	if planCode == "" {
+		planCode = PlanFree
+	}
+	var plan Plan
+	if err := s.db.WithContext(ctx).Where("code = ? AND is_active = ?", planCode, true).First(&plan).Error; err != nil {
+		if database.IsNotFound(err) {
+			return ErrInvalidSubscriptionTier
+		}
+		return err
+	}
+	price, err := s.defaultPrice(ctx, s.db, plan.ID, true)
+	if err != nil {
+		return err
+	}
+	if price == nil {
+		return ErrInvalidSubscriptionTier
+	}
+	now := s.now()
+	sub := Subscription{UserID: userID, PlanID: plan.ID, PriceID: price.ID, Status: SubActive, StartAt: now, CurrentPeriodStartAt: now}
+	if plan.Code == PlanFree {
+		sub.AutoRenew = normalizeInterval(price.BillingInterval) != IntervalLifetime
+	} else {
+		if expiresAt == nil {
+			return ErrSubscriptionExpiryReq
+		}
+		if !expiresAt.After(now) {
+			return ErrInvalidSubscriptionExp
+		}
+		sub.CurrentPeriodEndAt = utcPtr(*expiresAt)
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return replaceActiveSubscriptions(tx, userID, now, &sub)
+	})
+}
+
+// defaultPrice returns the plan's active default price; with fallback it
+// returns the cheapest active price when no default exists.
+func (s *Service) defaultPrice(ctx context.Context, db *gorm.DB, planID uint, fallback bool) (*Price, error) {
+	var price Price
+	err := db.WithContext(ctx).Where("plan_id = ? AND is_active = ? AND is_default = ?", planID, true, true).Order("id").First(&price).Error
+	if err == nil {
+		return &price, nil
+	}
+	if !database.IsNotFound(err) {
+		return nil, err
+	}
+	if !fallback {
+		return nil, nil
+	}
+	err = db.WithContext(ctx).Where("plan_id = ? AND is_active = ?", planID, true).Order("amount_cents ASC, id ASC").First(&price).Error
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &price, nil
+}
+
+// grantTime places dur of plan on the user's entitlement timeline starting at
+// at, inside tx. It returns the stored subscription carrying the new time.
+func (s *Service) grantTime(tx *gorm.DB, userID uint, plan Plan, price Price, dur time.Duration, at time.Time) (*Subscription, error) {
+	if dur <= 0 {
+		return nil, ErrInvalidOrder
+	}
+	var existing []Subscription
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ? AND status = ? AND current_period_end_at IS NOT NULL AND current_period_end_at > ?", userID, SubActive, at).
+		Find(&existing).Error; err != nil {
+		return nil, err
+	}
+	var plans []Plan
+	if err := tx.Find(&plans).Error; err != nil {
+		return nil, err
+	}
+	pm := make(map[uint]Plan, len(plans))
+	for _, p := range plans {
+		pm[p.ID] = p
+	}
+	segs := make([]tlSeg, 0, len(existing))
+	rows := map[uint]Subscription{}
+	for _, e := range existing {
+		rows[e.ID] = e
+		segs = append(segs, tlSeg{Src: e.ID, PlanID: e.PlanID, PriceID: e.PriceID, Rank: planRank(pm[e.PlanID]),
+			Start: e.CurrentPeriodStartAt, End: *e.CurrentPeriodEndAt, AutoRenew: e.AutoRenew})
+	}
+	result := placeOnTimeline(segs, at, tlGrant{PlanID: plan.ID, PriceID: price.ID, Rank: planRank(plan), Dur: dur})
+
+	used := map[uint]bool{}
+	var firstNew *Subscription
+	persist := func(seg tlSeg) (*Subscription, error) {
+		if seg.Src != 0 && !used[seg.Src] {
+			used[seg.Src] = true
+			row := rows[seg.Src]
+			row.StartAt, row.CurrentPeriodStartAt = seg.Start, seg.Start
+			row.CurrentPeriodEndAt = utcPtr(seg.End)
+			row.PlanID, row.PriceID, row.AutoRenew = seg.PlanID, seg.PriceID, seg.AutoRenew
+			if err := tx.Save(&row).Error; err != nil {
+				return nil, err
+			}
+			return &row, nil
+		}
+		row := Subscription{UserID: userID, PlanID: seg.PlanID, PriceID: seg.PriceID, Status: SubActive,
+			StartAt: seg.Start, CurrentPeriodStartAt: seg.Start, CurrentPeriodEndAt: utcPtr(seg.End), AutoRenew: seg.AutoRenew}
+		if err := tx.Create(&row).Error; err != nil {
+			return nil, err
+		}
+		return &row, nil
+	}
+	for _, seg := range result {
+		row, err := persist(seg)
+		if err != nil {
+			return nil, err
+		}
+		if seg.PlanID == plan.ID && seg.End.After(at) && (firstNew == nil || row.CurrentPeriodStartAt.Before(firstNew.CurrentPeriodStartAt)) {
+			firstNew = row
+		}
+	}
+	for _, e := range existing {
+		if used[e.ID] {
+			continue
+		}
+		end := minTime(maxTime(at, e.CurrentPeriodStartAt), *e.CurrentPeriodEndAt)
+		if err := tx.Model(&Subscription{}).Where("id = ?", e.ID).Updates(map[string]any{
+			"status": SubExpired, "auto_renew": false, "cancel_at_period_end": false, "current_period_end_at": end.UTC(),
+		}).Error; err != nil {
+			return nil, err
+		}
+	}
+	if firstNew == nil {
+		return nil, errors.New("billing: grant produced no segment")
+	}
+	return firstNew, nil
+}
+
+// SubscriptionView is the API form of a subscription.
+type SubscriptionView struct {
+	ID                   uint       `json:"id"`
+	UserID               uint       `json:"userID"`
+	PlanID               uint       `json:"planID"`
+	PriceID              uint       `json:"priceID"`
+	Status               string     `json:"status"`
+	StartAt              time.Time  `json:"startAt"`
+	CurrentPeriodStartAt time.Time  `json:"currentPeriodStartAt"`
+	CurrentPeriodEndAt   *time.Time `json:"currentPeriodEndAt"`
+	CancelAtPeriodEnd    bool       `json:"cancelAtPeriodEnd"`
+	AutoRenew            bool       `json:"autoRenew"`
+}
+
+func subscriptionView(sub Subscription) SubscriptionView {
+	return SubscriptionView{ID: sub.ID, UserID: sub.UserID, PlanID: sub.PlanID, PriceID: sub.PriceID, Status: sub.Status,
+		StartAt: sub.StartAt, CurrentPeriodStartAt: sub.CurrentPeriodStartAt, CurrentPeriodEndAt: sub.CurrentPeriodEndAt,
+		CancelAtPeriodEnd: sub.CancelAtPeriodEnd, AutoRenew: sub.AutoRenew}
+}
+
+// EntitlementView is one queued entitlement in the overview.
+type EntitlementView struct {
+	SubscriptionView
+	Plan      *PlanView `json:"plan"`
+	IsCurrent bool      `json:"isCurrent"`
+}
+
+// entitlementQueue builds the merged queue of non-free active entitlements.
+func (s *Service) entitlementQueue(ctx context.Context, userID uint) ([]EntitlementView, error) {
+	plans, err := s.loadPlansByID(ctx, s.db)
+	if err != nil {
+		return nil, err
+	}
+	var subs []Subscription
+	if err := s.db.WithContext(ctx).Where("user_id = ? AND status = ?", userID, SubActive).Find(&subs).Error; err != nil {
+		return nil, err
+	}
+	now := s.now()
+	cur, _, hasCur := currentOf(subs, plans, now)
+	var list []Subscription
+	for _, sub := range subs {
+		p := plans[sub.PlanID]
+		if p.Code == PlanFree || (sub.CurrentPeriodEndAt != nil && !sub.CurrentPeriodEndAt.After(now)) {
+			continue
+		}
+		list = append(list, sub)
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		a, b := list[i], list[j]
+		if !a.CurrentPeriodStartAt.Equal(b.CurrentPeriodStartAt) {
+			return a.CurrentPeriodStartAt.Before(b.CurrentPeriodStartAt)
+		}
+		ra, rb := planRank(plans[a.PlanID]), planRank(plans[b.PlanID])
+		if ra != rb {
+			return ra > rb
+		}
+		return a.ID < b.ID
+	})
+	var merged []EntitlementView
+	for _, sub := range list {
+		isCur := hasCur && sub.ID == cur.ID
+		if n := len(merged); n > 0 {
+			last := &merged[n-1]
+			if last.PlanID == sub.PlanID && last.PriceID == sub.PriceID && last.CurrentPeriodEndAt != nil &&
+				!sub.CurrentPeriodStartAt.After(*last.CurrentPeriodEndAt) {
+				if sub.CurrentPeriodEndAt == nil || sub.CurrentPeriodEndAt.After(*last.CurrentPeriodEndAt) {
+					last.CurrentPeriodEndAt = sub.CurrentPeriodEndAt
+				}
+				last.IsCurrent = last.IsCurrent || isCur
+				continue
+			}
+		}
+		v := EntitlementView{SubscriptionView: subscriptionView(sub), IsCurrent: isCur}
+		merged = append(merged, v)
+	}
+	for i := range merged {
+		pv, err := s.planView(ctx, plans[merged[i].PlanID])
+		if err != nil {
+			return nil, err
+		}
+		merged[i].Plan = pv
+	}
+	if merged == nil {
+		merged = []EntitlementView{}
+	}
+	return merged, nil
+}
