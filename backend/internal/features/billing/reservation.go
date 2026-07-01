@@ -202,3 +202,204 @@ func (s *Service) ReleaseReservation(ctx context.Context, userID uint, refNo str
 		Where("user_id = ? AND ref_no = ? AND status = ?", userID, refNo, ResActive).
 		Updates(map[string]any{"status": ResReleased, "released_at": s.now()}).Error
 }
+
+// RenewReservation extends the lease of a live reservation.
+func (s *Service) RenewReservation(ctx context.Context, userID uint, refNo string) error {
+	now := s.now()
+	res := s.db.WithContext(ctx).Model(&UsageReservation{}).
+		Where("user_id = ? AND ref_no = ? AND status = ? AND expires_at > ?", userID, refNo, ResActive, now).
+		Update("expires_at", now.Add(reservationLease))
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrReservationConflict
+	}
+	return nil
+}
+
+// MarkReconciliation flags a reservation whose upstream cost could not be
+// settled. Such a reservation keeps blocking budget and a slot until handled
+// operationally.
+func (s *Service) MarkReconciliation(ctx context.Context, userID uint, refNo, failureCode string) error {
+	if len(failureCode) > 64 {
+		failureCode = failureCode[:64]
+	}
+	now := s.now()
+	res := s.db.WithContext(ctx).Model(&UsageReservation{}).
+		Where("user_id = ? AND ref_no = ? AND status IN ?", userID, refNo, []string{ResActive, ResReconciliation}).
+		Updates(map[string]any{"status": ResReconciliation, "failure_code": failureCode, "reconciliation_at": now})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrReservationConflict
+	}
+	return nil
+}
+
+// Authorize decides, before the upstream call, whether the user may spend on
+// the model and reserves budget for the run.
+func (s *Service) Authorize(ctx context.Context, userID uint, platformModel, runID string) (*Authorization, error) {
+	rs, err := s.loadSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	refNo := strings.TrimSpace(runID)
+	auth := &Authorization{UserID: userID, Mode: rs.Mode, RefNo: refNo}
+	if rs.Mode != ModeUsage && rs.Mode != ModePeriod {
+		return auth, nil
+	}
+	if personalModelRef(platformModel) {
+		auth.Personal = true
+	} else {
+		spec, err := s.priceFor(ctx, platformModel)
+		if err != nil {
+			return nil, err
+		}
+		if spec == nil {
+			return nil, ErrPricingRequired
+		}
+		if spec.IsFree {
+			auth.Free = true
+			return auth, nil
+		}
+		if spec.Mode == PricingDuration && !s.confirmsVideo(ctx, platformModel) {
+			return nil, ErrPricingRequired
+		}
+	}
+	if refNo == "" {
+		return nil, errors.New("billing: a run reference is required to reserve budget")
+	}
+	if rs.prepaidErr != nil {
+		return nil, rs.prepaidErr
+	}
+	var w *periodWindow
+	if rs.Mode == ModePeriod {
+		plan, err := s.effectivePlan(ctx, s.db, userID)
+		if err != nil {
+			return nil, err
+		}
+		start, end := s.monthWindow(s.now())
+		w = &periodWindow{Limit: plan.PeriodCreditNanousd, Start: start.UTC(), End: end.UTC()}
+	}
+	r, err := s.reserve(ctx, userID, refNo, rs.Mode, rs.PrepaidAmountNanousd, w)
+	if err != nil {
+		return nil, err
+	}
+	auth.Reservation = r
+	return auth, nil
+}
+
+func (s *Service) confirmsVideo(ctx context.Context, model string) bool {
+	if s.ports.Models == nil {
+		return false
+	}
+	info, ok, err := s.ports.Models.Model(ctx, strings.TrimSpace(model))
+	return err == nil && ok && info.SupportsVideo
+}
+
+// EstimateInput describes the next upstream call for budget estimation.
+type EstimateInput struct {
+	PlatformModelName string
+	ProviderProtocol  string
+	CacheTimeout      string
+	RequestSpeed      string
+	UsageSpeed        string
+	RequestTier       string
+	UsageTier         string
+	InputTokens       int64
+	CacheReadTokens   int64
+	CacheWriteTokens  int64
+	// OutputTokens is the output already billed in earlier calls of the run.
+	OutputTokens int64
+	// MaxOutputTokens is the request's explicit output limit (0 = unbounded).
+	MaxOutputTokens int64
+	Calls           int64
+	DurationSeconds int64
+	// BilledSoFar is the amount already incurred by earlier calls of the run.
+	BilledSoFar int64
+}
+
+// EstimateCost prices the worst case of the next call (0 for free, unpriced
+// or unmetered runs).
+func (s *Service) EstimateCost(ctx context.Context, auth *Authorization, in EstimateInput) (int64, error) {
+	if auth == nil || (auth.Mode != ModeUsage && auth.Mode != ModePeriod) || auth.Free || auth.Personal {
+		return 0, nil
+	}
+	spec, err := s.priceFor(ctx, in.PlatformModelName)
+	if err != nil || spec == nil || spec.IsFree {
+		return 0, err
+	}
+	now := s.now()
+	speed := billingSpeed(in.ProviderProtocol, in.UsageSpeed, in.RequestSpeed)
+	tier := billingTier(in.ProviderProtocol, in.UsageTier)
+	mult := composeMultiplier(baseRatio(in.ProviderProtocol, speed, tier, in.PlatformModelName, ""),
+		s.groupRate(ctx, auth.UserID, in.PlatformModelName, s.extraGroupOf(ctx, auth.UserID)), spec.scheduleAt(now, s.loc))
+	mc, err := priceUsage(*spec, usageCounts{Input: in.InputTokens, CacheRead: in.CacheReadTokens, CacheWrite: in.CacheWriteTokens,
+		Output: in.OutputTokens + in.MaxOutputTokens, Calls: maxI64(in.Calls, 1), Seconds: in.DurationSeconds},
+		in.ProviderProtocol, in.CacheTimeout, mult.Total)
+	if err != nil {
+		return 0, err
+	}
+	return satAdd(in.BilledSoFar, mc.Total), nil
+}
+
+// EnsureBudget raises the run's reservation to cover the estimate. A failure is
+// reported as insufficient funds so the run stops before any upstream spend.
+func (s *Service) EnsureBudget(ctx context.Context, auth *Authorization, in EstimateInput) error {
+	if auth == nil || auth.Reservation == nil {
+		return nil
+	}
+	est, err := s.EstimateCost(ctx, auth, in)
+	if err != nil {
+		return err
+	}
+	if est <= satAdd(auth.Reservation.BalanceNanousd, auth.Reservation.PeriodCreditNanousd) {
+		return nil
+	}
+	if err := s.RaiseReservation(ctx, auth.UserID, auth.RefNo, est); err != nil {
+		if errors.Is(err, ErrInsufficientFunds) || errors.Is(err, ErrReservationConflict) {
+			return ErrInsufficientFunds
+		}
+		return err
+	}
+	return nil
+}
+
+// MaxOutputTokens extracts the explicit output limit from request options.
+func MaxOutputTokens(options map[string]any) int64 {
+	pick := func(m map[string]any, keys ...string) int64 {
+		for _, k := range keys {
+			switch v := m[k].(type) {
+			case float64:
+				if v > 0 {
+					return int64(v)
+				}
+			case int:
+				if v > 0 {
+					return int64(v)
+				}
+			case int64:
+				if v > 0 {
+					return v
+				}
+			}
+		}
+		return 0
+	}
+	if n := pick(options, "max_output_tokens", "max_completion_tokens", "max_tokens", "maxOutputTokens"); n > 0 {
+		return n
+	}
+	if g, ok := options["generationConfig"].(map[string]any); ok {
+		if n := pick(g, "maxOutputTokens"); n > 0 {
+			return n
+		}
+	}
+	if g, ok := options["generation_config"].(map[string]any); ok {
+		if n := pick(g, "max_output_tokens"); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
