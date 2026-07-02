@@ -527,3 +527,274 @@ func validateControlsDeclaration(caps capsMap) error {
 }
 
 // ---- effective controls ------------------------------------------------------
+
+func levelLabel(l string) string {
+	if l == "" {
+		return ""
+	}
+	if l == "xhigh" {
+		return "Extra high"
+	}
+	return strings.ToUpper(l[:1]) + l[1:]
+}
+
+func controlApplies(c *Control, pkeys []string) bool {
+	if len(c.Protocols) == 0 || len(pkeys) == 0 {
+		return true
+	}
+	for _, p := range c.Protocols {
+		if containsString(pkeys, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// effectiveControls assembles the controls of a model: the generated reasoning
+// control, the explicit controls and the controls compiled from legacy option
+// controls. Hidden controls are omitted unless includeHidden is set.
+func effectiveControls(caps capsMap, reasoning *ReasoningCapability, protocols []string, includeHidden bool) []*Control {
+	pkeys := protocolKeys(protocols)
+	explicit, err := parseControls(caps)
+	if err != nil {
+		explicit = nil // invalid stored controls never break the catalog
+	}
+	locked := lockedPaths(caps)
+
+	var out []*Control
+	covered := map[string]bool{}
+	var override *Control
+	for _, c := range explicit {
+		if c.Kind == "reasoning" {
+			override = c
+		}
+	}
+
+	if reasoning != nil {
+		g := &Control{ID: "reasoning", Kind: "reasoning", Type: "select", Label: "Reasoning", Icon: "brain",
+			Placement: "toolbar", Locked: reasoning.Locked, Protocols: []string{}}
+		for _, l := range reasoning.Levels {
+			g.Options = append(g.Options, ControlOption{Value: l, Label: levelLabel(l)})
+		}
+		g.Default = ptr(reasoning.Default)
+		if reasoning.Source == srcCatalog && !reasoning.Locked {
+			g.Options = append([]ControlOption{{Value: "auto", Label: "Auto"}}, g.Options...)
+			g.Default = ptr("auto")
+		}
+		if override != nil {
+			if override.Label != "" {
+				g.Label = override.Label
+			}
+			if override.Description != "" {
+				g.Description = override.Description
+			}
+			if override.Icon != "" {
+				g.Icon = override.Icon
+			}
+			g.Placement = override.Placement
+			g.Locked = g.Locked || override.Locked
+			g.hidden = override.hidden
+			g.Protocols = override.Protocols
+			if len(override.Options) > 0 {
+				var kept []ControlOption
+				for _, o := range g.Options {
+					for _, want := range override.Options {
+						if want.Value == o.Value {
+							if want.Label != "" {
+								o.Label = want.Label
+							}
+							if want.Description != "" {
+								o.Description = want.Description
+							}
+							kept = append(kept, o)
+						}
+					}
+				}
+				if len(kept) > 0 {
+					g.Options = kept
+					if g.Default == nil || !hasOption(kept, *g.Default) {
+						g.Default = ptr(kept[0].Value)
+					}
+				}
+			}
+		}
+		if g.Locked {
+			// A locked control shows only its default.
+			var only []ControlOption
+			for _, o := range g.Options {
+				if g.Default != nil && o.Value == *g.Default {
+					only = append(only, o)
+				}
+			}
+			if len(only) > 0 {
+				g.Options = only
+			}
+		}
+		out = append(out, g)
+		covered["reasoning"] = true
+	}
+
+	for _, c := range explicit {
+		if c.Kind == "reasoning" {
+			continue
+		}
+		covered[c.ID] = true
+		if c.path != "" {
+			covered[c.path] = true
+		}
+		for _, o := range c.Options {
+			collectPatchPaths(o.patch, "", covered)
+		}
+		for _, o := range []ControlOption{c.on, c.off} {
+			collectPatchPaths(o.patch, "", covered)
+		}
+		if !controlApplies(c, pkeys) {
+			continue
+		}
+		out = append(out, c)
+	}
+
+	// Legacy option controls.
+	owned := ownedReasoningPaths()
+	if legacy, ok := caps["optionControls"].([]any); ok {
+		defaults := caps.object("defaultOptions")
+		for _, le := range legacy {
+			lm, ok := le.(map[string]any)
+			if !ok {
+				continue
+			}
+			path := strOf(lm["path"])
+			if path == "" || !controlIDRe.MatchString(path) || forbiddenControlPath(path) || covered[path] || owned[path] {
+				continue
+			}
+			c := compileLegacy(lm, path, defaults)
+			if c == nil {
+				continue
+			}
+			c.Locked = locked[path]
+			covered[path] = true
+			out = append(out, c)
+		}
+	}
+
+	if includeHidden {
+		return out
+	}
+	vis := out[:0:0]
+	for _, c := range out {
+		if !c.hidden {
+			vis = append(vis, c)
+		}
+	}
+	return vis
+}
+
+func hasOption(opts []ControlOption, v string) bool {
+	for _, o := range opts {
+		if o.Value == v {
+			return true
+		}
+	}
+	return false
+}
+
+func collectPatchPaths(m map[string]any, prefix string, into map[string]bool) {
+	for k, v := range m {
+		p := k
+		if prefix != "" {
+			p = prefix + "." + k
+		}
+		into[p] = true
+		if sub, ok := v.(map[string]any); ok {
+			collectPatchPaths(sub, p, into)
+		}
+	}
+}
+
+func legacyLabel(lm map[string]any, path string) string {
+	if l := strOf(lm["label"]); l != "" {
+		return l
+	}
+	return path
+}
+
+// compileLegacy turns an administrator "option control" into a user control.
+// Free-text and JSON controls are not exposed (nil).
+func compileLegacy(lm map[string]any, path string, defaults map[string]any) *Control {
+	t := lower(strOf(lm["type"]))
+	c := &Control{ID: path, Kind: "generic", Placement: "menu", Label: legacyLabel(lm, path),
+		Description: strOf(lm["description"]), Icon: "", Protocols: []string{}, path: path}
+	defVal, hasDef := getPath(defaults, path)
+	switch t {
+	case "select":
+		var numeric bool
+		if hasDef {
+			_, numeric = floatOf(defVal)
+		}
+		c.Type = "select"
+		for _, v := range optionValues(lm["options"]) {
+			o := ControlOption{Value: v, Label: v}
+			if numeric {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					o.patch = nestedPatch(path, f)
+				}
+			}
+			if o.patch == nil {
+				o.patch = nestedPatch(path, v)
+			}
+			c.Options = append(c.Options, o)
+		}
+		if len(c.Options) == 0 {
+			return nil
+		}
+		if hasDef {
+			ds := stringifyScalar(defVal)
+			if hasOption(c.Options, ds) {
+				c.Default = ptr(ds)
+			}
+		}
+	case "boolean", "toggle":
+		c.Type = "toggle"
+		c.on = ControlOption{Value: "on", Label: "On", patch: nestedPatch(path, true)}
+		c.off = ControlOption{Value: "off", Label: "Off", patch: nestedPatch(path, false)}
+		c.Options = []ControlOption{c.on, c.off}
+		c.Default = ptr("off")
+		if b, ok := defVal.(bool); ok && hasDef && b {
+			c.Default = ptr("on")
+		}
+	case "number":
+		c.Type = "number"
+		if f, ok := floatOf(lm["min"]); ok {
+			c.Min = &f
+		}
+		if f, ok := floatOf(lm["max"]); ok {
+			c.Max = &f
+		}
+		if f, ok := floatOf(lm["step"]); ok && f > 0 {
+			c.Step = &f
+		}
+		c.Integer = boolOf(lm["integer"])
+		if hasDef {
+			if f, ok := floatOf(defVal); ok && c.numberOK(f) {
+				c.Default = ptr(strconv.FormatFloat(f, 'f', -1, 64))
+			}
+		}
+	default:
+		return nil
+	}
+	return c
+}
+
+func stringifyScalar(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case json.Number:
+		return t.String()
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(t)
+	}
+	return ""
+}
