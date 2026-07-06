@@ -134,3 +134,149 @@ function Snapshot({ snapshot }: { snapshot: ShareSnapshot }) {
     </div>
   );
 }
+
+function BranchNav({ entry, onMove }: { entry: PathEntry; onMove: (delta: -1 | 1) => void }) {
+  const { t } = useI18n();
+  const total = entry.siblings.length;
+  if (total < 2) return null;
+  return (
+    <div className="inline-flex items-center gap-0.5 text-xs text-muted-foreground" role="group" aria-label={t("sharePage.branch.label")}>
+      <Button variant="ghost" size="icon-xs" aria-label={t("sharePage.branch.previous")} disabled={entry.position === 0} onClick={() => onMove(-1)}>
+        <ChevronLeft />
+      </Button>
+      <span aria-live="polite" className="min-w-10 text-center tabular-nums">
+        {entry.position + 1} / {total}
+      </span>
+      <Button variant="ghost" size="icon-xs" aria-label={t("sharePage.branch.next")} disabled={entry.position === total - 1} onClick={() => onMove(1)}>
+        <ChevronRight />
+      </Button>
+    </div>
+  );
+}
+
+function MessageView({ entry, shareId, onMove }: { entry: PathEntry; shareId: string; onMove: (delta: -1 | 1) => void }) {
+  const { t, locale } = useI18n();
+  const message = entry.message;
+  const text = useMemo(() => rewriteSharedFileUrls(message.content, shareId), [message.content, shareId]);
+
+  const blocked = message.status === "blocked";
+
+  if (message.role === "user") {
+    return (
+      <article className="grid justify-items-end gap-1.5">
+        {blocked ? (
+          <p className="max-w-[85%] rounded-2xl border border-dashed px-4 py-2.5 text-sm italic text-muted-foreground">{t("sharePage.blocked")}</p>
+        ) : text ? (
+          <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-[15px] leading-relaxed text-primary-foreground">
+            {text}
+          </div>
+        ) : null}
+        <Attachments items={message.attachments} shareId={shareId} align="end" />
+        <BranchNav entry={entry} onMove={onMove} />
+      </article>
+    );
+  }
+
+  if (message.role !== "assistant") {
+    return (
+      <article className="rounded-xl border border-dashed px-4 py-3 text-sm text-muted-foreground">
+        <span className="mb-1 block text-xs font-semibold uppercase tracking-wide">{t("sharePage.systemRole")}</span>
+        <MiniMarkdown source={text} className="text-sm" />
+      </article>
+    );
+  }
+
+  const latency = formatLatency(message.latencyMs);
+  const tokens =
+    message.inputTokens + message.outputTokens > 0
+      ? t("sharePage.meta.tokens", { input: formatCount(message.inputTokens, locale), output: formatCount(message.outputTokens, locale) })
+      : "";
+  const meta = [message.modelName, latency, tokens].filter(Boolean);
+  return (
+    <article className="grid gap-2">
+      {blocked ? <p className="rounded-lg border border-dashed px-3 py-2 text-sm italic text-muted-foreground">{t("sharePage.blocked")}</p> : null}
+      {!blocked && text ? <MiniMarkdown source={text} /> : null}
+      {message.status === "error" || message.errorMessage ? (
+        <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {message.errorMessage || t("sharePage.replyFailed")}
+        </p>
+      ) : message.status === "interrupted" || message.status === "canceled" ? (
+        <p className="text-sm italic text-muted-foreground">{t("sharePage.replyFailed")}</p>
+      ) : null}
+      <Attachments items={message.attachments} shareId={shareId} align="start" />
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <BranchNav entry={entry} onMove={onMove} />
+        {meta.length ? <p className="text-xs text-muted-foreground">{meta.join(" · ")}</p> : null}
+      </div>
+    </article>
+  );
+}
+
+function isImage(item: ShareAttachment): boolean {
+  return item.kind === "image" || item.mime.startsWith("image/");
+}
+
+function Attachments({ items, shareId, align }: { items: ShareMessage["attachments"]; shareId: string; align: "start" | "end" }) {
+  if (items.length === 0) return null;
+  return (
+    <ul className={cn("flex max-w-[85%] flex-wrap gap-2", align === "end" && "justify-end")}>
+      {items.map((item) => {
+        const href = absolutizeApiPath(sharedFileUrl(shareId, item.fileId));
+        return (
+          <li key={item.fileId}>
+            {isImage(item) ? (
+              <a href={href} target="_blank" rel="noopener noreferrer" className="block overflow-hidden rounded-xl border">
+                {/* eslint-disable-next-line @next/next/no-img-element -- share-scoped file endpoint */}
+                <img src={href} alt={item.name} loading="lazy" className="max-h-56 max-w-full object-cover" />
+              </a>
+            ) : (
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex max-w-64 items-center gap-2 rounded-lg border bg-card px-3 py-2 text-sm hover:bg-muted"
+              >
+                {item.kind === "document" ? <FileText className="size-4 shrink-0" /> : <Paperclip className="size-4 shrink-0" />}
+                <span className="truncate">{item.name}</span>
+                {item.size ? <span className="shrink-0 text-xs text-muted-foreground">{formatBytes(item.size)}</span> : null}
+              </a>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function ContinueButton({ shareId }: { shareId: string }) {
+  const { t } = useI18n();
+  const errorMessage = useErrorMessage();
+  const router = useRouter();
+  const viewer = useViewer();
+  const [busy, setBusy] = useState(false);
+
+  const onClick = async () => {
+    if (!shareId || busy) return;
+    if (!viewer.signedIn) {
+      router.push(loginForShare(shareId));
+      return;
+    }
+    setBusy(true);
+    try {
+      const id = await cloneSharedConversation(shareId);
+      router.push(`/chat?conversation_id=${encodeURIComponent(id)}`);
+    } catch (error) {
+      toast.error(t("sharePage.cta.failed"), { description: errorMessage(error) });
+      setBusy(false);
+    }
+  };
+
+  const label = !viewer.signedIn ? t("sharePage.cta.signIn") : busy ? t("sharePage.cta.continuing") : t("sharePage.cta.continue");
+  return (
+    <div className="pointer-events-none fixed inset-x-0 bottom-6 z-30 flex justify-center px-4">
+      <Button size="lg" className="pointer-events-auto rounded-full px-7 shadow-lg" onClick={() => void onClick()} loading={busy} disabled={!viewer.resolved}>
+        {label}
+      </Button>
+    </div>
+  );
+}
