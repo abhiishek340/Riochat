@@ -142,3 +142,145 @@ export function editFormOf(user: UserRecord): EditForm {
 export function roundBalance(value: number): number {
   return Math.round(value * 1e6) / 1e6;
 }
+
+export type BalanceParse = { ok: true; value: number } | { ok: false };
+
+/** A finite, non-negative number, rounded to six decimals. */
+export function parseBalance(text: string): BalanceParse {
+  const source = text.trim();
+  if (source === "") return { ok: false };
+  const n = Number(source);
+  if (!Number.isFinite(n) || n < 0) return { ok: false };
+  return { ok: true, value: roundBalance(n) };
+}
+
+export interface EditPatch {
+  avatarURL?: string;
+  displayName?: string;
+  email?: string;
+  phone?: string;
+  role?: string;
+  status?: string;
+  timezone?: string;
+  locale?: string;
+  profilePreferences?: string;
+  subscriptionTier?: string;
+  subscriptionExpiresAt?: string;
+  reason?: string;
+}
+
+export interface EditPlan {
+  patch: EditPatch;
+  /** New balance in USD when it changed. */
+  balance?: number;
+}
+
+export interface EditContext {
+  mode: BillingMode;
+}
+
+export type EditResult = { ok: true; plan: EditPlan; empty: boolean } | { ok: false; problem: Problem };
+
+/**
+ * Only changed fields travel. Role and status are sent only when they are
+ * known values (an unknown one on the account is preserved). Blank timezone
+ * and locale mean the defaults. The reason accompanies a status change only.
+ */
+export function planEdit(user: UserRecord, form: EditForm, ctx: EditContext): EditResult {
+  const patch: EditPatch = {};
+  const nameProblem = validateDisplayName(form.displayName, true);
+  if (nameProblem) return { ok: false, problem: nameProblem };
+  const set = <K extends keyof EditPatch>(key: K, value: EditPatch[K], original: unknown) => {
+    if (value !== original) patch[key] = value;
+  };
+  set("avatarURL", form.avatarURL, user.avatarURL);
+  set("displayName", form.displayName.trim(), user.displayName);
+  set("email", form.email.trim(), user.email);
+  set("phone", form.phone.trim(), user.phone);
+  if ((ROLES as readonly string[]).includes(form.role)) set("role", form.role, user.role);
+  if ((STATUSES as readonly string[]).includes(form.status) && form.status !== user.status) patch.status = form.status;
+  set("timezone", form.timezone.trim() || "Etc/UTC", user.timezone || "Etc/UTC");
+  set("locale", form.locale.trim() || "en-US", user.locale || "en-US");
+  set("profilePreferences", form.profilePreferences, user.profilePreferences);
+
+  if (ctx.mode === "period") {
+    const tier = form.tier.trim();
+    if (!tier) return { ok: false, problem: problem("adminUsers.problems.tierRequired") };
+    const expiry = tier === "free" ? undefined : endOfDayIso(form.expiryDate);
+    if (tier !== "free") {
+      if (!form.expiryDate.trim()) return { ok: false, problem: problem("adminUsers.problems.expiryRequired") };
+      if (!expiry) return { ok: false, problem: problem("adminUsers.problems.expiryInvalid") };
+    }
+    const tierChanged = tier !== (user.subscriptionTier || "free");
+    const expiryChanged = tier !== "free" && form.expiryDate !== dayOf(user.subscriptionExpiresAt);
+    if (tierChanged || expiryChanged) {
+      patch.subscriptionTier = tier;
+      if (expiry) patch.subscriptionExpiresAt = expiry;
+    }
+  }
+  if (patch.status !== undefined && form.reason.trim()) patch.reason = form.reason.trim();
+
+  let balance: number | undefined;
+  if (ctx.mode !== "self") {
+    const parsed = parseBalance(form.balance);
+    if (!parsed.ok) return { ok: false, problem: problem("adminUsers.problems.balanceInvalid") };
+    if (parsed.value !== roundBalance(user.billingBalanceUSD ?? 0)) balance = parsed.value;
+  }
+  const plan: EditPlan = balance === undefined ? { patch } : { patch, balance };
+  return { ok: true, plan, empty: Object.keys(patch).length === 0 && balance === undefined };
+}
+
+// --- privilege ---------------------------------------------------------------------
+
+/** A plain admin cannot manage a superadmin. */
+export function canManage(viewerRole: string | undefined, target: Pick<UserRecord, "role">): boolean {
+  return target.role !== "superadmin" || viewerRole === "superadmin";
+}
+
+export function roleChoices(viewerRole: string | undefined, current: string): string[] {
+  const base = viewerRole === "superadmin" ? [...ROLES] : ROLES.filter((r) => r !== "superadmin");
+  return base.includes(current as (typeof ROLES)[number]) || !current ? [...base] : [...base, current];
+}
+
+// --- list: client-side filter and sort -------------------------------------------------
+
+export const USER_SORTS = ["id_desc", "id_asc", "last_login_desc", "updated_desc", "display_name_asc"] as const;
+export type UserSort = (typeof USER_SORTS)[number];
+
+export interface UserFilters {
+  role: string;
+  status: string;
+  tier: string;
+}
+
+export function filterUsers(users: readonly UserRecord[], f: UserFilters): UserRecord[] {
+  return users.filter((u) => (!f.role || u.role === f.role) && (!f.status || u.status === f.status) && (!f.tier || (u.subscriptionTier || "free") === f.tier));
+}
+
+const stamp = (iso: string | null | undefined) => (iso ? Date.parse(iso) || 0 : 0);
+const nameOf = (u: UserRecord) => u.displayName || u.username;
+
+export function sortUsers(users: readonly UserRecord[], sort: UserSort): UserRecord[] {
+  const list = [...users];
+  switch (sort) {
+    case "id_asc":
+      return list.sort((a, b) => a.id - b.id);
+    case "last_login_desc":
+      return list.sort((a, b) => stamp(b.lastActiveAt || b.lastLoginAt) - stamp(a.lastActiveAt || a.lastLoginAt) || b.id - a.id);
+    case "updated_desc":
+      return list.sort((a, b) => stamp(b.updatedAt) - stamp(a.updatedAt) || b.id - a.id);
+    case "display_name_asc":
+      return list.sort((a, b) => nameOf(a).localeCompare(nameOf(b), "en") || a.id - b.id);
+    default:
+      return list.sort((a, b) => b.id - a.id);
+  }
+}
+
+/** Tier choices: the plans by code plus the built-in tiers they do not already cover. */
+export function tierChoices(planCodes: readonly string[]): string[] {
+  return [...planCodes, ...BUILTIN_TIERS.filter((t) => !planCodes.includes(t))];
+}
+
+export function bulkReason(kind: "role" | "status"): string {
+  return kind === "role" ? "bulk_update_role" : "bulk_update_status";
+}
