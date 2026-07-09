@@ -385,3 +385,328 @@ func (s *Service) replaceRouteSet(tx *gorm.DB, pmID, umID uint, desired []ModelR
 }
 
 // ---- upsert ------------------------------------------------------------------------------
+
+type upsertOptions struct {
+	routeSource   string // default source of created routes
+	catalogSource string // source of a created upstream model
+	forceStatus   string
+}
+
+func cleanSource(raw string, fallback string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return fallback, nil
+	}
+	if len(s) > 16 {
+		return "", badRequest(apperr.ErrInvalidBody.WithMessage("invalid request body: source is too long"))
+	}
+	return s, nil
+}
+
+func umSource(s string) string {
+	switch s {
+	case SourceManual, SourceSync, SourceImport:
+		return s
+	}
+	return SourceManual
+}
+
+// upsertResult describes what an upsert did.
+type upsertResult struct {
+	row             *UpstreamModelRow
+	platformCreated bool
+	protocols       []string
+	createdRoutes   int
+	existingRoutes  int
+	bindingCode     string
+	platformID      uint
+}
+
+// UpsertBinding creates or replaces a binding between a platform model and an
+// upstream model on one upstream.
+func (s *Service) UpsertBinding(ctx context.Context, upstreamID uint, req upsertBindingReq) (*UpstreamModelRow, error) {
+	res, err := s.upsertBinding(ctx, upstreamID, req, upsertOptions{})
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateCatalog()
+	return res.row, nil
+}
+
+func (s *Service) upsertBinding(ctx context.Context, upstreamID uint, req upsertBindingReq, opt upsertOptions) (*upsertResult, error) {
+	pmName, err := normalizePlatformName(req.PlatformModelName)
+	if err != nil {
+		return nil, err
+	}
+	umName := strings.TrimSpace(req.UpstreamModelName)
+	if umName == "" {
+		return nil, badRequest(apperr.ErrInvalidBody.WithMessage("invalid request body: upstreamModelName is required"))
+	}
+	if runeLen(umName) > 256 {
+		return nil, badRequest(apperr.ErrInvalidBody.WithMessage("invalid request body: upstreamModelName is too long"))
+	}
+	headers := ""
+	if req.HeadersJSON != nil {
+		if err := validateHeadersJSON(*req.HeadersJSON); err != nil {
+			return nil, err
+		}
+		headers = *req.HeadersJSON
+	}
+	var explicitKinds []string
+	if strings.TrimSpace(req.KindsJSON) != "" {
+		if explicitKinds, err = normalizeKinds(req.KindsJSON); err != nil {
+			return nil, err
+		}
+	}
+	var out upsertResult
+	var rowUM UpstreamModel
+	var rowPM PlatformModel
+	var rowRoute ModelRoute
+	err = s.tx(ctx, func(tx *gorm.DB) error {
+		up, err := s.loadUpstream(ctx, tx, upstreamID)
+		if err != nil {
+			return err
+		}
+		var pm PlatformModel
+		pmErr := tx.Where("name = ?", pmName).First(&pm).Error
+		if pmErr != nil && !isNotFound(pmErr) {
+			return pmErr
+		}
+		pmExists := pmErr == nil
+		kinds := explicitKinds
+		if kinds == nil {
+			if pmExists {
+				if kinds = parseStoredKinds(pm.KindsJSON); len(kinds) == 0 {
+					kinds = []string{KindChat}
+				}
+			} else {
+				kinds = inferKinds(pmName)
+			}
+		}
+		defs := parseProtocolDefaultsLenient(up.ProtocolDefaultsJSON)
+		protocols, err := resolveProtocolSet(up.Compatible, defs, kinds, req.Protocols)
+		if err != nil {
+			return err
+		}
+		if !pmExists {
+			vendor := deriveVendor("", pmName)
+			order, err := s.nextSortOrder(tx)
+			if err != nil {
+				return err
+			}
+			pm = PlatformModel{Name: pmName, Vendor: vendor, KindsJSON: kindsJSON(kinds), CapabilitiesJSON: "{}",
+				AccessScope: ScopePublic, Icon: autoIcon("", pmName, vendor), CBPolicyMode: "default",
+				Status: StatusActive, SortOrder: order}
+			if err := tx.Create(&pm).Error; err != nil {
+				if !database.IsDuplicate(err) {
+					return err
+				}
+				if err := tx.Where("name = ?", pmName).First(&pm).Error; err != nil {
+					return err
+				}
+			} else {
+				out.platformCreated = true
+			}
+		} else if explicitKinds != nil && kindsJSON(explicitKinds) != kindsJSON(parseStoredKinds(pm.KindsJSON)) {
+			pm.KindsJSON = kindsJSON(explicitKinds)
+			if err := tx.Model(&PlatformModel{}).Where("id = ?", pm.ID).Update("kinds_json", pm.KindsJSON).Error; err != nil {
+				return err
+			}
+		}
+		var um UpstreamModel
+		umErr := tx.Where("upstream_id = ? AND upstream_model_name = ?", upstreamID, umName).First(&um).Error
+		if umErr != nil && !isNotFound(umErr) {
+			return umErr
+		}
+		if umErr != nil {
+			code, err := newBindingCode()
+			if err != nil {
+				return err
+			}
+			vendor := deriveVendor("", umName, up.Name, up.BaseURL)
+			src := umSource(firstNonEmpty(opt.catalogSource, derefStr(req.Source)))
+			um = UpstreamModel{UpstreamID: upstreamID, BindingCode: code, UpstreamModelName: umName, Vendor: vendor,
+				Icon: autoIcon("", umName, vendor), SuggestedProtocol: protocols[0], KindsJSON: kindsJSON(kinds),
+				Status: StatusActive, Source: src, RawJSON: "{}"}
+			if err := tx.Create(&um).Error; err != nil {
+				if !database.IsDuplicate(err) {
+					return err
+				}
+				if err := tx.Where("upstream_id = ? AND upstream_model_name = ?", upstreamID, umName).First(&um).Error; err != nil {
+					return err
+				}
+			}
+		}
+		// Existing routes of the binding.
+		var existingIDs []uint
+		var existing []ModelRoute
+		if len(req.RouteIDs) > 0 {
+			ids := uniqueUints(req.RouteIDs)
+			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+			if err := tx.Where("id IN ?", ids).Order("id ASC").Find(&existing).Error; err != nil {
+				return err
+			}
+			if len(existing) != len(ids) {
+				return ErrBindingChanged
+			}
+			for _, r := range existing {
+				var owner UpstreamModel
+				if err := tx.First(&owner, r.UpstreamModelID).Error; err != nil || owner.UpstreamID != upstreamID {
+					return ErrUpstreamModelNotFound
+				}
+				existingIDs = append(existingIDs, r.ID)
+			}
+		} else if err := tx.Where("platform_model_id = ? AND upstream_model_id = ?", pm.ID, um.ID).Order("id ASC").Find(&existing).Error; err != nil {
+			return err
+		}
+		byProto := map[string]ModelRoute{}
+		for _, r := range existing {
+			byProto[r.Protocol] = r
+		}
+		defaultSource := firstNonEmpty(opt.routeSource, SourceManual)
+		desired := make([]ModelRoute, 0, len(protocols))
+		for _, p := range protocols {
+			tpl, ok := byProto[p]
+			if !ok && len(existing) > 0 {
+				tpl, ok = existing[0], true
+			}
+			r := ModelRoute{Protocol: p, Status: StatusActive, Priority: 1, Weight: 1, Source: defaultSource}
+			if ok {
+				r.Status, r.Priority, r.Weight, r.Source = tpl.Status, tpl.Priority, tpl.Weight, tpl.Source
+				r.CBFailureThreshold, r.CBDurationMin, r.CBWindowMin, r.HeadersJSON = tpl.CBFailureThreshold, tpl.CBDurationMin, tpl.CBWindowMin, tpl.HeadersJSON
+			}
+			if opt.forceStatus != "" {
+				r.Status = opt.forceStatus
+			}
+			if req.Status != nil {
+				st := normalizeStatus(*req.Status)
+				if !validWritableStatus(st) {
+					return badRequest(apperr.ErrInvalidBody)
+				}
+				r.Status = st
+			}
+			if req.Priority != nil {
+				r.Priority = atLeastOne(*req.Priority)
+			}
+			if req.Weight != nil {
+				r.Weight = atLeastOne(*req.Weight)
+			}
+			if req.Source != nil {
+				if r.Source, err = cleanSource(*req.Source, SourceManual); err != nil {
+					return err
+				}
+			}
+			if req.CBFailureThreshold != nil {
+				r.CBFailureThreshold = nonNegative(*req.CBFailureThreshold)
+			}
+			if req.CBDurationMin != nil {
+				r.CBDurationMin = nonNegative(*req.CBDurationMin)
+			}
+			if req.CBWindowMin != nil {
+				r.CBWindowMin = nonNegative(*req.CBWindowMin)
+			}
+			if req.HeadersJSON != nil {
+				r.HeadersJSON = headers
+			}
+			desired = append(desired, r)
+		}
+		before := map[string]bool{}
+		for _, r := range existing {
+			if r.PlatformModelID == pm.ID && r.UpstreamModelID == um.ID {
+				before[r.Protocol] = true
+			}
+		}
+		if err := s.replaceRouteSet(tx, pm.ID, um.ID, desired, existingIDs); err != nil {
+			if errors.Is(err, errRouteSetDuplicate) {
+				return ErrRouteConflict
+			}
+			return err
+		}
+		for _, p := range protocols {
+			if before[p] {
+				out.existingRoutes++
+			} else {
+				out.createdRoutes++
+			}
+		}
+		out.protocols, out.bindingCode, out.platformID = protocols, um.BindingCode, pm.ID
+		var first ModelRoute
+		if err := tx.Where("platform_model_id = ? AND upstream_model_id = ? AND protocol = ?", pm.ID, um.ID, protocols[0]).First(&first).Error; err != nil {
+			return err
+		}
+		rowUM, rowPM, rowRoute = um, pm, first
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Built after the transaction: rowFor reads settings through the pool, and on
+	// SQLite (one connection) doing that while the transaction holds the connection
+	// would wait on itself.
+	row := s.rowFor(ctx, upstreamID, &rowUM, &rowPM, &rowRoute)
+	out.row = &row
+	return &out, nil
+}
+
+func (s *Service) rowFor(ctx context.Context, upstreamID uint, um *UpstreamModel, pm *PlatformModel, r *ModelRoute) UpstreamModelRow {
+	open, until := s.circuitInfo(ctx, s.BreakerEnabled(ctx), bindingPrefix(upstreamID, um.BindingCode))
+	return UpstreamModelRow{
+		ID: um.ID, RouteID: r.ID, UpstreamID: upstreamID, BindingCode: um.BindingCode, PlatformModelID: pm.ID,
+		PlatformModelName: pm.Name, ModelVendor: pm.Vendor, ModelKindsJSON: pm.KindsJSON, ModelIcon: pm.Icon,
+		UpstreamModelName: um.UpstreamModelName, UpstreamModelVendor: um.Vendor, UpstreamModelIcon: um.Icon,
+		UpstreamModelKindsJSON: um.KindsJSON, SuggestedProtocol: um.SuggestedProtocol, Protocol: r.Protocol,
+		UpstreamModelStatus: um.Status, RouteStatus: r.Status, Priority: r.Priority, Weight: r.Weight, Source: r.Source,
+		CBFailureThreshold: r.CBFailureThreshold, CBDurationMin: r.CBDurationMin, CBWindowMin: r.CBWindowMin,
+		HeadersJSON: redactHeadersJSON(r.HeadersJSON), CircuitOpen: open, CircuitUntil: until,
+		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// ---- route operations by upstream --------------------------------------------------------
+
+// routeOfUpstream loads a route that belongs to the upstream.
+func (s *Service) routeOfUpstream(ctx context.Context, db *gorm.DB, upstreamID, routeID uint) (*ModelRoute, *UpstreamModel, error) {
+	var r ModelRoute
+	if err := db.WithContext(ctx).First(&r, routeID).Error; err != nil {
+		if isNotFound(err) {
+			return nil, nil, ErrUpstreamModelNotFound
+		}
+		return nil, nil, err
+	}
+	var um UpstreamModel
+	if err := db.WithContext(ctx).First(&um, r.UpstreamModelID).Error; err != nil || um.UpstreamID != upstreamID {
+		if err != nil && !isNotFound(err) {
+			return nil, nil, err
+		}
+		return nil, nil, ErrUpstreamModelNotFound
+	}
+	return &r, &um, nil
+}
+
+// DeleteRoute deletes one route of an upstream.
+func (s *Service) DeleteRoute(ctx context.Context, upstreamID, routeID uint) error {
+	if _, _, err := s.routeOfUpstream(ctx, s.db, upstreamID, routeID); err != nil {
+		return err
+	}
+	if err := s.db.WithContext(ctx).Delete(&ModelRoute{}, routeID).Error; err != nil {
+		return err
+	}
+	s.invalidateCatalog()
+	return nil
+}
