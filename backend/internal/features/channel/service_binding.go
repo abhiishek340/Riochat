@@ -710,3 +710,352 @@ func (s *Service) DeleteRoute(ctx context.Context, upstreamID, routeID uint) err
 	s.invalidateCatalog()
 	return nil
 }
+
+// BatchDeleteRoutes deletes routes of an upstream sequentially.
+func (s *Service) BatchDeleteRoutes(ctx context.Context, upstreamID uint, ids []uint) BatchResult {
+	return s.batchDelete(ids, func(id uint) error { return s.DeleteRoute(ctx, upstreamID, id) }, ErrUpstreamModelNotFound)
+}
+
+// SetRouteStatus enables or disables a route.
+func (s *Service) SetRouteStatus(ctx context.Context, upstreamID, routeID uint, status string) error {
+	if _, _, err := s.routeOfUpstream(ctx, s.db, upstreamID, routeID); err != nil {
+		return err
+	}
+	if err := s.db.WithContext(ctx).Model(&ModelRoute{}).Where("id = ?", routeID).Update("status", status).Error; err != nil {
+		return err
+	}
+	s.invalidateCatalog()
+	return nil
+}
+
+// OpenBindingCircuit opens the circuit of the route's upstream model.
+func (s *Service) OpenBindingCircuit(ctx context.Context, upstreamID, routeID uint) error {
+	_, um, err := s.routeOfUpstream(ctx, s.db, upstreamID, routeID)
+	if err != nil {
+		return err
+	}
+	if !s.BreakerEnabled(ctx) {
+		return ErrBreakerDisabled
+	}
+	return s.circuits.openManual(ctx, bindingPrefix(upstreamID, um.BindingCode))
+}
+
+// ResetBindingCircuit clears the circuit of the route's upstream model.
+func (s *Service) ResetBindingCircuit(ctx context.Context, upstreamID, routeID uint) error {
+	_, um, err := s.routeOfUpstream(ctx, s.db, upstreamID, routeID)
+	if err != nil {
+		return err
+	}
+	return s.circuits.reset(ctx, bindingPrefix(upstreamID, um.BindingCode), false)
+}
+
+// ---- model protocol set ------------------------------------------------------------------
+
+// SetModelProtocols rewrites the protocol set of every binding of a model and
+// the model's kinds, atomically.
+func (s *Service) SetModelProtocols(ctx context.Context, modelID uint, req setProtocolsReq) (*ModelView, error) {
+	kinds, err := normalizeKinds(req.KindsJSON)
+	if err != nil {
+		return nil, err
+	}
+	err = s.tx(ctx, func(tx *gorm.DB) error {
+		pm, err := s.loadModel(ctx, tx, modelID)
+		if err != nil {
+			return err
+		}
+		var routes []ModelRoute
+		if err := tx.Where("platform_model_id = ?", modelID).Order("id ASC").Find(&routes).Error; err != nil {
+			return err
+		}
+		if len(routes) == 0 {
+			return ErrSourcesNotFound
+		}
+		byUM := map[uint][]ModelRoute{}
+		var umOrder []uint
+		for _, r := range routes {
+			if _, ok := byUM[r.UpstreamModelID]; !ok {
+				umOrder = append(umOrder, r.UpstreamModelID)
+			}
+			byUM[r.UpstreamModelID] = append(byUM[r.UpstreamModelID], r)
+		}
+		if err := tx.Model(&PlatformModel{}).Where("id = ?", pm.ID).Update("kinds_json", kindsJSON(kinds)).Error; err != nil {
+			return err
+		}
+		for _, umID := range umOrder {
+			var um UpstreamModel
+			if err := tx.First(&um, umID).Error; err != nil {
+				return err
+			}
+			up, err := s.loadUpstream(ctx, tx, um.UpstreamID)
+			if err != nil {
+				return err
+			}
+			protocols, err := resolveProtocolSet(up.Compatible, parseProtocolDefaultsLenient(up.ProtocolDefaultsJSON), kinds, req.Protocols)
+			if err != nil {
+				return err
+			}
+			existing := byUM[umID]
+			ids := make([]uint, 0, len(existing))
+			byProto := map[string]ModelRoute{}
+			for _, r := range existing {
+				ids = append(ids, r.ID)
+				byProto[r.Protocol] = r
+			}
+			desired := make([]ModelRoute, 0, len(protocols))
+			for _, p := range protocols {
+				tpl, ok := byProto[p]
+				if !ok {
+					tpl = existing[0]
+				}
+				desired = append(desired, ModelRoute{Protocol: p, Status: tpl.Status, Priority: tpl.Priority, Weight: tpl.Weight,
+					Source: tpl.Source, CBFailureThreshold: tpl.CBFailureThreshold, CBDurationMin: tpl.CBDurationMin,
+					CBWindowMin: tpl.CBWindowMin, HeadersJSON: tpl.HeadersJSON})
+			}
+			if err := s.replaceRouteSet(tx, modelID, umID, desired, ids); err != nil {
+				if errors.Is(err, errRouteSetDuplicate) {
+					return ErrUpstreamModelConflict
+				}
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateCatalog()
+	return s.GetModel(ctx, modelID)
+}
+
+// ---- sources (model-centric) -----------------------------------------------------------------
+
+func (s *Service) sourceView(ctx context.Context, r routeRecord, breaker bool) SourceView {
+	v := SourceView{
+		ID: r.RouteID, UpstreamID: r.UpstreamID, UpstreamName: r.UpName, UpstreamStatus: r.UpStatus, BaseURL: r.UpBaseURL,
+		BindingCode: r.BindingCode, UpstreamModelName: r.UpstreamModelName, UpstreamModelKindsJSON: r.UMKindsJSON,
+		UpstreamModelVendor: deriveVendor(r.UMVendor, r.UpstreamModelName, r.UpName, r.UpBaseURL),
+		SuggestedProtocol:   r.SuggestedProtocol, UpstreamModelStatus: r.UMStatus, Protocol: r.Protocol, Status: r.RouteStatus,
+		Priority: r.Priority, Weight: r.Weight, Source: r.RouteSource, CBFailureThreshold: r.RouteCBFailure,
+		CBDurationMin: r.RouteCBDuration, CBWindowMin: r.RouteCBWindow, HeadersJSON: redactHeadersJSON(r.RouteHeaders),
+		CreatedAt: r.RouteCreatedAt, UpdatedAt: r.RouteUpdatedAt,
+	}
+	v.UpstreamModelIcon = autoIcon(r.UMIcon, r.UpstreamModelName, v.UpstreamModelVendor)
+	if breaker {
+		if open, until := s.circuitInfo(ctx, true, upstreamPrefix(r.UpstreamID)); open {
+			v.CircuitOpen, v.CircuitUntil, v.CircuitScope = true, until, "upstream"
+		} else if open, until := s.circuitInfo(ctx, true, bindingPrefix(r.UpstreamID, r.BindingCode)); open {
+			v.CircuitOpen, v.CircuitUntil, v.CircuitScope = true, until, "source"
+		}
+	}
+	return v
+}
+
+// ListSources lists the routes of a model ordered by priority then newest first.
+func (s *Service) ListSources(ctx context.Context, modelID uint, page, size int) ([]SourceView, int64, error) {
+	if _, err := s.loadModel(ctx, s.db, modelID); err != nil {
+		return nil, 0, err
+	}
+	var total int64
+	if err := s.db.WithContext(ctx).Model(&ModelRoute{}).Where("platform_model_id = ?", modelID).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var recs []routeRecord
+	err := routeQuery(s.db.WithContext(ctx)).Where("r.platform_model_id = ?", modelID).
+		Order("r.priority ASC, r.id DESC").Offset(pageOffset(page, size)).Limit(size).Scan(&recs).Error
+	if err != nil {
+		return nil, 0, err
+	}
+	breaker := s.BreakerEnabled(ctx)
+	out := make([]SourceView, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, s.sourceView(ctx, r, breaker))
+	}
+	return out, total, nil
+}
+
+func (s *Service) getSource(ctx context.Context, db *gorm.DB, routeID uint) (*SourceView, error) {
+	var rec routeRecord
+	if err := routeQuery(db.WithContext(ctx)).Where("r.id = ?", routeID).Scan(&rec).Error; err != nil {
+		return nil, err
+	}
+	if rec.RouteID == 0 {
+		return nil, ErrUpstreamModelNotFound
+	}
+	v := s.sourceView(ctx, rec, s.BreakerEnabled(ctx))
+	return &v, nil
+}
+
+// BindSource binds an existing upstream model to a platform model.
+func (s *Service) BindSource(ctx context.Context, modelID uint, req bindSourceReq) (*SourceView, error) {
+	var routeID uint
+	err := s.tx(ctx, func(tx *gorm.DB) error {
+		pm, err := s.loadModel(ctx, tx, modelID)
+		if err != nil {
+			return err
+		}
+		up, err := s.loadUpstream(ctx, tx, req.UpstreamID)
+		if err != nil {
+			return err
+		}
+		if up.Status != StatusActive {
+			return ErrSourceUnavailable
+		}
+		var um UpstreamModel
+		if err := tx.First(&um, req.UpstreamModelID).Error; err != nil || um.UpstreamID != up.ID {
+			if err != nil && !isNotFound(err) {
+				return err
+			}
+			return ErrUpstreamModelNotFound
+		}
+		if um.Status != StatusActive {
+			return ErrSourceUnavailable
+		}
+		kinds := parseStoredKinds(pm.KindsJSON)
+		explicit := derefStr(req.Protocol)
+		if strings.TrimSpace(explicit) == "" {
+			explicit = um.SuggestedProtocol
+		}
+		proto, err := resolveProtocol(up.Compatible, parseProtocolDefaultsLenient(up.ProtocolDefaultsJSON), kinds, explicit)
+		if err != nil {
+			return err
+		}
+		var existing []ModelRoute
+		if err := tx.Where("platform_model_id = ? AND upstream_model_id = ?", pm.ID, um.ID).Find(&existing).Error; err != nil {
+			return err
+		}
+		set := []string{proto}
+		var current *ModelRoute
+		for i, r := range existing {
+			set = append(set, r.Protocol)
+			if r.Protocol == proto {
+				current = &existing[i]
+			}
+		}
+		if !supportedCombination(set) {
+			return ErrInvalidCombination
+		}
+		route := ModelRoute{PlatformModelID: pm.ID, UpstreamModelID: um.ID, Protocol: proto, Status: StatusActive, Priority: 1, Weight: 1, Source: SourceManual}
+		if current != nil {
+			route = *current
+		}
+		if req.Status != nil {
+			route.Status = normalizeStatus(*req.Status)
+		}
+		if req.Priority != nil {
+			route.Priority = atLeastOne(*req.Priority)
+		}
+		if req.Weight != nil {
+			route.Weight = atLeastOne(*req.Weight)
+		}
+		if req.CBFailureThreshold != nil {
+			route.CBFailureThreshold = nonNegative(*req.CBFailureThreshold)
+		}
+		if req.CBDurationMin != nil {
+			route.CBDurationMin = nonNegative(*req.CBDurationMin)
+		}
+		if req.CBWindowMin != nil {
+			route.CBWindowMin = nonNegative(*req.CBWindowMin)
+		}
+		if err := tx.Save(&route).Error; err != nil {
+			if database.IsDuplicate(err) {
+				return ErrRouteConflict
+			}
+			return err
+		}
+		routeID = route.ID
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateCatalog()
+	return s.getSource(ctx, s.db, routeID)
+}
+
+// UpdateSource updates one route of a model.
+func (s *Service) UpdateSource(ctx context.Context, modelID, routeID uint, req updateSourceReq) (*SourceView, error) {
+	changed := false
+	err := s.tx(ctx, func(tx *gorm.DB) error {
+		if _, err := s.loadModel(ctx, tx, modelID); err != nil {
+			return err
+		}
+		var r ModelRoute
+		if err := tx.First(&r, routeID).Error; err != nil {
+			if !isNotFound(err) {
+				return err
+			}
+			return ErrUpstreamModelNotFound
+		}
+		if r.PlatformModelID != modelID {
+			return ErrModelNotFound
+		}
+		if req.Protocol != nil {
+			p := lower(*req.Protocol)
+			if p == "" {
+				return ErrProtocolRequired
+			}
+			if !isKnownProtocol(p) {
+				return ErrInvalidAdapter
+			}
+			if p != r.Protocol {
+				var siblings []ModelRoute
+				if err := tx.Where("platform_model_id = ? AND upstream_model_id = ? AND id <> ?", r.PlatformModelID, r.UpstreamModelID, r.ID).Find(&siblings).Error; err != nil {
+					return err
+				}
+				set := []string{p}
+				for _, sib := range siblings {
+					set = append(set, sib.Protocol)
+					if sib.Protocol == p {
+						return ErrRouteConflict
+					}
+				}
+				if !supportedCombination(set) {
+					return ErrInvalidCombination
+				}
+				r.Protocol = p
+				changed = true
+			}
+		}
+		if req.Status != nil {
+			r.Status = normalizeStatus(*req.Status)
+			changed = true
+		}
+		if req.Priority != nil {
+			r.Priority = atLeastOne(*req.Priority)
+			changed = true
+		}
+		if req.Weight != nil {
+			r.Weight = atLeastOne(*req.Weight)
+			changed = true
+		}
+		if req.CBFailureThreshold != nil {
+			r.CBFailureThreshold = nonNegative(*req.CBFailureThreshold)
+			changed = true
+		}
+		if req.CBDurationMin != nil {
+			r.CBDurationMin = nonNegative(*req.CBDurationMin)
+			changed = true
+		}
+		if req.CBWindowMin != nil {
+			r.CBWindowMin = nonNegative(*req.CBWindowMin)
+			changed = true
+		}
+		if !changed {
+			return nil
+		}
+		if err := tx.Save(&r).Error; err != nil {
+			if database.IsDuplicate(err) {
+				return ErrRouteConflict
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		s.invalidateCatalog()
+	}
+	return s.getSource(ctx, s.db, routeID)
+}
