@@ -126,3 +126,166 @@ func (s *Service) ListModelPrices(ctx context.Context, q string, offset, limit i
 	}
 	return out, total, nil
 }
+
+// UpsertModelPrice validates and stores the price of a platform model.
+func (s *Service) UpsertModelPrice(ctx context.Context, in ModelPriceInput) (*ModelPriceView, error) {
+	name := strings.TrimSpace(in.PlatformModelName)
+	if name == "" {
+		return nil, ErrPlatformModelRequired
+	}
+	mode := normalizePricingMode(in.PricingMode)
+	var info *ModelInfo
+	if s.ports.Models != nil {
+		mi, ok, err := s.ports.Models.Model(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, ErrInvalidModelPricing
+		}
+		info = &mi
+		if mode == PricingDuration && !mi.SupportsVideo {
+			return nil, ErrInvalidModelPricing
+		}
+	} else if mode == PricingDuration {
+		return nil, ErrInvalidModelPricing
+	}
+	basis := strings.TrimSpace(in.CacheWritePriceBasis)
+	if basis != "" && basis != "direct" && basis != "anthropic_5m" {
+		return nil, ErrInvalidModelPricing
+	}
+	row := ModelPrice{PlatformModelName: name, Currency: CurrencyUSD, IsFree: in.IsFree != nil && *in.IsFree, PricingMode: mode,
+		TieredPricingJSON: "{}", SchedulePricingJSON: "{}"}
+	switch mode {
+	case PricingCall:
+		row.CallNanousdPerCall = USDToNano(deref(in.CallUSDPerCall))
+	case PricingDuration:
+		row.DurationNanousdPerSecond = USDToNano(deref(in.DurationUSDPerSecond))
+	case PricingTiered:
+		tc, err := parseTiersJSON(in.TieredPricingJSON)
+		if err != nil {
+			return nil, ErrInvalidModelPricing.WithCause(err)
+		}
+		row.TieredPricingJSON = marshalTiers(tc)
+		row.CacheWritePriceBasis = basis
+	default:
+		row.InputNanousdPerMTokens = USDToNano(deref(in.InputUSDPerMTokens))
+		row.CacheReadNanousdPerMTokens = USDToNano(deref(in.CacheReadUSDPerMTokens))
+		row.CacheWriteNanousdPerMTokens = USDToNano(deref(in.CacheWriteUSDPerMTokens))
+		row.OutputNanousdPerMTokens = USDToNano(deref(in.OutputUSDPerMTokens))
+		row.CacheWritePriceBasis = basis
+	}
+	sc, err := parseScheduleJSON(in.SchedulePricingJSON)
+	if err != nil {
+		return nil, ErrInvalidModelPricing.WithCause(err)
+	}
+	row.SchedulePricingJSON = marshalSchedule(sc)
+
+	var saved ModelPrice
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var cur ModelPrice
+		e := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("platform_model_name = ?", name).First(&cur).Error
+		switch {
+		case e == nil:
+			row.ID, row.CreatedAt = cur.ID, cur.CreatedAt
+			if err := tx.Save(&row).Error; err != nil {
+				return err
+			}
+		case database.IsNotFound(e):
+			if err := database.Translate(tx.Create(&row).Error); err != nil {
+				return err
+			}
+		default:
+			return e
+		}
+		saved = row
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	_ = s.cache.Delete(ctx, publicPriceCacheKey)
+	v := modelPriceView(saved, info)
+	return &v, nil
+}
+
+func deref(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// PublicTier is a tier in the public price view.
+type PublicTier struct {
+	FromTokens              int64   `json:"fromTokens"`
+	UpToTokens              *int64  `json:"upToTokens"`
+	InputUSDPerMTokens      float64 `json:"inputUSDPerMTokens"`
+	CacheReadUSDPerMTokens  float64 `json:"cacheReadUSDPerMTokens"`
+	CacheWriteUSDPerMTokens float64 `json:"cacheWriteUSDPerMTokens"`
+	OutputUSDPerMTokens     float64 `json:"outputUSDPerMTokens"`
+}
+
+// PublicPricing is the pricing object attached to public model list entries.
+type PublicPricing struct {
+	Currency                 string           `json:"currency"`
+	IsFree                   bool             `json:"isFree"`
+	Mode                     string           `json:"mode"`
+	InputUSDPerMTokens       float64          `json:"inputUSDPerMTokens"`
+	CacheReadUSDPerMTokens   float64          `json:"cacheReadUSDPerMTokens"`
+	CacheWriteUSDPerMTokens  float64          `json:"cacheWriteUSDPerMTokens"`
+	CacheWrite5mMultiplier   float64          `json:"cacheWrite5mMultiplier"`
+	CacheWrite1hMultiplier   float64          `json:"cacheWrite1hMultiplier"`
+	OutputUSDPerMTokens      float64          `json:"outputUSDPerMTokens"`
+	CallUSDPerCall           float64          `json:"callUSDPerCall"`
+	DurationUSDPerSecond     float64          `json:"durationUSDPerSecond"`
+	Tiers                    []PublicTier     `json:"tiers"`
+	SchedulePeriods          []SchedulePeriod `json:"schedulePeriods"`
+	ScheduleUTCOffsetMinutes int              `json:"scheduleUTCOffsetMinutes"`
+}
+
+func (s *Service) publicPricingOf(row ModelPrice, offsetMin int) PublicPricing {
+	m5, m1 := CacheWriteMultipliers(row.CacheWritePriceBasis)
+	p := PublicPricing{Currency: firstNonEmpty(row.Currency, CurrencyUSD), IsFree: row.IsFree, Mode: normalizePricingMode(row.PricingMode),
+		InputUSDPerMTokens: NanoToUSD(row.InputNanousdPerMTokens), CacheReadUSDPerMTokens: NanoToUSD(row.CacheReadNanousdPerMTokens),
+		CacheWriteUSDPerMTokens: NanoToUSD(row.CacheWriteNanousdPerMTokens), CacheWrite5mMultiplier: m5, CacheWrite1hMultiplier: m1,
+		OutputUSDPerMTokens: NanoToUSD(row.OutputNanousdPerMTokens), CallUSDPerCall: NanoToUSD(row.CallNanousdPerCall),
+		DurationUSDPerSecond: NanoToUSD(row.DurationNanousdPerSecond), Tiers: []PublicTier{}, SchedulePeriods: []SchedulePeriod{},
+		ScheduleUTCOffsetMinutes: offsetMin}
+	if p.Mode == PricingTiered {
+		if tc, err := parseTiersJSON(row.TieredPricingJSON); err == nil {
+			for _, t := range tc.Tiers {
+				p.Tiers = append(p.Tiers, PublicTier(t))
+			}
+		}
+	}
+	if sc, err := parseScheduleJSON(row.SchedulePricingJSON); err == nil && sc != nil {
+		p.SchedulePeriods = sc.Periods
+	}
+	return p
+}
+
+// PublicPricing returns the public pricing of the named models. It is empty in
+// self mode (pricing is not shown) and omits models without a price row; the
+// caller hides those models in non-self modes. Results may be up to 30 seconds
+// stale and are invalidated by every price upsert.
+func (s *Service) PublicPricing(ctx context.Context) (mode string, prices map[string]PublicPricing, err error) {
+	mode = s.currentMode(ctx)
+	prices = map[string]PublicPricing{}
+	if mode == ModeSelf {
+		return mode, prices, nil
+	}
+	_, offset := s.now().In(s.loc).Zone()
+	if cached, ok, _ := cache.GetJSON[map[string]PublicPricing](ctx, s.cache, publicPriceCacheKey); ok {
+		return mode, cached, nil
+	}
+	var rows []ModelPrice
+	if err := s.db.WithContext(ctx).Find(&rows).Error; err != nil {
+		return mode, nil, err
+	}
+	for _, r := range rows {
+		prices[r.PlatformModelName] = s.publicPricingOf(r, offset/60)
+	}
+	_ = cache.SetJSON(ctx, s.cache, publicPriceCacheKey, prices, publicPriceCacheTTL)
+	return mode, prices, nil
+}
