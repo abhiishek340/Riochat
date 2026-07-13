@@ -138,3 +138,144 @@ type failingReader struct{ err error }
 func (f *failingReader) Read([]byte) (int, error) { return 0, f.err }
 
 func wrap(f Full) gin.H { return gin.H{"skill": f} }
+
+func (a *api) discover(c *gin.Context) {
+	ids, ok := idFilter(c)
+	if !ok {
+		return
+	}
+	rows, total, err := a.svc.Discover(c.Request.Context(), middleware.MustPrincipal(c).UserID, ids,
+		c.Query("q"), pagination.FromRequest(c.Request))
+	if err != nil {
+		httpx.FailErr(c, err)
+		return
+	}
+	httpx.Paged(c, total, rows)
+}
+
+func (a *api) detail(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	f, err := a.svc.Get(c.Request.Context(), middleware.MustPrincipal(c).UserID, id)
+	if err != nil {
+		httpx.FailErr(c, err)
+		return
+	}
+	httpx.OK(c, wrap(f))
+}
+
+func (a *api) list(c *gin.Context, scope string, owner uint) {
+	rows, total, err := a.svc.ListOwned(c.Request.Context(), scope, owner, c.Query("q"),
+		enabledFilter(c), pagination.FromRequest(c.Request))
+	if err != nil {
+		httpx.FailErr(c, err)
+		return
+	}
+	httpx.Paged(c, total, rows)
+}
+
+func (a *api) create(c *gin.Context, scope string, owner uint) (Full, bool) {
+	var req createRequest
+	if !httpx.BindJSON(c, &req) {
+		return Full{}, false
+	}
+	f, err := a.svc.Create(c.Request.Context(), scope, owner, middleware.MustPrincipal(c).UserID, Input{
+		Title: req.Title, Trigger: req.Trigger, Description: req.Description,
+		Markdown: req.Markdown, SortOrder: int(req.SortOrder),
+	})
+	if err != nil {
+		httpx.FailErr(c, err)
+		return Full{}, false
+	}
+	return f, true
+}
+
+func (a *api) patch(c *gin.Context, scope string, owner uint) (Full, bool) {
+	id, ok := pathID(c)
+	if !ok {
+		return Full{}, false
+	}
+	allowEmptyBody(c)
+	var req patchRequest
+	if !httpx.BindJSON(c, &req) {
+		return Full{}, false
+	}
+	var order *int
+	if req.SortOrder != nil {
+		v := int(*req.SortOrder)
+		order = &v
+	}
+	f, err := a.svc.Update(c.Request.Context(), scope, owner, middleware.MustPrincipal(c).UserID, id, Patch{
+		Title: req.Title, Trigger: req.Trigger, Description: req.Description,
+		Markdown: req.Markdown, Enabled: req.Enabled, SortOrder: order,
+	})
+	if err != nil {
+		httpx.FailErr(c, err)
+		return Full{}, false
+	}
+	return f, true
+}
+
+func (a *api) remove(c *gin.Context, scope string, owner uint) (uint, bool) {
+	id, ok := pathID(c)
+	if !ok {
+		return 0, false
+	}
+	if err := a.svc.Delete(c.Request.Context(), scope, owner, id); err != nil {
+		httpx.FailErr(c, err)
+		return 0, false
+	}
+	return id, true
+}
+
+func (a *api) record(c *gin.Context, action string, id uint, detail any) {
+	if a.audit == nil {
+		return
+	}
+	a.audit.RecordRequest(c, action, auditResource, strconv.FormatUint(uint64(id), 10), detail)
+}
+
+func (a *api) listMine(c *gin.Context) { a.list(c, ScopeUser, middleware.MustPrincipal(c).UserID) }
+
+func (a *api) createMine(c *gin.Context) {
+	if f, ok := a.create(c, ScopeUser, middleware.MustPrincipal(c).UserID); ok {
+		httpx.OK(c, wrap(f))
+	}
+}
+
+func (a *api) patchMine(c *gin.Context) {
+	if f, ok := a.patch(c, ScopeUser, middleware.MustPrincipal(c).UserID); ok {
+		httpx.OK(c, wrap(f))
+	}
+}
+
+func (a *api) deleteMine(c *gin.Context) {
+	if _, ok := a.remove(c, ScopeUser, middleware.MustPrincipal(c).UserID); ok {
+		httpx.OK(c, gin.H{"deleted": true})
+	}
+}
+
+func (a *api) listBuiltin(c *gin.Context) { a.list(c, ScopeBuiltin, 0) }
+
+func (a *api) createBuiltin(c *gin.Context) {
+	if f, ok := a.create(c, ScopeBuiltin, 0); ok {
+		a.record(c, actionCreate, f.ID, gin.H{"trigger": f.Trigger})
+		httpx.OK(c, wrap(f))
+	}
+}
+
+func (a *api) patchBuiltin(c *gin.Context) {
+	if f, ok := a.patch(c, ScopeBuiltin, 0); ok {
+		a.record(c, actionUpdate, f.ID, gin.H{"trigger": f.Trigger})
+		httpx.OK(c, wrap(f))
+	}
+}
+
+func (a *api) deleteBuiltin(c *gin.Context) {
+	if id, ok := a.remove(c, ScopeBuiltin, 0); ok {
+		a.record(c, actionDelete, id, nil)
+		httpx.OK(c, gin.H{"deleted": true})
+	}
+}
