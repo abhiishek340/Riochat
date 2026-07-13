@@ -314,3 +314,286 @@ func TestFieldNormalizers(t *testing.T) {
 		t.Errorf("uniqueUints: %v", got)
 	}
 }
+
+func TestProtocolRules(t *testing.T) {
+	allowed := map[string][]string{
+		KindChat:           {"openai_responses", "openrouter_chat_completions", "openrouter_responses", "openai_chat_completions", "anthropic_messages", "google_generate_content", "gemini_interactions", "xai_responses"},
+		KindAudio:          {"openai_responses", "openrouter_chat_completions", "openrouter_responses", "openai_chat_completions", "anthropic_messages", "google_generate_content", "xai_responses"},
+		KindImageGen:       {"openai_image_generations", "openrouter_images", "google_image_generation", "gemini_interactions", "xai_image"},
+		KindImageEdit:      {"openai_image_edits", "openrouter_images", "google_image_generation", "gemini_interactions", "xai_image_edits"},
+		KindVideoGen:       {"openai_video_generations", "gemini_interactions", "xai_video"},
+		KindVideoExtension: {"xai_video_extensions"},
+	}
+	for kind, list := range allowed {
+		for p := range knownProtocols {
+			want := containsString(list, p)
+			if got := protocolAllowedForKind(p, kind); got != want {
+				t.Errorf("%s allowed for %s: %v want %v", p, kind, got, want)
+			}
+		}
+	}
+	if len(knownProtocols) != 17 {
+		t.Errorf("known protocols: %d", len(knownProtocols))
+	}
+	if isImplementedProtocol(ProtoOpenAIVideoGen) || !isImplementedProtocol(ProtoXAIVideo) || isImplementedProtocol("") || isImplementedProtocol("nope") {
+		t.Error("implemented protocols")
+	}
+	// Supported combinations.
+	for _, c := range []struct {
+		set  []string
+		want bool
+	}{
+		{nil, true}, {[]string{"openai_responses"}, true}, {[]string{"openai_responses", "openai_responses"}, true},
+		{[]string{"openai_image_generations", "openai_image_edits"}, true}, {[]string{"openai_image_edits", "openai_image_generations"}, true},
+		{[]string{"xai_image", "xai_image_edits"}, true}, {[]string{"xai_video", "xai_video_extensions"}, true},
+		{[]string{"xai_video", "xai_image"}, false}, {[]string{"openai_chat_completions", "openai_responses"}, false},
+		{[]string{"openai_image_generations", "openai_image_edits", "xai_image"}, false},
+	} {
+		if got := supportedCombination(c.set); got != c.want {
+			t.Errorf("%v: %v want %v", c.set, got, c.want)
+		}
+	}
+}
+
+func TestProtocolResolutionRules(t *testing.T) {
+	none := protocolDefaults{}
+	// Explicit protocols.
+	if p, err := resolveProtocol("openai", none, []string{"chat"}, " OpenAI_Responses "); err != nil || p != ProtoOpenAIResponses {
+		t.Errorf("explicit: %q %v", p, err)
+	}
+	if _, err := resolveProtocol("openai", none, []string{"chat"}, "bogus"); !errors.Is(err, ErrInvalidAdapter) {
+		t.Errorf("unknown: %v", err)
+	}
+	if _, err := resolveProtocol("openai", none, []string{"chat"}, ProtoXAIVideo); !errors.Is(err, ErrInvalidAdapter) {
+		t.Errorf("not allowed for kinds: %v", err)
+	}
+	if p, err := resolveProtocol("openai", none, nil, ProtoXAIVideo); err != nil || p != ProtoXAIVideo {
+		t.Errorf("empty kinds accept any known protocol: %q %v", p, err)
+	}
+	// Inferred protocols.
+	if _, err := resolveProtocol("openai", none, nil, ""); !errors.Is(err, ErrProtocolRequired) {
+		t.Errorf("no kinds: %v", err)
+	}
+	table := []struct {
+		style string
+		kinds []string
+		want  string
+	}{
+		{StyleOpenAI, []string{"chat"}, ProtoOpenAIChat},
+		{StyleOpenAI, []string{"audio"}, ProtoOpenAIChat},
+		{StyleOpenAI, []string{"image_gen"}, ProtoOpenAIImageGen},
+		{StyleOpenAI, []string{"image_edit"}, ProtoOpenAIImageEdit},
+		{StyleOpenAI, []string{"video_gen"}, ProtoOpenAIVideoGen},
+		{StyleAnthropic, []string{"chat"}, ProtoAnthropicMessages},
+		{StyleGoogle, []string{"chat"}, ProtoGoogleGenerate},
+		{StyleGoogle, []string{"image_gen"}, ProtoGoogleImage},
+		{StyleGoogle, []string{"image_edit"}, ProtoGoogleImage},
+		{StyleGoogle, []string{"video_gen"}, ProtoGeminiInteractions},
+		{StyleXAI, []string{"chat"}, ProtoXAIResponses},
+		{StyleXAI, []string{"image_gen"}, ProtoXAIImage},
+		{StyleXAI, []string{"image_edit"}, ProtoXAIImageEdit},
+		{StyleXAI, []string{"video_gen"}, ProtoXAIVideo},
+		{StyleXAI, []string{"video_extension"}, ProtoXAIVideoExtension},
+		{StyleOpenRouter, []string{"chat"}, ProtoOpenRouterResponses},
+		{StyleOpenRouter, []string{"image_gen"}, ProtoOpenRouterImages},
+		{StyleOpenRouter, []string{"image_edit"}, ProtoOpenRouterImages},
+		{StyleOpenRouter, []string{"video_gen"}, ProtoOpenAIVideoGen},
+		{StyleCustom, []string{"chat"}, ProtoOpenAIChat},
+		{StyleCustom, []string{"image_gen"}, ProtoOpenAIImageGen},
+		{StyleCustom, []string{"image_edit"}, ProtoOpenAIImageEdit},
+		// The primary kind (first in canonical order) decides, not the order given.
+		{StyleOpenAI, []string{"image_gen", "chat"}, ProtoOpenAIChat},
+		// A video default that serves every kind is used for a universal model.
+		{StyleGoogle, []string{"chat", "image_gen", "image_edit", "video_gen"}, ProtoGeminiInteractions},
+	}
+	for _, c := range table {
+		if p, err := resolveProtocol(c.style, none, c.kinds, ""); err != nil || p != c.want {
+			t.Errorf("%s %v: %q %v want %q", c.style, c.kinds, p, err, c.want)
+		}
+	}
+	for _, c := range []struct {
+		style string
+		kinds []string
+	}{{StyleAnthropic, []string{"image_gen"}}, {StyleAnthropic, []string{"video_gen"}}, {StyleCustom, []string{"video_gen"}}, {"mystery", []string{"chat"}}, {"", []string{"chat"}}, {StyleCustom, []string{"video_extension"}}} {
+		if p, err := resolveProtocol(c.style, none, c.kinds, ""); !errors.Is(err, ErrProtocolRequired) {
+			t.Errorf("%s %v must need a protocol, got %q %v", c.style, c.kinds, p, err)
+		}
+	}
+	// The upstream's own defaults beat the fallback table.
+	defs := protocolDefaults{"chat": ProtoOpenAIResponses}
+	if p, _ := resolveProtocol(StyleOpenAI, defs, []string{"chat"}, ""); p != ProtoOpenAIResponses {
+		t.Errorf("custom default: %q", p)
+	}
+	// Protocol sets.
+	sets := []struct {
+		style string
+		kinds []string
+		in    []string
+		want  string
+	}{
+		{StyleOpenAI, []string{"image_gen", "image_edit"}, nil, "openai_image_generations,openai_image_edits"},
+		{StyleGoogle, []string{"image_gen", "image_edit"}, nil, "google_image_generation"},
+		{StyleXAI, []string{"image_gen", "image_edit"}, nil, "xai_image,xai_image_edits"},
+		{StyleXAI, []string{"video_gen", "video_extension"}, nil, "xai_video,xai_video_extensions"},
+		{StyleOpenAI, []string{"video_gen", "video_extension"}, nil, "openai_video_generations"},
+		{StyleOpenRouter, []string{"image_gen", "image_edit"}, nil, "openrouter_images"},
+		{StyleOpenAI, []string{"chat"}, []string{" ", ""}, "openai_chat_completions"},
+		{StyleOpenAI, []string{"image_gen", "image_edit"}, []string{"openai_image_edits", "openai_image_generations", "openai_image_edits"}, "openai_image_edits,openai_image_generations"},
+	}
+	for _, c := range sets {
+		got, err := resolveProtocolSet(c.style, none, c.kinds, c.in)
+		if err != nil || strings.Join(got, ",") != c.want {
+			t.Errorf("%s %v %v: %v %v want %s", c.style, c.kinds, c.in, got, err, c.want)
+		}
+	}
+	if _, err := resolveProtocolSet(StyleAnthropic, none, []string{"image_gen", "image_edit"}, nil); !errors.Is(err, ErrProtocolRequired) {
+		t.Errorf("anthropic image set: %v", err)
+	}
+	if _, err := resolveProtocolSet(StyleOpenAI, none, []string{"chat"}, []string{"openai_chat_completions", "openai_responses"}); !errors.Is(err, ErrInvalidCombination) {
+		t.Errorf("two chat protocols: %v", err)
+	}
+	// Suggested protocols never fail with "protocol required".
+	if got, err := suggestedProtocols(StyleAnthropic, none, []string{"image_gen"}); err != nil || len(got) != 0 {
+		t.Errorf("suggested: %v %v", got, err)
+	}
+	if got, err := suggestedProtocols(StyleOpenAI, none, []string{"chat"}); err != nil || len(got) != 1 {
+		t.Errorf("suggested chat: %v %v", got, err)
+	}
+	if got := fallbackDefaultsJSON("anthropic"); got != `{"audio":"anthropic_messages","chat":"anthropic_messages"}` {
+		t.Errorf("fallback json: %s", got)
+	}
+	if got := fallbackDefaultsJSON("mystery"); got != "{}" {
+		t.Errorf("unknown style: %s", got)
+	}
+}
+
+func TestProtocolEndpointKinds(t *testing.T) {
+	for p, want := range map[string]string{
+		ProtoOpenAIChat: "chat_completions", ProtoOpenRouterChat: "chat_completions", ProtoOpenAIResponses: "responses", ProtoXAIResponses: "responses",
+		ProtoOpenRouterResponses: "responses", ProtoOpenAIImageGen: "image_generations", ProtoXAIImage: "image_generations", ProtoGoogleImage: "image_generations",
+		ProtoOpenAIImageEdit: "image_edits", ProtoXAIImageEdit: "image_edits", ProtoOpenRouterImages: "images", ProtoOpenAIVideoGen: "video_generations",
+		ProtoXAIVideo: "video_generations", ProtoXAIVideoExtension: "video_extensions", ProtoGeminiInteractions: "interactions",
+	} {
+		if got := protocolEndpoint(p); got != want {
+			t.Errorf("%s: %q want %q", p, got, want)
+		}
+	}
+}
+
+func TestKeyDocument(t *testing.T) {
+	doc, err := parseAndValidateKeys(`{"strategy":"round_robin","keys":[{"key":"a-key-12345","note":"n"},{"key":"b","status":"off"}],"custom":{"x":1}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.normalizedStrategy() != "round_robin" || len(doc.activeKeys()) != 1 {
+		t.Fatalf("doc: %+v", doc)
+	}
+	out, _ := doc.marshal()
+	if !strings.Contains(out, `"custom":{"x":1}`) {
+		t.Errorf("unrelated fields must be preserved: %s", out)
+	}
+	for _, bad := range []string{`{`, `[]`, `{"keys":[]}`, `{"keys":[{"key":" "}]}`, `{"keys":[{"key":"k","status":"disabled"}]}`, `{"keys":"x"}`, `{"strategy":5,"keys":[{"key":"k"}]}`} {
+		if _, err := parseAndValidateKeys(bad); !errors.Is(err, ErrInvalidAPIKeys) {
+			t.Errorf("%s must be refused: %v", bad, err)
+		}
+	}
+	for in, want := range map[string]string{"failover": "failover", "round_robin": "round_robin", "": "random", "whatever": "random", " failover ": "failover"} {
+		if got := (&keyDoc{Strategy: in}).normalizedStrategy(); got != want {
+			t.Errorf("strategy %q: %s", in, got)
+		}
+	}
+	for in, want := range map[string]string{"": "****", "short": "****", "12345678": "****", "123456789": "1234****6789", " sk-abcdefghijk ": "sk-a****hijk"} {
+		if got := maskKey(in); got != want {
+			t.Errorf("mask %q: %q want %q", in, got, want)
+		}
+	}
+	// Selection helpers.
+	d := &keyDoc{Strategy: "failover", Keys: []keyEntry{{Key: "off", Status: "disabled"}, {Key: "one"}, {Key: "two"}}}
+	if k, ok := d.pickKey(func() int64 { return 5 }); !ok || k != "one" {
+		t.Errorf("failover pick: %q", k)
+	}
+	d.Strategy = "round_robin"
+	if k, _ := d.pickKey(func() int64 { return 5 }); k != "two" {
+		t.Errorf("round robin pick: %q", k)
+	}
+	if k, _ := d.pickKey(func() int64 { return 6 }); k != "one" {
+		t.Errorf("round robin wraps: %q", k)
+	}
+	if _, ok := (&keyDoc{Keys: []keyEntry{{Key: "x", Status: "disabled"}}}).pickKey(func() int64 { return 0 }); ok {
+		t.Error("no active key")
+	}
+}
+
+func TestWebPHeaderParsing(t *testing.T) {
+	// A real 1x1 lossless image, then an extended container around it.
+	vp8l, _ := base64.StdEncoding.DecodeString("UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==")
+	info, err := inspectIcon(vp8l)
+	if err != nil || info.contentType != "image/webp" || info.width != 1 || info.height != 1 || info.ext != ".webp" {
+		t.Fatalf("plain webp: %+v %v", info, err)
+	}
+	chunk := func(tag string, payload []byte) []byte {
+		out := append([]byte(tag), 0, 0, 0, 0)
+		binary.LittleEndian.PutUint32(out[4:], uint32(len(payload)))
+		out = append(out, payload...)
+		if len(payload)%2 == 1 {
+			out = append(out, 0)
+		}
+		return out
+	}
+	riff := func(parts ...[]byte) []byte {
+		body := []byte("WEBP")
+		for _, p := range parts {
+			body = append(body, p...)
+		}
+		out := append([]byte("RIFF"), 0, 0, 0, 0)
+		binary.LittleEndian.PutUint32(out[4:], uint32(len(body)))
+		return append(out, body...)
+	}
+	vp8x := func(flags byte, w, h int) []byte {
+		p := make([]byte, 10)
+		p[0] = flags
+		wm, hm := w-1, h-1
+		p[4], p[5], p[6] = byte(wm), byte(wm>>8), byte(wm>>16)
+		p[7], p[8], p[9] = byte(hm), byte(hm>>8), byte(hm>>16)
+		return chunk("VP8X", p)
+	}
+	img := vp8l[20:33] // the 13-byte VP8L payload
+	ext := riff(vp8x(0, 1, 1), chunk("VP8L", img))
+	if info, err := inspectIcon(ext); err != nil || info.width != 1 || info.height != 1 {
+		t.Fatalf("extended webp: %+v %v", info, err)
+	}
+	// A canvas that disagrees with the still image, or a header with no image
+	// data, does not decode.
+	if _, err := inspectIcon(riff(vp8x(0, 300, 200), chunk("VP8L", img))); !errors.Is(err, ErrIconFileInvalid) {
+		t.Errorf("canvas mismatch: %v", err)
+	}
+	if _, err := inspectIcon(riff(vp8x(0, 100, 50), chunk("EXIF", make([]byte, 8)))); !errors.Is(err, ErrIconFileInvalid) {
+		t.Errorf("header only: %v", err)
+	}
+	// Dimension limits apply to the canvas.
+	if _, err := inspectIcon(riff(vp8x(0x02, 3000, 10), chunk("ANMF", make([]byte, 16)))); !errors.Is(err, ErrIconFileInvalid) {
+		t.Errorf("webp dimensions: %v", err)
+	}
+	if info, err := inspectIcon(riff(vp8x(0x02, 2048, 10), chunk("ANMF", make([]byte, 16)))); err != nil || info.width != 2048 {
+		t.Errorf("animated webp canvas: %+v %v", info, err)
+	}
+	// Truncated, oversized RIFF length and trailing garbage inside the length.
+	trunc := append([]byte(nil), ext...)
+	binary.LittleEndian.PutUint32(trunc[4:], uint32(len(ext)+100))
+	if _, err := inspectIcon(trunc); !errors.Is(err, ErrIconFileInvalid) {
+		t.Errorf("truncated webp: %v", err)
+	}
+	if _, err := inspectIcon(ext[:len(ext)-4]); !errors.Is(err, ErrIconFileInvalid) {
+		t.Errorf("cut webp: %v", err)
+	}
+	two := riff(chunk("VP8L", img), chunk("VP8L", img))
+	if _, err := inspectIcon(two); !errors.Is(err, ErrIconFileInvalid) {
+		t.Errorf("two bitstreams: %v", err)
+	}
+	if _, err := inspectIcon(nil); !errors.Is(err, ErrIconFileInvalid) {
+		t.Errorf("empty: %v", err)
+	}
+	if _, err := inspectIcon(make([]byte, maxIconBytes+1)); !errors.Is(err, ErrIconFileTooLarge) {
+		t.Errorf("big: %v", err)
+	}
+}
