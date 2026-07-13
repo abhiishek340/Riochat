@@ -117,3 +117,155 @@ func TestModelPriceValidation(t *testing.T) {
 		t.Fatalf("long name: %d", code)
 	}
 }
+
+func TestModelPriceTieredValidation(t *testing.T) {
+	e := newEnv(t)
+	tier := func(limit int64) map[string]any {
+		return map[string]any{"fromTokens": 0, "upToTokens": limit, "inputUSDPerMTokens": 1.0, "cacheReadUSDPerMTokens": 0.1,
+			"cacheWriteUSDPerMTokens": 1.0, "outputUSDPerMTokens": 5.0}
+	}
+	asJSON := func(tiers ...map[string]any) string {
+		return mustJSON(map[string]any{"tiers": tiers})
+	}
+	var many []map[string]any
+	for i := 1; i <= 101; i++ {
+		many = append(many, tier(int64(i*1000)))
+	}
+	bad := map[string]string{
+		"non increasing": asJSON(tier(200000), tier(100000)),
+		"empty":          `{"tiers":[]}`,
+		"too many":       asJSON(many...),
+		"garbage":        `[[`,
+		"equal":          asJSON(tier(1000), tier(1000)),
+	}
+	for name, js := range bad {
+		b := priceBody("tm", "tiered")
+		b["tieredPricingJSON"] = js
+		w := e.do("PUT", "/api/v1/admin/billing/model-prices", e.admin(2), b)
+		testkit.Expect(t, w, 400, "billing.invalid_model_pricing")
+		_ = name
+	}
+	good := asJSON(tier(200000), map[string]any{"fromTokens": 200000, "upToTokens": 0, "inputUSDPerMTokens": 4.0, "cacheReadUSDPerMTokens": 0.4,
+		"cacheWriteUSDPerMTokens": 4.0, "outputUSDPerMTokens": 20.0})
+	b := priceBody("tm", "tiered")
+	b["tieredPricingJSON"] = good
+	w := e.do("PUT", "/api/v1/admin/billing/model-prices", e.admin(2), b)
+	testkit.Expect(t, w, 200, "")
+	var out struct {
+		ModelPricing ModelPriceView `json:"modelPricing"`
+	}
+	testkit.Decode(t, w, &out)
+	v := out.ModelPricing
+	if v.InputNanousdPerMTokens != 0 || v.OutputNanousdPerMTokens != 0 || !strings.Contains(v.TieredPricingJSON, "tiers") {
+		t.Fatalf("tiered view %+v", v)
+	}
+}
+
+func TestModelPriceScheduleValidationViaAPI(t *testing.T) {
+	e := newEnv(t)
+	body := func(js string) int {
+		b := priceBody("sm", "token")
+		b["schedulePricingJSON"] = js
+		return e.do("PUT", "/api/v1/admin/billing/model-prices", e.admin(2), b).Code
+	}
+	overlap := `{"periods":[{"name":"a","weekdays":[1,2,3,4,5],"start":"09:00","end":"18:00","ratePercent":150},{"name":"b","weekdays":[1,2,3,4,5],"start":"08:00","end":"10:00","ratePercent":120}]}`
+	if body(overlap) != 400 {
+		t.Fatal("overlap accepted")
+	}
+	ok := `{"periods":[{"name":"night","weekdays":[5],"start":"22:00","end":"06:00","ratePercent":150}]}`
+	if body(ok) != 200 {
+		t.Fatal("night period rejected")
+	}
+	if body(`{"periods":[{"name":"x","weekdays":[1],"start":"09:00","end":"10:00","ratePercent":0}]}`) != 400 {
+		t.Fatal("rate 0 accepted")
+	}
+	if body(`{"periods":[{"name":"x","weekdays":[1],"start":"09:00","end":"10:00","ratePercent":10001}]}`) != 400 {
+		t.Fatal("rate 10001 accepted")
+	}
+	if body(`{}`) != 200 || body(``) != 200 {
+		t.Fatal("empty schedule rejected")
+	}
+}
+
+func TestModelPriceCatalogRules(t *testing.T) {
+	cat := &fakeCatalog{models: map[string]ModelInfo{
+		"chat":  {Name: "chat", Vendor: "acme", Icon: "acme.svg"},
+		"video": {Name: "video", SupportsVideo: true},
+	}}
+	e := newEnv(t, withPorts(func(p *Ports) { p.Models = cat }))
+	put := func(name, mode string) int {
+		return e.do("PUT", "/api/v1/admin/billing/model-prices", e.admin(2), priceBody(name, mode)).Code
+	}
+	if put("ghost", "token") != 400 {
+		t.Fatal("unknown model accepted")
+	}
+	if put("chat", "token") != 200 {
+		t.Fatal("active model rejected")
+	}
+	if put("chat", "duration") != 400 {
+		t.Fatal("duration on non-video model accepted")
+	}
+	if put("video", "duration") != 200 {
+		t.Fatal("duration on video model rejected")
+	}
+	// orphan rows are hidden from the list
+	e.price(ModelPrice{PlatformModelName: "orphan", PricingMode: "token"})
+	w := e.do("GET", "/api/v1/admin/billing/model-prices", e.admin(2), nil)
+	testkit.Expect(t, w, 200, "")
+	var out struct {
+		Total   int64            `json:"total"`
+		Results []ModelPriceView `json:"results"`
+	}
+	testkit.Decode(t, w, &out)
+	if out.Total != 2 || len(out.Results) != 2 {
+		t.Fatalf("list %+v", out)
+	}
+	for _, r := range out.Results {
+		if r.PlatformModelName == "orphan" {
+			t.Fatal("orphan listed")
+		}
+		if r.PlatformModelName == "chat" && (r.ModelVendor != "acme" || r.ModelIcon != "acme.svg") {
+			t.Fatalf("vendor/icon %+v", r)
+		}
+	}
+	// query filter is a case-insensitive substring
+	w = e.do("GET", "/api/v1/admin/billing/model-prices?q=CHA", e.admin(2), nil)
+	testkit.Decode(t, w, &out)
+	if out.Total != 1 || out.Results[0].PlatformModelName != "chat" {
+		t.Fatalf("filtered %+v", out)
+	}
+}
+
+func TestModelPriceListWithoutCatalogOrdersByName(t *testing.T) {
+	e := newEnv(t)
+	for _, n := range []string{"b", "c", "a"} {
+		e.price(ModelPrice{PlatformModelName: n, PricingMode: "token"})
+	}
+	w := e.do("GET", "/api/v1/admin/billing/model-prices?page_size=2", e.admin(2), nil)
+	var out struct {
+		Total   int64            `json:"total"`
+		Results []ModelPriceView `json:"results"`
+	}
+	testkit.Decode(t, w, &out)
+	if out.Total != 3 || len(out.Results) != 2 || out.Results[0].PlatformModelName != "a" || out.Results[1].PlatformModelName != "b" {
+		t.Fatalf("%+v", out)
+	}
+}
+
+func TestPublicPricingInvalidatedOnUpsert(t *testing.T) {
+	e := newEnv(t)
+	e.mode("usage")
+	ctx := t.Context()
+	e.price(ModelPrice{PlatformModelName: "p1", PricingMode: "token", InputNanousdPerMTokens: 1_000_000_000})
+	mode, prices, err := e.svc.PublicPricing(ctx)
+	if err != nil || mode != "usage" || prices["p1"].InputUSDPerMTokens != 1 {
+		t.Fatalf("%s %+v %v", mode, prices, err)
+	}
+	b := priceBody("p1", "token")
+	b["inputUSDPerMTokens"] = 2.0
+	testkit.Expect(t, e.do("PUT", "/api/v1/admin/billing/model-prices", e.admin(2), b), 200, "")
+	_, prices, _ = e.svc.PublicPricing(ctx)
+	if prices["p1"].InputUSDPerMTokens != 2 {
+		t.Fatalf("stale cache: %+v", prices["p1"])
+	}
+}
