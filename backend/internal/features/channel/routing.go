@@ -264,3 +264,281 @@ func (s *Service) ResolveRoute(ctx context.Context, req RouteRequest) (*Route, e
 	}
 	return nil, ErrRoutesUnavailable
 }
+
+func pickWeighted(c []candidate) int {
+	total := 0
+	for _, x := range c {
+		total += effectiveWeight(x.rec.Weight)
+	}
+	n := rand.IntN(total)
+	for i, x := range c {
+		n -= effectiveWeight(x.rec.Weight)
+		if n < 0 {
+			return i
+		}
+	}
+	return len(c) - 1
+}
+
+func effectiveWeight(w int) int {
+	if w <= 0 {
+		return 100
+	}
+	return w
+}
+
+func (s *Service) snapshot(ctx context.Context, pm *PlatformModel, c candidate, upProbe, bindProbe bool) *Route {
+	r, up := c.rec, c.up
+	key, _ := c.keys.pickKey(func() int64 { return s.circuits.nextKeyCounter(ctx, up.ID) })
+	caps := parseCapsLenient(pm.CapabilitiesJSON)
+	view := s.catalog.current()
+	vendor := firstNonEmpty(pm.Vendor, detectVendor(pm.Name, r.UpstreamModelName, up.Name))
+	rEntry := view.matchReasoning(pm.Name, pm.Vendor, protocolKeys([]string{r.Protocol}))
+	mEntry := view.matchModality(pm.Name, pm.Vendor, protocolKeys([]string{r.Protocol}))
+	route := &Route{
+		RouteID: r.RouteID, PlatformModelID: pm.ID, PlatformModelName: pm.Name, UpstreamModelID: r.UpstreamModelID,
+		UpstreamID: up.ID, UpstreamName: up.Name, BindingCode: r.BindingCode, Protocol: r.Protocol,
+		BaseURL: strings.TrimSpace(up.BaseURL), APIKey: key,
+		ConnectTimeout:    time.Duration(timeoutOrDefault(up.ConnectTimeoutMS, defaultConnectTimeoutMS)) * time.Millisecond,
+		ReadTimeout:       time.Duration(timeoutOrDefault(up.ReadTimeoutMS, defaultReadTimeoutMS)) * time.Millisecond,
+		StreamIdleTimeout: time.Duration(timeoutOrDefault(up.StreamIdleTimeoutMS, defaultStreamIdleMS)) * time.Millisecond,
+		HeadersJSON:       mergeHeaders(up.HeadersJSON, r.RouteHeaders),
+		Vendor:            pm.Vendor, Icon: pm.Icon, CapabilitiesJSON: pm.CapabilitiesJSON, SystemPrompt: pm.SystemPrompt,
+		UpstreamModelName: r.UpstreamModelName,
+		Reasoning:         resolveReasoning(caps, []string{r.Protocol}, pm.Vendor, rEntry),
+		UpstreamBreaker: BreakerSettings{FailureThreshold: up.CBFailureThreshold, ModelThreshold: up.CBModelThreshold,
+			ThresholdLogic: up.CBThresholdLogic, DurationMin: up.CBDurationMin, WindowMin: up.CBWindowMin},
+		ModelBreaker:         BreakerSettings{FailureThreshold: pm.CBFailureThreshold, DurationMin: pm.CBDurationMin, WindowMin: pm.CBWindowMin},
+		ModelPolicyMode:      pm.CBPolicyMode,
+		RouteBreaker:         BreakerSettings{FailureThreshold: r.RouteCBFailure, DurationMin: r.RouteCBDuration, WindowMin: r.RouteCBWindow},
+		UpstreamProbeGranted: upProbe, BindingProbeGranted: bindProbe,
+	}
+	route.ReasoningPassback, route.PassbackOptions = passbackFor(r.Protocol, pm.Vendor, pm.Name, r.UpstreamModelName, up.Name)
+	if explicit, declared, valid := caps.explicitInputModalities(); declared && valid && len(explicit) > 0 {
+		route.InputModalities = explicit
+	} else if mEntry != nil {
+		route.InputModalities = append([]string{}, mEntry.Inputs...)
+	}
+	_ = vendor
+	return route
+}
+
+// passbackFor decides whether earlier reasoning content must be passed back.
+func passbackFor(protocol, vendor string, names ...string) (bool, map[string]any) {
+	switch protocol {
+	case ProtoOpenRouterChat:
+		return true, nil
+	case ProtoOpenAIChat:
+		v := canonicalVendor(vendor)
+		if v == "" || v == "unknown" {
+			v = detectVendor(names...)
+		}
+		switch v {
+		case "deepseek", "moonshot", "zhipu", "xiaomi", "minimax":
+			return true, nil
+		case "alibaba":
+			return true, map[string]any{"preserve_thinking": true}
+		}
+	}
+	return false, nil
+}
+
+// ResolveDefaultRoute returns a route for the first public model, in display
+// order and without user filtering, that can serve the task.
+func (s *Service) ResolveDefaultRoute(ctx context.Context, task string) (*Route, error) {
+	list, err := s.ListActiveModels(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range list {
+		if !ModelSupportsTask(parseStoredKinds(m.KindsJSON), task) {
+			continue
+		}
+		r, err := s.ResolveRoute(ctx, RouteRequest{Model: m.PlatformModelName, Task: task, Scope: ScopeInternal})
+		if err == nil {
+			return r, nil
+		}
+	}
+	return nil, ErrRoutesUnavailable
+}
+
+// ---- outcome bookkeeping ---------------------------------------------------------------
+
+func summarizeFailure(err error) string {
+	var ue *UpstreamError
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "upstream request timed out"
+	case errors.As(err, &ue) && ue.StatusCode > 0:
+		return "upstream request failed with status " + strconv.Itoa(ue.StatusCode)
+	}
+	return "upstream request failed"
+}
+
+// parseRetryAfter reads a Retry-After header: whole seconds or an HTTP date.
+func parseRetryAfter(h http.Header, now time.Time) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n < 0 {
+			return 0
+		}
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := t.Sub(now)
+		if d <= 0 {
+			return 0
+		}
+		return time.Duration(math.Ceil(d.Seconds())) * time.Second
+	}
+	return 0
+}
+
+func (s *Service) bookkeepingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+// MarkSuccess records a successful use of a route.
+func (s *Service) MarkSuccess(ctx context.Context, r *Route) {
+	if r == nil || r.UpstreamID == 0 {
+		return
+	}
+	ctx, cancel := s.bookkeepingCtx(ctx)
+	defer cancel()
+	if err := s.circuits.clearBackoff(ctx, r.UpstreamID, r.RouteID); err != nil {
+		s.log.Warn("llm_backoff_clear_failed", logx.Err(err))
+	}
+	if r.UpstreamProbeGranted {
+		if err := s.circuits.clearScope(ctx, upstreamPrefix(r.UpstreamID)); err != nil {
+			s.log.Warn("llm_circuit_clear_failed", logx.Err(err))
+		}
+	}
+	if r.BindingProbeGranted {
+		if err := s.circuits.clearScope(ctx, bindingPrefix(r.UpstreamID, r.BindingCode)); err != nil {
+			s.log.Warn("llm_circuit_clear_failed", logx.Err(err))
+		}
+	}
+	_ = s.circuits.setMeta(ctx, upstreamPrefix(r.UpstreamID), "last_success_at", strconv.FormatInt(s.now().Unix(), 10))
+}
+
+func pickPositive(vals ...int) int {
+	for _, v := range vals {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+// MarkFailure records a failed use of a route and decides whether it trips a
+// circuit or backs the route off.
+func (s *Service) MarkFailure(ctx context.Context, r *Route, cause error) {
+	if r == nil || r.UpstreamID == 0 {
+		return
+	}
+	ctx, cancel := s.bookkeepingCtx(ctx)
+	defer cancel()
+	release := func() {
+		if r.UpstreamProbeGranted {
+			_ = s.circuits.releaseProbe(ctx, upstreamPrefix(r.UpstreamID))
+		}
+		if r.BindingProbeGranted {
+			_ = s.circuits.releaseProbe(ctx, bindingPrefix(r.UpstreamID, r.BindingCode))
+		}
+	}
+	if cause == nil {
+		release()
+		return
+	}
+	// Every failure leaves a trace on the upstream, before it is classified.
+	up := upstreamPrefix(r.UpstreamID)
+	_ = s.circuits.setMeta(ctx, up, "last_failure_at", strconv.FormatInt(s.now().Unix(), 10))
+	_ = s.circuits.setMeta(ctx, up, "last_error", summarizeFailure(cause))
+	if errors.Is(cause, context.Canceled) {
+		release()
+		return
+	}
+
+	class := s.classification(ctx)
+	var ue *UpstreamError
+	status := 0
+	if errors.As(cause, &ue) {
+		status = ue.StatusCode
+	}
+	switch {
+	case status >= 400 && status < 500 && status != http.StatusTooManyRequests && listHas(class.IgnoreErrors, "4xx"):
+		release()
+		return
+	case status == http.StatusTooManyRequests && listHas(class.RateLimitErrors, "429"):
+		release()
+		var retry time.Duration
+		if ue != nil {
+			retry = parseRetryAfter(ue.Header, s.now())
+		}
+		if _, err := s.circuits.recordBackoff(ctx, r.UpstreamID, r.RouteID, s.backoffSettings(ctx), retry); err != nil {
+			s.log.Warn("llm_backoff_record_failed", logx.Err(err))
+		}
+		return
+	}
+	defs := s.breakerSettings(ctx)
+	if !defs.Enabled {
+		release()
+		return
+	}
+	// Effective thresholds.
+	bind := BreakerSettings{
+		FailureThreshold: pickPositive(r.RouteBreaker.FailureThreshold, r.ModelBreaker.FailureThreshold, defs.ModelFailureThreshold),
+		WindowMin:        pickPositive(r.RouteBreaker.WindowMin, r.ModelBreaker.WindowMin, defs.ModelWindowMin),
+		DurationMin:      pickPositive(r.RouteBreaker.DurationMin, r.ModelBreaker.DurationMin, defs.ModelDurationMin),
+	}
+	if r.ModelPolicyMode == "enforced" {
+		bind = BreakerSettings{
+			FailureThreshold: pickPositive(r.ModelBreaker.FailureThreshold, defs.ModelFailureThreshold),
+			WindowMin:        pickPositive(r.ModelBreaker.WindowMin, defs.ModelWindowMin),
+			DurationMin:      pickPositive(r.ModelBreaker.DurationMin, defs.ModelDurationMin),
+		}
+	}
+	upl := upstreamLevel{
+		breakerLevel: breakerLevel{
+			Threshold: pickPositive(r.UpstreamBreaker.FailureThreshold, defs.UpstreamFailureThreshold),
+			Window:    time.Duration(pickPositive(r.UpstreamBreaker.WindowMin, defs.UpstreamWindowMin)) * time.Minute,
+			Duration:  time.Duration(pickPositive(r.UpstreamBreaker.DurationMin, defs.UpstreamDurationMin)) * time.Minute,
+		},
+		ModelThreshold: pickPositive(r.UpstreamBreaker.ModelThreshold, defs.UpstreamModelThreshold),
+		Logic:          firstNonEmpty(r.UpstreamBreaker.ThresholdLogic, defs.UpstreamThresholdLogic),
+	}
+	bindPrefix := bindingPrefix(r.UpstreamID, r.BindingCode)
+	active := s.activeBindingPrefixes(ctx, r.UpstreamID)
+	if len(active) == 0 {
+		active = []string{bindPrefix}
+	}
+	_, err := s.circuits.recordFailure(ctx, up, bindPrefix, breakerLevel{
+		Threshold: bind.FailureThreshold, Window: time.Duration(bind.WindowMin) * time.Minute,
+		Duration: time.Duration(bind.DurationMin) * time.Minute,
+	}, upl, active)
+	if err != nil {
+		s.log.Warn("llm_circuit_record_failed", logx.Err(err))
+	}
+}
+
+// activeBindingPrefixes lists the circuit prefixes of the upstream's bindings
+// that have an active route, upstream model and platform model.
+func (s *Service) activeBindingPrefixes(ctx context.Context, upstreamID uint) []string {
+	var codes []string
+	err := s.db.WithContext(ctx).Table("llm_model_routes AS r").
+		Joins("JOIN llm_upstream_models um ON um.id = r.upstream_model_id").
+		Joins("JOIN llm_platform_models pm ON pm.id = r.platform_model_id").
+		Where("um.upstream_id = ? AND r.status = ? AND um.status = ? AND pm.status = ?", upstreamID, StatusActive, StatusActive, StatusActive).
+		Distinct().Pluck("um.binding_code", &codes).Error
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(codes))
+	for _, c := range codes {
+		out = append(out, bindingPrefix(upstreamID, c))
+	}
+	return out
+}
