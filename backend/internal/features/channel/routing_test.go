@@ -279,3 +279,556 @@ func TestRoutingPassbackFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestRoutingCircuitBreakerSkips(t *testing.T) {
+	s := newSuite(t)
+	up, row := s.mkChat("cbskip", "cb-model")
+	// Disabled breaker: an open key does not matter.
+	_ = s.svc.circuits.openManual(bg, upstreamPrefix(up.ID))
+	if _, err := s.resolve("cb-model"); err != nil {
+		t.Fatalf("breaker disabled must ignore circuits: %v", err)
+	}
+	s.setBreaker(`{"enabled":true}`) // clears every circuit
+	if _, err := s.resolve("cb-model"); err != nil {
+		t.Fatalf("closed after global enable: %v", err)
+	}
+	s.ok("POST", fmt.Sprintf("%s/%d/circuit/open", upPath, up.ID), nil)
+	if _, err := s.resolve("cb-model"); !errors.Is(err, ErrRoutesUnavailable) {
+		t.Fatalf("open upstream circuit: %v", err)
+	}
+	s.ok("POST", fmt.Sprintf("%s/%d/circuit/reset", upPath, up.ID), nil)
+	s.ok("POST", fmt.Sprintf("%s/%d/models/%d/circuit/open", upPath, up.ID, row.RouteID), nil)
+	if _, err := s.resolve("cb-model"); !errors.Is(err, ErrRoutesUnavailable) {
+		t.Fatalf("open binding circuit: %v", err)
+	}
+	s.ok("POST", fmt.Sprintf("%s/%d/models/%d/circuit/reset", upPath, up.ID, row.RouteID), nil)
+	if _, err := s.resolve("cb-model"); err != nil {
+		t.Fatalf("after reset: %v", err)
+	}
+	// A skipped tier falls through to the next one.
+	up2 := s.mkUpstream("cbskip2", "openai", nil)
+	r2 := s.bind(up2.ID, "cb-model", "other", []string{ProtoOpenAIChat}, map[string]any{"priority": 2})
+	s.ok("POST", fmt.Sprintf("%s/%d/circuit/open", upPath, up.ID), nil)
+	r, err := s.resolve("cb-model")
+	if err != nil || r.RouteID != r2.RouteID {
+		t.Fatalf("fall through: %+v %v", r, err)
+	}
+	// Turning the breaker off and on again clears manual circuits.
+	s.setBreaker(`{"enabled":false}`)
+	s.setBreaker(`{"enabled":true}`)
+	if r, err = s.resolve("cb-model"); err != nil || r.UpstreamID != up.ID {
+		t.Fatalf("state cleared on enable: %+v %v", r, err)
+	}
+}
+
+func failure(status int) error { return &UpstreamError{StatusCode: status, Err: errors.New("boom")} }
+
+func TestFailureClassification(t *testing.T) {
+	s := newSuite(t)
+	up, row := s.mkChat("cls", "cls-model")
+	s.setBreaker(`{"enabled":true,"model_failure_threshold":1}`)
+	reset := func() {
+		_ = s.svc.circuits.reset(bg, upstreamPrefix(up.ID), true)
+		_ = s.svc.circuits.reset(bg, bindingPrefix(up.ID, row.BindingCode), false)
+		_ = s.svc.circuits.clearBackoff(bg, up.ID, row.RouteID)
+	}
+	open := func() bool {
+		o, _, _ := s.svc.circuits.peekOpen(bg, bindingPrefix(up.ID, row.BindingCode))
+		return o
+	}
+	backoff := func() time.Duration {
+		d, _ := s.svc.circuits.backoffRemaining(bg, up.ID, row.RouteID)
+		return d
+	}
+	route := func() *Route {
+		r, err := s.resolve("cls-model")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	// 500 trips; 404 and cancellation do not; deadline trips.
+	s.svc.MarkFailure(bg, route(), failure(404))
+	if open() || backoff() > 0 {
+		t.Fatal("404 must be ignored")
+	}
+	s.svc.MarkFailure(bg, route(), context.Canceled)
+	s.svc.MarkFailure(bg, route(), nil)
+	if open() {
+		t.Fatal("cancellation and nil must be ignored")
+	}
+	s.svc.MarkFailure(bg, route(), failure(500))
+	if !open() {
+		t.Fatal("500 must trip the circuit")
+	}
+	reset()
+	s.svc.MarkFailure(bg, route(), context.DeadlineExceeded)
+	if !open() {
+		t.Fatal("deadline must trip the circuit")
+	}
+	reset()
+	s.svc.MarkFailure(bg, route(), io.ErrUnexpectedEOF)
+	if !open() {
+		t.Fatal("connection errors trip the circuit")
+	}
+	reset()
+	// 429 backs off, no circuit.
+	s.svc.MarkFailure(bg, route(), failure(429))
+	if open() || backoff() <= 0 {
+		t.Fatalf("429: open=%v backoff=%v", open(), backoff())
+	}
+	reset()
+	// Removing 429 from the rate limit list makes it a circuit failure.
+	s.env.DB.Model(&settingRow{}).Where("namespace = ? AND \"key\" = ?", "llm", "circuit_breaker.error_classification").
+		Update("value", `{"circuit_errors":["5xx"],"rate_limit_errors":["x"],"ignore_errors":["4xx"]}`)
+	s.svc.MarkFailure(bg, route(), failure(429))
+	if !open() || backoff() > 0 {
+		t.Fatalf("429 without list entry: open=%v backoff=%v", open(), backoff())
+	}
+	reset()
+	// Removing 4xx from the ignore list makes 404 count.
+	s.env.DB.Model(&settingRow{}).Where("namespace = ? AND \"key\" = ?", "llm", "circuit_breaker.error_classification").
+		Update("value", `{"circuit_errors":["5xx"],"rate_limit_errors":[" 429 "],"ignore_errors":["nothing"]}`)
+	s.svc.MarkFailure(bg, route(), failure(404))
+	if !open() {
+		t.Fatal("404 must count when 4xx is not ignored")
+	}
+	reset()
+	// Matching is trim + case-insensitive.
+	s.svc.MarkFailure(bg, route(), failure(429))
+	if backoff() <= 0 {
+		t.Fatal("padded 429 entry must match")
+	}
+	reset()
+	// Breaker disabled: only a 429 back-off is recorded, no circuit.
+	s.setBreaker(`{"enabled":false}`)
+	s.svc.MarkFailure(bg, route(), failure(500))
+	if open() {
+		t.Fatal("disabled breaker never trips")
+	}
+	// External routes are ignored.
+	s.svc.MarkFailure(bg, &Route{UpstreamID: 0}, failure(500))
+	s.svc.MarkSuccess(bg, nil)
+}
+
+func TestRateLimitBackoff(t *testing.T) {
+	s := newSuite(t)
+	u1 := s.mkUpstream("bo1", "openai", nil)
+	u2 := s.mkUpstream("bo2", "openai", nil)
+	a := s.bind(u1.ID, "bo-model", "a", []string{ProtoOpenAIChat}, nil)
+	b := s.bind(u2.ID, "bo-model", "b", []string{ProtoOpenAIChat}, nil)
+	ra := func() *Route {
+		for i := 0; i < 200; i++ {
+			r, err := s.resolve("bo-model")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.RouteID == a.RouteID {
+				return r
+			}
+		}
+		t.Fatal("route a never drawn")
+		return nil
+	}
+	err429 := &UpstreamError{StatusCode: 429, Err: errors.New("slow down"), Header: http.Header{"Retry-After": []string{"12"}}}
+	s.svc.MarkFailure(bg, ra(), err429)
+	// Route a is skipped for at least 12 s; the sibling is still served.
+	for i := 0; i < 50; i++ {
+		r, err := s.resolve("bo-model")
+		if err != nil || r.RouteID != b.RouteID {
+			t.Fatalf("sibling expected: %+v %v", r, err)
+		}
+	}
+	if d, _ := s.svc.circuits.backoffRemaining(bg, u1.ID, a.RouteID); d < 12*time.Second || d > 60*time.Second {
+		t.Fatalf("backoff %v", d)
+	}
+	// Everything backing off: the rate-limited error exposes the shortest wait.
+	s.svc.MarkFailure(bg, &Route{RouteID: b.RouteID, UpstreamID: u2.ID, BindingCode: b.BindingCode}, &UpstreamError{StatusCode: 429, Err: errors.New("x")})
+	_, err := s.resolve("bo-model")
+	if !errors.Is(err, ErrUpstreamLimited) {
+		t.Fatalf("expected rate limited, got %v", err)
+	}
+	wait, ok := RetryAfterOf(err)
+	if !ok || wait <= 0 || wait > 12*time.Second {
+		t.Fatalf("retry after: %v %v", wait, ok)
+	}
+	// Time passing releases the route.
+	s.env.Clock.Advance(61 * time.Second)
+	if _, err := s.resolve("bo-model"); err != nil {
+		t.Fatalf("after wait: %v", err)
+	}
+	// Success clears the back-off.
+	s.svc.MarkFailure(bg, &Route{RouteID: a.RouteID, UpstreamID: u1.ID, BindingCode: a.BindingCode}, err429)
+	s.svc.MarkSuccess(bg, &Route{RouteID: a.RouteID, UpstreamID: u1.ID, BindingCode: a.BindingCode})
+	if d, _ := s.svc.circuits.backoffRemaining(bg, u1.ID, a.RouteID); d != 0 {
+		t.Fatalf("success must clear back-off: %v", d)
+	}
+	// Exponential growth, capped by the maximum; Retry-After is bounded by the maximum too.
+	cfg := backoffConfig{BaseSec: 5, MaxSec: 60, Multiplier: 2}
+	var last time.Duration
+	for i := 0; i < 6; i++ {
+		d, err := s.svc.circuits.recordBackoff(bg, 900, 901, cfg, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 4 && d != time.Duration(5<<i)*time.Second {
+			t.Fatalf("step %d: %v", i, d)
+		}
+		last = d
+	}
+	if last != 60*time.Second {
+		t.Fatalf("cap: %v", last)
+	}
+	if d, _ := s.svc.circuits.recordBackoff(bg, 902, 903, cfg, 500*time.Second); d != 60*time.Second {
+		t.Fatalf("retry-after above max: %v", d)
+	}
+	if d, _ := s.svc.circuits.recordBackoff(bg, 904, 905, backoffConfig{}, 0); d != 5*time.Second {
+		t.Fatalf("normalized defaults: %v", d)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	h := func(v string) http.Header { return http.Header{"Retry-After": []string{v}} }
+	if got := parseRetryAfter(h("7"), now); got != 7*time.Second {
+		t.Errorf("seconds: %v", got)
+	}
+	if got := parseRetryAfter(h("-5"), now); got != 0 {
+		t.Errorf("negative: %v", got)
+	}
+	if got := parseRetryAfter(h(now.Add(90*time.Second+500*time.Millisecond).UTC().Format(http.TimeFormat)), now); got != 91*time.Second && got != 90*time.Second {
+		t.Errorf("http date: %v", got)
+	}
+	if got := parseRetryAfter(h(now.Add(-time.Hour).UTC().Format(http.TimeFormat)), now); got != 0 {
+		t.Errorf("past date: %v", got)
+	}
+	if got := parseRetryAfter(h("soon"), now); got != 0 {
+		t.Errorf("garbage: %v", got)
+	}
+	if got := parseRetryAfter(http.Header{}, now); got != 0 {
+		t.Errorf("absent: %v", got)
+	}
+	lower := http.Header{}
+	lower["retry-after"] = []string{"3"} // non-canonical key
+	_ = lower
+}
+
+func TestCircuitThresholdMath(t *testing.T) {
+	s := newSuite(t)
+	u := s.mkUpstream("thr", "openai", nil)
+	row := s.bind(u.ID, "thr-model", "thr-up", []string{ProtoOpenAIChat}, nil)
+	s.setBreaker(`{"enabled":true}`) // model threshold 5 in 3 minutes, 15 minutes open
+	bind := bindingPrefix(u.ID, row.BindingCode)
+	fail := func() {
+		r, err := s.resolve("thr-model")
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		s.svc.MarkFailure(bg, r, failure(503))
+	}
+	isOpen := func(prefix string) (bool, int64) {
+		o, until, _ := s.svc.circuits.peekOpen(bg, prefix)
+		return o, until
+	}
+	for i := 0; i < 4; i++ {
+		fail()
+		if o, _ := isOpen(bind); o {
+			t.Fatalf("opened too early after %d failures", i+1)
+		}
+	}
+	fail()
+	o, until := isOpen(bind)
+	if !o {
+		t.Fatal("5th failure must open the binding circuit")
+	}
+	if want := s.env.Clock.Now().Add(15 * time.Minute).Unix(); until < want-1 || until > want+1 {
+		t.Fatalf("open for 15 minutes: until %d want %d", until, want)
+	}
+	// Failures outside the window do not accumulate.
+	_ = s.svc.circuits.reset(bg, bind, true)
+	for i := 0; i < 4; i++ {
+		r, _ := s.resolve("thr-model")
+		s.svc.MarkFailure(bg, r, failure(503))
+	}
+	s.env.Clock.Advance(4 * time.Minute)
+	r, _ := s.resolve("thr-model")
+	s.svc.MarkFailure(bg, r, failure(503))
+	if o, _ := isOpen(bind); o {
+		t.Fatal("old failures must age out of the window")
+	}
+}
+
+func TestCircuitPolicyModes(t *testing.T) {
+	// Route overrides win in default mode; the platform model wins when enforced.
+	for _, mode := range []string{"default", "enforced"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newSuite(t)
+			u := s.mkUpstream("pol", "openai", nil)
+			row := s.bind(u.ID, "pol-model", "pol-up", []string{ProtoOpenAIChat}, map[string]any{"cbFailureThreshold": 2, "cbDurationMin": 7})
+			s.ok("PATCH", fmt.Sprintf("%s/%d", mdPath, row.PlatformModelID), map[string]any{"cbPolicyMode": mode, "cbFailureThreshold": 3, "cbDurationMin": 20})
+			s.setBreaker(`{"enabled":true}`)
+			bind := bindingPrefix(u.ID, row.BindingCode)
+			trips := 0
+			for i := 1; i <= 4; i++ {
+				r, _ := s.resolve("pol-model")
+				s.svc.MarkFailure(bg, r, failure(500))
+				if o, _, _ := s.svc.circuits.peekOpen(bg, bind); o && trips == 0 {
+					trips = i
+				}
+			}
+			_, until, _ := s.svc.circuits.peekOpen(bg, bind)
+			mins := time.Duration(until-s.env.Clock.Now().Unix()) * time.Second / time.Minute
+			if mode == "default" && (trips != 2 || mins < 6 || mins > 7) {
+				t.Fatalf("route overrides: tripped at %d for %d min", trips, mins)
+			}
+			if mode == "enforced" && (trips != 3 || mins < 19 || mins > 20) {
+				t.Fatalf("model policy: tripped at %d for %d min", trips, mins)
+			}
+		})
+	}
+}
+
+func TestUpstreamCircuitRules(t *testing.T) {
+	setup := func(t *testing.T, logic string) (*suite, uint, []UpstreamModelRow) {
+		s := newSuite(t)
+		u := s.mkUpstream("rule", "openai", map[string]any{"cbThresholdLogic": logic, "cbFailureThreshold": 1000, "cbModelThreshold": 3})
+		var rows []UpstreamModelRow
+		for i := 0; i < 3; i++ {
+			rows = append(rows, s.bind(u.ID, fmt.Sprintf("rule-%d", i), fmt.Sprintf("rule-up-%d", i), []string{ProtoOpenAIChat}, map[string]any{"cbFailureThreshold": 1}))
+		}
+		s.setBreaker(`{"enabled":true}`)
+		return s, u.ID, rows
+	}
+	failModel := func(s *suite, i int) {
+		r, err := s.resolve(fmt.Sprintf("rule-%d", i))
+		if err != nil {
+			s.t.Fatalf("resolve rule-%d: %v", i, err)
+		}
+		s.svc.MarkFailure(bg, r, failure(500))
+	}
+	t.Run("or", func(t *testing.T) {
+		s, id, _ := setup(t, "or")
+		failModel(s, 0)
+		failModel(s, 1)
+		if o, _, _ := s.svc.circuits.peekOpen(bg, upstreamPrefix(id)); o {
+			t.Fatal("two open bindings are below the model threshold")
+		}
+		failModel(s, 2)
+		if o, _, _ := s.svc.circuits.peekOpen(bg, upstreamPrefix(id)); !o {
+			t.Fatal("three open bindings must trip the upstream with the or rule")
+		}
+	})
+	t.Run("and", func(t *testing.T) {
+		s, id, _ := setup(t, "and")
+		failModel(s, 0)
+		failModel(s, 1)
+		failModel(s, 2)
+		if o, _, _ := s.svc.circuits.peekOpen(bg, upstreamPrefix(id)); o {
+			t.Fatal("and needs the upstream failure count too")
+		}
+	})
+	t.Run("and with both satisfied", func(t *testing.T) {
+		s := newSuite(t)
+		u := s.mkUpstream("rule", "openai", map[string]any{"cbThresholdLogic": "and", "cbFailureThreshold": 3, "cbModelThreshold": 2})
+		for i := 0; i < 3; i++ {
+			th := 1
+			if i == 2 {
+				th = 100
+			}
+			s.bind(u.ID, fmt.Sprintf("rule-%d", i), fmt.Sprintf("rule-up-%d", i), []string{ProtoOpenAIChat}, map[string]any{"cbFailureThreshold": th})
+		}
+		s.setBreaker(`{"enabled":true}`)
+		failModel(s, 0)
+		failModel(s, 1)
+		if o, _, _ := s.svc.circuits.peekOpen(bg, upstreamPrefix(u.ID)); o {
+			t.Fatal("2 failures are below the upstream threshold of 3")
+		}
+		failModel(s, 2)
+		if o, _, _ := s.svc.circuits.peekOpen(bg, upstreamPrefix(u.ID)); !o {
+			t.Fatal("both conditions hold now")
+		}
+	})
+}
+
+func TestHalfOpenProbe(t *testing.T) {
+	s := newSuite(t)
+	u := s.mkUpstream("half", "openai", nil)
+	row := s.bind(u.ID, "half-model", "half-up", []string{ProtoOpenAIChat}, map[string]any{"cbFailureThreshold": 1, "cbDurationMin": 1})
+	s.setBreaker(`{"enabled":true}`)
+	r, _ := s.resolve("half-model")
+	s.svc.MarkFailure(bg, r, failure(500))
+	if _, err := s.resolve("half-model"); !errors.Is(err, ErrRoutesUnavailable) {
+		t.Fatalf("open: %v", err)
+	}
+	// After the open period the first request becomes the probe; a concurrent one is refused.
+	s.env.Clock.Advance(61 * time.Second)
+	probe, err := s.resolve("half-model")
+	if err != nil || !probe.BindingProbeGranted {
+		t.Fatalf("probe: %+v %v", probe, err)
+	}
+	if _, err := s.resolve("half-model"); !errors.Is(err, ErrRoutesUnavailable) {
+		t.Fatalf("second request during probe: %v", err)
+	}
+	// Success clears the circuit.
+	s.svc.MarkSuccess(bg, probe)
+	if r, err := s.resolve("half-model"); err != nil || r.BindingProbeGranted {
+		t.Fatalf("closed after probe success: %+v %v", r, err)
+	}
+	// Probe failure re-opens at once.
+	s.svc.MarkFailure(bg, r, failure(500))
+	s.env.Clock.Advance(61 * time.Second)
+	probe, err = s.resolve("half-model")
+	if err != nil || !probe.BindingProbeGranted {
+		t.Fatalf("second probe: %+v %v", probe, err)
+	}
+	s.svc.MarkFailure(bg, probe, failure(500))
+	if _, err := s.resolve("half-model"); !errors.Is(err, ErrRoutesUnavailable) {
+		t.Fatalf("probe failure must re-open: %v", err)
+	}
+	// A probe that was ignored (4xx) is released so the next request can probe.
+	s.env.Clock.Advance(61 * time.Second)
+	probe, err = s.resolve("half-model")
+	if err != nil || !probe.BindingProbeGranted {
+		t.Fatalf("third probe: %+v %v", probe, err)
+	}
+	s.svc.MarkFailure(bg, probe, failure(400))
+	if p2, err := s.resolve("half-model"); err != nil || !p2.BindingProbeGranted {
+		t.Fatalf("released probe should be grantable again: %+v %v", p2, err)
+	}
+	_ = row
+}
+
+func TestRoutingAccessControl(t *testing.T) {
+	s := newSuite(t)
+	_, row := s.mkChat("acc", "acc-model")
+	// Internal scope vs user scope on an internal model.
+	m := s.mkModel("secret-model", map[string]any{"accessScope": "internal"})
+	up := s.mkUpstream("acc2", "openai", nil)
+	s.bind(up.ID, m.PlatformModelName, "sec", []string{ProtoOpenAIChat}, nil)
+	if _, err := s.svc.ResolveRoute(bg, RouteRequest{Model: "secret-model", Scope: ScopeUser}); !errors.Is(err, ErrModelAccessDenied) {
+		t.Fatalf("internal model, user scope: %v", err)
+	}
+	if _, err := s.svc.ResolveRoute(bg, RouteRequest{Model: "secret-model", Scope: "weird"}); !errors.Is(err, ErrModelAccessDenied) {
+		t.Fatalf("unknown scope behaves as user: %v", err)
+	}
+	if _, err := s.svc.ResolveRoute(bg, RouteRequest{Model: "secret-model", Scope: ScopeInternal, UserID: 9}); err != nil {
+		t.Fatalf("internal scope: %v", err)
+	}
+	// User id 0 skips group checks; a user needs a group.
+	if _, err := s.svc.ResolveRoute(bg, RouteRequest{Model: "acc-model"}); err != nil {
+		t.Fatalf("user 0: %v", err)
+	}
+	if _, err := s.svc.ResolveRoute(bg, RouteRequest{Model: "acc-model", UserID: 7}); !errors.Is(err, ErrModelAccessDenied) {
+		t.Fatalf("model without groups denies: %v", err)
+	}
+	g, _ := s.svc.CreatePermissionGroup(bg, PermissionGroup{Name: "vip"})
+	_ = s.svc.SetModelGroups(bg, row.PlatformModelID, []uint{g.ID})
+	if _, err := s.svc.ResolveRoute(bg, RouteRequest{Model: "acc-model", UserID: 7}); !errors.Is(err, ErrModelAccessDenied) {
+		t.Fatalf("user outside the group: %v", err)
+	}
+	_ = s.svc.SetGroupUsers(bg, g.ID, []uint{7})
+	if _, err := s.svc.ResolveRoute(bg, RouteRequest{Model: "acc-model", UserID: 7}); err != nil {
+		t.Fatalf("user in group: %v", err)
+	}
+	// Internal scope ignores groups entirely.
+	if _, err := s.svc.ResolveRoute(bg, RouteRequest{Model: "acc-model", UserID: 8, Scope: ScopeInternal}); err != nil {
+		t.Fatalf("internal scope ignores groups: %v", err)
+	}
+}
+
+func TestResolveDefaultRoute(t *testing.T) {
+	s := newSuite(t)
+	if _, err := s.svc.ResolveDefaultRoute(bg, "chat"); !errors.Is(err, ErrRoutesUnavailable) {
+		t.Fatalf("empty catalog: %v", err)
+	}
+	// First model in display order that can serve the task and resolves.
+	u := s.mkUpstream("def", "openai", nil)
+	s.bind(u.ID, "gpt-image-1", "img", []string{}, nil)
+	s.bind(u.ID, "chatty", "chatty", []string{ProtoOpenAIChat}, nil)
+	r, err := s.svc.ResolveDefaultRoute(bg, "chat")
+	if err != nil || r.PlatformModelName != "chatty" {
+		t.Fatalf("chat default: %+v %v", r, err)
+	}
+	r, err = s.svc.ResolveDefaultRoute(bg, "image_generation")
+	if err != nil || r.PlatformModelName != "gpt-image-1" || r.Protocol != ProtoOpenAIImageGen {
+		t.Fatalf("image default: %+v %v", r, err)
+	}
+	if _, err := s.svc.ResolveDefaultRoute(bg, "video_generation"); !errors.Is(err, ErrRoutesUnavailable) {
+		t.Fatalf("video default: %v", err)
+	}
+}
+
+func TestShouldFailOver(t *testing.T) {
+	type netTimeout struct{ error }
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"503", failure(503), true},
+		{"500", failure(500), true},
+		{"408", failure(408), true},
+		{"429", failure(429), true},
+		{"400", failure(400), false},
+		{"404", failure(404), false},
+		{"422", failure(422), false},
+		{"eof", io.EOF, true},
+		{"unexpected eof", io.ErrUnexpectedEOF, true},
+		{"wrapped eof", fmt.Errorf("read: %w", io.EOF), true},
+		{"accepted eof", &UpstreamError{Err: io.EOF, Accepted: true}, false},
+		{"accepted 503", &UpstreamError{StatusCode: 503, Accepted: true}, false},
+		{"cancel", context.Canceled, false},
+		{"wrapped cancel", fmt.Errorf("x: %w", context.Canceled), false},
+		{"deadline", context.DeadlineExceeded, true},
+		{"generic", errors.New("validation failed"), false},
+	}
+	for _, c := range cases {
+		if got := ShouldFailOver(c.err); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+	_ = netTimeout{}
+}
+
+func TestTaskHelpers(t *testing.T) {
+	for in, want := range map[string]string{"": "chat", "weird": "chat", " Image_Generation ": "image_generation", "image_edit": "image_edit",
+		"video_generation": "video_generation", "video_extension": "video_extension", "chat": "chat"} {
+		if got := NormalizeTaskType(in); got != want {
+			t.Errorf("normalize %q: %s", in, got)
+		}
+	}
+	cases := []struct {
+		kinds    []string
+		protocol string
+		task     string
+		want     bool
+	}{
+		{[]string{"chat"}, ProtoOpenAIChat, "chat", true},
+		{[]string{"audio"}, ProtoOpenAIChat, "chat", true},
+		{[]string{"audio"}, ProtoGeminiInteractions, "chat", false},
+		{[]string{"chat"}, ProtoOpenAIImageGen, "chat", false},
+		{[]string{"chat"}, ProtoOpenAIChat, "image_generation", false},
+		{[]string{"image_gen"}, ProtoOpenAIImageGen, "image_generation", true},
+		{[]string{"image_gen"}, ProtoOpenAIImageEdit, "image_edit", false},
+		{[]string{"image_edit"}, ProtoOpenAIImageEdit, "image_edit", true},
+		{[]string{"video_gen"}, ProtoXAIVideo, "video_generation", true},
+		{[]string{"video_gen", "video_extension"}, ProtoXAIVideoExtension, "video_generation", false},
+		{[]string{"video_gen", "video_extension"}, ProtoXAIVideoExtension, "video_extension", true},
+		{[]string{"video_extension"}, ProtoXAIVideo, "video_extension", false},
+		{nil, ProtoOpenAIChat, "chat", true},
+		{nil, ProtoOpenAIImageGen, "chat", false},
+		{nil, ProtoOpenAIImageGen, "image_generation", true},
+		{[]string{"chat", "image_gen"}, ProtoGeminiInteractions, "image_generation", true},
+	}
+	for i, c := range cases {
+		if got := RouteServesTask(c.kinds, c.protocol, c.task); got != c.want {
+			t.Errorf("case %d (%v %s %s): got %v", i, c.kinds, c.protocol, c.task, got)
+		}
+	}
+	if !ModelSupportsTask(nil, "image_edit") || ModelSupportsTask([]string{"chat"}, "image_edit") || !ModelSupportsTask([]string{"chat"}, "") ||
+		!ModelSupportsTask([]string{"video_gen"}, "video_generation") || ModelSupportsTask([]string{"video_gen"}, "video_extension") ||
+		ModelSupportsTask([]string{"image_gen"}, "chat") {
+		t.Error("ModelSupportsTask")
+	}
+}
