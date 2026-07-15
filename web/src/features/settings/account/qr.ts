@@ -184,3 +184,186 @@ function drawFormat(g: Grid, mask: number): void {
   for (let i = 8; i < 15; i++) setFixed(g, 8, g.size - 15 + i, bit(bits, i));
   setFixed(g, 8, g.size - 8, true);
 }
+
+function drawFunctionPatterns(g: Grid, version: number): void {
+  for (let i = 0; i < g.size; i++) {
+    setFixed(g, 6, i, i % 2 === 0);
+    setFixed(g, i, 6, i % 2 === 0);
+  }
+  for (const [cx, cy] of [
+    [3, 3],
+    [g.size - 4, 3],
+    [3, g.size - 4],
+  ] as const) {
+    for (let dy = -4; dy <= 4; dy++) {
+      for (let dx = -4; dx <= 4; dx++) {
+        const dist = Math.max(Math.abs(dx), Math.abs(dy));
+        setFixed(g, cx + dx, cy + dy, dist !== 2 && dist !== 4);
+      }
+    }
+  }
+  const pos = ALIGNMENT[version - 1] as readonly number[];
+  const last = pos.length - 1;
+  for (let i = 0; i < pos.length; i++) {
+    for (let j = 0; j < pos.length; j++) {
+      if ((i === 0 && j === 0) || (i === 0 && j === last) || (i === last && j === 0)) continue;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) setFixed(g, (pos[i] as number) + dx, (pos[j] as number) + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+      }
+    }
+  }
+  drawFormat(g, 0);
+  if (version >= 7) {
+    const bits = versionBits(version);
+    for (let i = 0; i < 18; i++) {
+      const a = g.size - 11 + (i % 3);
+      const b = Math.floor(i / 3);
+      setFixed(g, a, b, bit(bits, i));
+      setFixed(g, b, a, bit(bits, i));
+    }
+  }
+}
+
+function placeCodewords(g: Grid, codewords: readonly number[]): void {
+  let i = 0;
+  const total = codewords.length * 8;
+  for (let right = g.size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < g.size; vert++) {
+      for (let j = 0; j < 2; j++) {
+        const x = right - j;
+        const upward = ((right + 1) & 2) === 0;
+        const y = upward ? g.size - 1 - vert : vert;
+        if (!(g.fixed[y] as boolean[])[x] && i < total) {
+          (g.modules[y] as boolean[])[x] = bit(codewords[i >>> 3] as number, 7 - (i & 7));
+          i++;
+        }
+      }
+    }
+  }
+}
+
+export function maskApplies(mask: number, x: number, y: number): boolean {
+  switch (mask) {
+    case 0:
+      return (x + y) % 2 === 0;
+    case 1:
+      return y % 2 === 0;
+    case 2:
+      return x % 3 === 0;
+    case 3:
+      return (x + y) % 3 === 0;
+    case 4:
+      return (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0;
+    case 5:
+      return ((x * y) % 2) + ((x * y) % 3) === 0;
+    case 6:
+      return ((((x * y) % 2) + ((x * y) % 3)) % 2) === 0;
+    default:
+      return ((((x + y) % 2) + ((x * y) % 3)) % 2) === 0;
+  }
+}
+
+function applyMask(g: Grid, mask: number): void {
+  for (let y = 0; y < g.size; y++) {
+    for (let x = 0; x < g.size; x++) {
+      if (!(g.fixed[y] as boolean[])[x] && maskApplies(mask, x, y)) (g.modules[y] as boolean[])[x] = !(g.modules[y] as boolean[])[x];
+    }
+  }
+}
+
+/** Penalty score of a finished matrix (lower is easier to scan). */
+export function penalty(m: Matrix): number {
+  const size = m.length;
+  const at = (x: number, y: number) => (m[y] as boolean[])[x] as boolean;
+  let score = 0;
+  for (let pass = 0; pass < 2; pass++) {
+    for (let a = 0; a < size; a++) {
+      let run = 1;
+      for (let b = 1; b < size; b++) {
+        const same = pass === 0 ? at(b, a) === at(b - 1, a) : at(a, b) === at(a, b - 1);
+        if (same) {
+          run++;
+          if (run === 5) score += 3;
+          else if (run > 5) score += 1;
+        } else run = 1;
+      }
+    }
+  }
+  for (let y = 0; y < size - 1; y++) {
+    for (let x = 0; x < size - 1; x++) {
+      const c = at(x, y);
+      if (c === at(x + 1, y) && c === at(x, y + 1) && c === at(x + 1, y + 1)) score += 3;
+    }
+  }
+  const pattern = [true, false, true, true, true, false, true, false, false, false, false];
+  const rev = [...pattern].reverse();
+  for (let pass = 0; pass < 2; pass++) {
+    for (let a = 0; a < size; a++) {
+      for (let b = 0; b + 11 <= size; b++) {
+        const cell = (k: number) => (pass === 0 ? at(b + k, a) : at(a, b + k));
+        if (pattern.every((v, k) => cell(k) === v) || rev.every((v, k) => cell(k) === v)) score += 40;
+      }
+    }
+  }
+  let dark = 0;
+  for (const row of m) for (const c of row) if (c) dark++;
+  const percent = (dark * 100) / (size * size);
+  score += Math.floor(Math.abs(percent - 50) / 5) * 10;
+  return score;
+}
+
+/** Encodes `text` and returns the module matrix (true = dark). */
+export function encodeQr(text: string): Matrix {
+  const bytes = utf8(text);
+  const version = versionFor(bytes.length);
+  if (version === 0) throw new Error("qr: text too long");
+  const codewords = interleave(dataCodewords(bytes, version), version);
+  let best: Matrix | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (let mask = 0; mask < 8; mask++) {
+    const g = newGrid(version);
+    drawFunctionPatterns(g, version);
+    placeCodewords(g, codewords);
+    applyMask(g, mask);
+    drawFormat(g, mask);
+    const score = penalty(g.modules);
+    if (score < bestScore) {
+      bestScore = score;
+      best = g.modules;
+    }
+  }
+  return best as Matrix;
+}
+
+/**
+ * Reads the codewords back out of a finished symbol of the given version and
+ * mask (the inverse of placement). Used to check the encoder.
+ */
+export function readCodewords(m: Matrix, version: number, mask: number): number[] {
+  const g = newGrid(version);
+  drawFunctionPatterns(g, version);
+  const out: number[] = [];
+  let acc = 0;
+  let n = 0;
+  for (let right = g.size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < g.size; vert++) {
+      for (let j = 0; j < 2; j++) {
+        const x = right - j;
+        const upward = ((right + 1) & 2) === 0;
+        const y = upward ? g.size - 1 - vert : vert;
+        if ((g.fixed[y] as boolean[])[x]) continue;
+        const raw = (m[y] as boolean[])[x] as boolean;
+        const value = maskApplies(mask, x, y) ? !raw : raw;
+        acc = (acc << 1) | (value ? 1 : 0);
+        if (++n === 8) {
+          out.push(acc);
+          acc = 0;
+          n = 0;
+        }
+      }
+    }
+  }
+  return out;
+}
