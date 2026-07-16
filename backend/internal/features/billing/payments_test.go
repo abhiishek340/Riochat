@@ -477,3 +477,272 @@ func TestStripeWebhookTopupCreditsOnce(t *testing.T) {
 		t.Fatalf("txs %+v", txs)
 	}
 }
+
+func TestStripeWebhookRejections(t *testing.T) {
+	st := newStripeFake(t)
+	e := payEnv(t, st)
+	o := e.pendingOrder(5, "stripe", map[string]any{"priceID": e.priceID("pro-monthly")})
+	url := "/api/v1/billing/payments/stripe/webhook"
+	// wrong amount
+	w, _ := e.stripeEvent(o, func(ev map[string]any) {
+		ev["data"].(map[string]any)["object"].(map[string]any)["amount_total"] = 1
+	})
+	testkit.Expect(t, w, 400, "payment.notification_mismatch")
+	// wrong currency
+	w, _ = e.stripeEvent(o, func(ev map[string]any) {
+		ev["data"].(map[string]any)["object"].(map[string]any)["currency"] = "eur"
+	})
+	testkit.Expect(t, w, 400, "payment.notification_mismatch")
+	// wrong session id
+	w, _ = e.stripeEvent(o, func(ev map[string]any) {
+		ev["data"].(map[string]any)["object"].(map[string]any)["id"] = "cs_other"
+	})
+	testkit.Expect(t, w, 400, "payment.notification_mismatch")
+	// uppercase currency is fine for comparison, but the order is still unpaid here
+	// unknown order
+	w, _ = e.stripeEvent(o, func(ev map[string]any) {
+		obj := ev["data"].(map[string]any)["object"].(map[string]any)
+		obj["metadata"] = map[string]any{"order_no": "nope"}
+	})
+	testkit.Expect(t, w, 400, "payment.order_not_found")
+	// missing order number
+	w, _ = e.stripeEvent(o, func(ev map[string]any) {
+		obj := ev["data"].(map[string]any)["object"].(map[string]any)
+		obj["metadata"] = map[string]any{}
+		delete(obj, "client_reference_id")
+	})
+	testkit.Expect(t, w, 400, "payment.order_no_required")
+	// fall back to client_reference_id
+	w, _ = e.stripeEvent(o, func(ev map[string]any) {
+		ev["data"].(map[string]any)["object"].(map[string]any)["metadata"] = map[string]any{}
+	})
+	testkit.Expect(t, w, 200, "")
+	// ignored events
+	w, _ = e.stripeEvent(o, func(ev map[string]any) { ev["type"] = "charge.refunded" })
+	testkit.Expect(t, w, 200, "")
+	if decodeData[map[string]any](t, w)["ignored"] != true {
+		t.Fatalf("body %s", w.Body)
+	}
+	w, _ = e.stripeEvent(o, func(ev map[string]any) {
+		ev["data"].(map[string]any)["object"].(map[string]any)["payment_status"] = "unpaid"
+	})
+	if decodeData[map[string]any](t, w)["ignored"] != true {
+		t.Fatalf("unpaid body %s", w.Body)
+	}
+	// signature problems
+	raw := []byte(`{"type":"ping"}`)
+	ts := e.Clock.Now().Unix()
+	good := "v1=" + stripeSignature(testStripeWebhook, ts, raw)
+	cases := map[string]string{
+		"missing":       "",
+		"stale":         "t=" + strconv.FormatInt(ts-301, 10) + ",v1=" + stripeSignature(testStripeWebhook, ts-301, raw),
+		"future":        "t=" + strconv.FormatInt(ts+301, 10) + ",v1=" + stripeSignature(testStripeWebhook, ts+301, raw),
+		"wrong secret":  "t=" + strconv.FormatInt(ts, 10) + ",v1=" + stripeSignature("other", ts, raw),
+		"bad timestamp": "t=abc," + good,
+		"no v1":         "t=" + strconv.FormatInt(ts, 10),
+		"bad hex":       "t=" + strconv.FormatInt(ts, 10) + ",v1=zz",
+	}
+	for name, h := range cases {
+		w := e.do("POST", url, map[string]string{"Stripe-Signature": h}, raw)
+		if w.Code != 400 {
+			t.Errorf("%s: %d", name, w.Code)
+			continue
+		}
+		testkit.Expect(t, w, 400, "payment.invalid_signature")
+	}
+	// multiple v1 signatures: any match accepts; edge of the tolerance accepts
+	h := "t=" + strconv.FormatInt(ts-300, 10) + ",v1=deadbeef,v1=" + stripeSignature(testStripeWebhook, ts-300, raw)
+	testkit.Expect(t, e.do("POST", url, map[string]string{"Stripe-Signature": h}, raw), 200, "")
+	// invalid JSON with a valid signature
+	bad := []byte(`{not json`)
+	testkit.Expect(t, e.postStripe(bad, ts), 400, "payment.invalid_event")
+	// too large
+	big := make([]byte, stripeWebhookMaxBody+10)
+	testkit.Expect(t, e.postStripe(big, ts), 413, "payment.webhook_body_too_large")
+	// not configured
+	e.setSettings(map[string]string{KeyStripeWebhookSecret: ""})
+	testkit.Expect(t, e.postStripe(raw, ts), 400, "payment.webhook_not_configured")
+}
+
+func TestStripeWebhookRejectsOrderOfOtherProvider(t *testing.T) {
+	e := payEnv(t, newStripeFake(t))
+	o := e.pendingOrder(5, "epay", map[string]any{"priceID": e.priceID("pro-monthly")})
+	w, _ := e.stripeEvent(o, func(ev map[string]any) {
+		ev["data"].(map[string]any)["object"].(map[string]any)["currency"] = "cny"
+	})
+	testkit.Expect(t, w, 400, "payment.notification_mismatch")
+}
+
+func (e *env) epayNotify(method string, o PaymentOrder, mut func(map[string]string)) *httptest.ResponseRecorder {
+	p := map[string]string{"pid": testEpayPID, "trade_no": "T123", "out_trade_no": o.OrderNo, "type": "alipay", "name": "x",
+		"money": formatMoney(o.PayAmountCents), "trade_status": "TRADE_SUCCESS"}
+	if mut != nil {
+		mut(p)
+	}
+	if p["sign"] == "" {
+		p["sign"] = epaySign(p, testEpayKey)
+	}
+	if p["sign"] == "-" {
+		delete(p, "sign")
+	}
+	q := url.Values{}
+	for k, v := range p {
+		q.Set(k, v)
+	}
+	if method == "GET" {
+		return e.do("GET", "/api/v1/billing/payments/epay/notify?"+q.Encode(), nil, nil)
+	}
+	req := httptest.NewRequest("POST", "/api/v1/billing/payments/epay/notify", strings.NewReader(q.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "203.0.113.9:1"
+	w := httptest.NewRecorder()
+	e.Engine.ServeHTTP(w, req)
+	return w
+}
+
+func TestEpayNotifyCompletesOrder(t *testing.T) {
+	for _, method := range []string{"GET", "POST"} {
+		e := payEnv(t, nil)
+		o := e.pendingOrder(5, "epay", map[string]any{"priceID": e.priceID("pro-monthly")})
+		w := e.epayNotify(method, o, nil)
+		if w.Code != 200 || w.Body.String() != "success" {
+			t.Fatalf("%s: %d %q", method, w.Code, w.Body)
+		}
+		var got PaymentOrder
+		e.DB.First(&got, o.ID)
+		if got.Status != "paid" || got.ExternalPaymentID != "T123" {
+			t.Fatalf("%s order %+v", method, got)
+		}
+		snap, _ := e.svc.CurrentSubscription(t.Context(), 5)
+		if snap.Tier != "pro" {
+			t.Fatalf("tier %s", snap.Tier)
+		}
+		if en, ok := e.audit.last("billing.payment.completed"); !ok || en.Detail["source"] != "epay.notify" {
+			t.Fatalf("audit %+v", en)
+		}
+		// repeat is safe
+		w = e.epayNotify(method, o, nil)
+		if w.Code != 200 || w.Body.String() != "success" {
+			t.Fatalf("repeat: %d %q", w.Code, w.Body)
+		}
+		var n int64
+		e.DB.Model(&Subscription{}).Where("user_id = 5 AND plan_id = ?", got.PlanID).Count(&n)
+		if n != 1 {
+			t.Fatalf("subscriptions %d", n)
+		}
+	}
+}
+
+func TestEpayNotifyRejections(t *testing.T) {
+	e := payEnv(t, nil)
+	o := e.pendingOrder(5, "epay", map[string]any{"priceID": e.priceID("pro-monthly")})
+	fail := func(name string, mut func(map[string]string)) {
+		w := e.epayNotify("GET", o, mut)
+		if w.Code != 400 || w.Body.String() != "fail" {
+			t.Errorf("%s: %d %q", name, w.Code, w.Body)
+		}
+	}
+	fail("bad signature", func(p map[string]string) { p["sign"] = "0000" })
+	fail("missing signature", func(p map[string]string) { p["sign"] = "-" })
+	fail("wrong pid", func(p map[string]string) { p["pid"] = "9999" })
+	fail("wrong money", func(p map[string]string) { p["money"] = "1.00" })
+	fail("unknown order", func(p map[string]string) { p["out_trade_no"] = "nope" })
+	fail("missing order", func(p map[string]string) { delete(p, "out_trade_no") })
+	// an unrelated status is acknowledged and does nothing
+	w := e.epayNotify("GET", o, func(p map[string]string) { p["trade_status"] = "WAIT_BUYER_PAY" })
+	if w.Code != 200 || w.Body.String() != "success" {
+		t.Fatalf("ignored: %d %q", w.Code, w.Body)
+	}
+	var got PaymentOrder
+	e.DB.First(&got, o.ID)
+	if got.Status != "pending" {
+		t.Fatalf("order %s", got.Status)
+	}
+	// no key configured
+	e.setSettings(map[string]string{KeyEpayKey: ""})
+	w = e.epayNotify("GET", o, nil)
+	if w.Code != 400 || w.Body.String() != "fail" {
+		t.Fatalf("no key: %d %q", w.Code, w.Body)
+	}
+}
+
+func TestEpayNotifyForStripeOrderFails(t *testing.T) {
+	e := payEnv(t, newStripeFake(t))
+	o := e.pendingOrder(5, "stripe", map[string]any{"priceID": e.priceID("pro-monthly")})
+	w := e.epayNotify("GET", o, nil)
+	if w.Code != 400 {
+		t.Fatalf("%d", w.Code)
+	}
+}
+
+func TestLatePaymentExpiresOrder(t *testing.T) {
+	e := payEnv(t, newStripeFake(t))
+	o := e.pendingOrder(5, "stripe", map[string]any{"priceID": e.priceID("pro-monthly")})
+	e.Clock.Advance(31 * time.Minute)
+	w, _ := e.stripeEvent(o, nil)
+	testkit.Expect(t, w, 400, "payment.order_state_invalid")
+	var got PaymentOrder
+	e.DB.First(&got, o.ID)
+	if got.Status != "expired" {
+		t.Fatalf("status %s", got.Status)
+	}
+	if snap, _ := e.svc.CurrentSubscription(t.Context(), 5); snap.Tier != "free" {
+		t.Fatalf("late payment granted %s", snap.Tier)
+	}
+	// an expired order cannot be completed afterwards either
+	w, _ = e.stripeEvent(o, nil)
+	testkit.Expect(t, w, 400, "payment.order_state_invalid")
+}
+
+func TestCompleteOrderDirect(t *testing.T) {
+	e := payEnv(t, nil)
+	ctx := context.Background()
+	if _, _, err := e.svc.CompleteOrder(ctx, "ghost", "x", time.Time{}); !isCode(err, ErrOrderNotFound) {
+		t.Fatalf("%v", err)
+	}
+	o := e.pendingOrder(5, "epay", map[string]any{"amountMinorUnits": 100})
+	done, delivered, err := e.svc.CompleteOrder(ctx, o.OrderNo, "ext", time.Time{})
+	if err != nil || !delivered || done.Status != "paid" {
+		t.Fatalf("%+v %v %v", done, delivered, err)
+	}
+	_, delivered, err = e.svc.CompleteOrder(ctx, o.OrderNo, "ext", time.Time{})
+	if err != nil || delivered {
+		t.Fatalf("repeat delivered=%v err=%v", delivered, err)
+	}
+	// failed orders cannot be completed
+	e.DB.Model(&PaymentOrder{}).Where("id = ?", o.ID).Update("status", "failed")
+	if _, _, err := e.svc.CompleteOrder(ctx, o.OrderNo, "ext", time.Time{}); !isCode(err, ErrOrderStateInvalid) {
+		t.Fatalf("failed: %v", err)
+	}
+}
+
+func TestCompletedLifetimeSubscriptionOrderIsRejected(t *testing.T) {
+	e := payEnv(t, nil)
+	pro := e.planByCode("pro")
+	// a paid lifetime price cannot be sold through checkout
+	price := Price{PlanID: pro.ID, Code: "pro-life", BillingInterval: "lifetime", Currency: "USD", AmountCents: 9900, IsActive: true}
+	e.DB.Create(&price)
+	testkit.Expect(t, e.checkout(5, map[string]any{"priceID": price.ID, "paymentProvider": "epay"}), 400, "payment.invalid_order")
+}
+
+func TestPaidOrdersQueueOnTimeline(t *testing.T) {
+	e := payEnv(t, nil)
+	ctx := context.Background()
+	price := e.priceID("pro-monthly")
+	for i := 0; i < 2; i++ {
+		o := e.pendingOrder(5, "epay", map[string]any{"priceID": price})
+		if _, _, err := e.svc.CompleteOrder(ctx, o.OrderNo, "x"+strconv.Itoa(i), time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snap, _ := e.svc.CurrentSubscription(ctx, 5)
+	start := e.Clock.Now()
+	if snap.ExpiresAt == nil || !snap.ExpiresAt.Equal(start.AddDate(0, 2, 0)) {
+		// the second grant is placed after the first (a month is a month long each)
+		first := start.AddDate(0, 1, 0)
+		want := first.Add(first.Sub(start))
+		if !snap.ExpiresAt.Equal(want) {
+			t.Fatalf("expiry %v, want %v or %v", snap.ExpiresAt, start.AddDate(0, 2, 0), want)
+		}
+	}
+}
