@@ -299,3 +299,325 @@ func TestRedeemSubscriptionCode(t *testing.T) {
 		t.Fatalf("entitlements %v", (*ov)["subscriptionEntitlements"])
 	}
 }
+
+func TestRedeemLimits(t *testing.T) {
+	e := newEnv(t)
+	e.mode("usage")
+	// max 1: second user gets exhausted
+	c := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1})
+	testkit.Expect(t, e.redeem(1, c.Code), 200, "")
+	testkit.Expect(t, e.redeem(2, c.Code), 400, "billing.redemption_code_exhausted")
+	// per-user limit 1 with a bigger total: the same user is stopped
+	c = e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "maxRedemptions": 5})
+	testkit.Expect(t, e.redeem(1, c.Code), 200, "")
+	testkit.Expect(t, e.redeem(1, c.Code), 400, "billing.redemption_user_limit_exceeded")
+	testkit.Expect(t, e.redeem(2, c.Code), 200, "")
+	// per-user limit 2
+	c = e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "maxRedemptions": 5, "perUserLimit": 2})
+	testkit.Expect(t, e.redeem(3, c.Code), 200, "")
+	testkit.Expect(t, e.redeem(3, c.Code), 200, "")
+	testkit.Expect(t, e.redeem(3, c.Code), 400, "billing.redemption_user_limit_exceeded")
+	// expired
+	exp := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "expiresAt": e.Clock.Now().Add(time.Hour).Format(time.RFC3339)})
+	e.Clock.Advance(2 * time.Hour)
+	testkit.Expect(t, e.redeem(4, exp.Code), 400, "billing.redemption_code_unavailable")
+	// inactive
+	in := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1})
+	testkit.Expect(t, e.do("PATCH", codesURL+"/"+uitoa(in.ID), e.admin(2), map[string]any{"status": "inactive"}), 200, "")
+	testkit.Expect(t, e.redeem(4, in.Code), 400, "billing.redemption_code_unavailable")
+	// unknown and malformed
+	testkit.Expect(t, e.redeem(4, "NOSUCH-CODE"), 400, "billing.redemption_code_unavailable")
+	testkit.Expect(t, e.redeem(4, "bad code!"), 400, "billing.invalid_redemption_code")
+	testkit.Expect(t, e.do("POST", "/api/v1/billing/redemptions", e.user(4), map[string]any{"code": "ab"}), 400, "request.invalid_body")
+	testkit.Expect(t, e.do("POST", "/api/v1/billing/redemptions", e.user(4), map[string]any{}), 400, "request.invalid_body")
+}
+
+func TestRedeemConcurrentRespectsMax(t *testing.T) {
+	e := newEnv(t)
+	e.mode("usage")
+	c := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "maxRedemptions": 3, "perUserLimit": 1})
+	done := make(chan error, 8)
+	for i := 1; i <= 8; i++ {
+		go func(uid uint) {
+			_, err := e.svc.Redeem(t.Context(), uid, c.Code)
+			done <- err
+		}(uint(i))
+	}
+	okCount := 0
+	for i := 0; i < 8; i++ {
+		if err := <-done; err == nil {
+			okCount++
+		}
+	}
+	var code RedemptionCode
+	e.DB.First(&code, c.ID)
+	if okCount != 3 || code.RedeemedCount != 3 {
+		t.Fatalf("ok=%d redeemed=%d", okCount, code.RedeemedCount)
+	}
+}
+
+func TestRedeemWithRotatedKey(t *testing.T) {
+	e := newEnv(t)
+	e.mode("usage")
+	c := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "code": "ROTATE-ME"})
+	hashes := e.svc.secrets.LookupHashes("ROTATE-ME")
+	if len(hashes) == 0 || hashes[0] == "" {
+		t.Fatal("no lookup hashes")
+	}
+	testkit.Expect(t, e.redeem(1, c.Code), 200, "")
+}
+
+func TestUpdateCode(t *testing.T) {
+	e := newEnv(t)
+	e.mode("usage")
+	c := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "maxRedemptions": 3, "perUserLimit": 2, "description": "old"})
+	url := codesURL + "/" + uitoa(c.ID)
+	patch := func(b map[string]any) (int, CodeView) {
+		w := e.do("PATCH", url, e.admin(2), b)
+		var wrap struct{ Code CodeView }
+		if w.Code == 200 {
+			testkit.Decode(t, w, &wrap)
+		}
+		return w.Code, wrap.Code
+	}
+	testkit.Expect(t, e.redeem(1, c.Code), 200, "")
+	testkit.Expect(t, e.redeem(1, c.Code), 200, "")
+	// below the redeemed count
+	w := e.do("PATCH", url, e.admin(2), map[string]any{"maxRedemptions": 1})
+	testkit.Expect(t, w, 400, "billing.invalid_redemption_code")
+	// per-user limit above the total
+	testkit.Expect(t, e.do("PATCH", url, e.admin(2), map[string]any{"perUserLimit": 5}), 400, "billing.invalid_redemption_code")
+	testkit.Expect(t, e.do("PATCH", url, e.admin(2), map[string]any{"status": "deleted"}), 400, "request.invalid_body")
+	testkit.Expect(t, e.do("PATCH", url, e.admin(2), map[string]any{"perUserLimit": 0}), 400, "request.invalid_body")
+	testkit.Expect(t, e.do("PATCH", url, e.admin(2), map[string]any{"perUserLimit": 101}), 400, "request.invalid_body")
+	testkit.Expect(t, e.do("PATCH", url, e.admin(2), map[string]any{"description": strings.Repeat("d", 256)}), 400, "request.invalid_body")
+	testkit.Expect(t, e.do("PATCH", url, e.admin(2), map[string]any{"expiresAt": "tomorrow"}), 400, "request.invalid_body")
+	testkit.Expect(t, e.do("PATCH", url, e.admin(2), map[string]any{"expiresAt": e.Clock.Now().Add(-time.Hour).Format(time.RFC3339)}), 400, "billing.invalid_redemption_code")
+	testkit.Expect(t, e.do("PATCH", url, e.admin(2), "{not json"), 400, "request.invalid_body")
+	// null removes the cap, absent leaves it unchanged
+	code, v := patch(map[string]any{"description": " new "})
+	if code != 200 || v.MaxRedemptions == nil || *v.MaxRedemptions != 3 || v.Description != "new" || v.PerUserLimit != 2 {
+		t.Fatalf("absent: %d %+v", code, v)
+	}
+	code, v = patch(map[string]any{"maxRedemptions": nil})
+	if code != 200 || v.MaxRedemptions != nil || v.RemainingRedemptions != nil {
+		t.Fatalf("null: %d %+v", code, v)
+	}
+	code, v = patch(map[string]any{"expiresAt": e.Clock.Now().Add(time.Hour).Format(time.RFC3339), "perUserLimit": 4})
+	if code != 200 || v.ExpiresAt == nil || v.PerUserLimit != 4 {
+		t.Fatalf("expiry: %d %+v", code, v)
+	}
+	code, v = patch(map[string]any{"expiresAt": nil, "status": "inactive"})
+	if code != 200 || v.ExpiresAt != nil || v.Status != "inactive" {
+		t.Fatalf("clear expiry: %d %+v", code, v)
+	}
+	// the reward cannot be edited
+	code, v = patch(map[string]any{"creditUSD": 99, "mode": "period"})
+	if code != 200 || v.CreditNanousd != 1_000_000_000 || v.Mode != "usage" {
+		t.Fatalf("reward edit: %d %+v", code, v)
+	}
+	if _, ok := e.audit.last("update_redemption_code"); !ok {
+		t.Fatal("no audit")
+	}
+	testkit.Expect(t, e.do("PATCH", codesURL+"/999", e.admin(2), map[string]any{"status": "active"}), 404, "billing.redemption_code_unavailable")
+	testkit.Expect(t, e.do("PATCH", codesURL+"/abc", e.admin(2), map[string]any{}), 400, "redemption_code.invalid_id")
+}
+
+func TestDeleteAndBatchDeleteCodes(t *testing.T) {
+	e := newEnv(t)
+	a := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1})
+	b := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1})
+	w := e.do("DELETE", codesURL+"/"+uitoa(a.ID), e.admin(2), nil)
+	testkit.Expect(t, w, 200, "")
+	if decodeData[map[string]any](t, w)["deleted"] != true {
+		t.Fatalf("body %s", w.Body)
+	}
+	testkit.Expect(t, e.do("DELETE", codesURL+"/"+uitoa(a.ID), e.admin(2), nil), 404, "billing.redemption_code_unavailable")
+	w = e.do("POST", codesURL+"/batch-delete", e.admin(2), map[string]any{"ids": []uint{b.ID, 12345}})
+	testkit.Expect(t, w, 200, "")
+	res := decodeData[struct {
+		Total, SuccessCount, NotFoundCount, FailedCount int
+		Results                                         []BatchDeleteResult
+	}](t, w)
+	if res.Total != 2 || res.SuccessCount != 1 || res.NotFoundCount != 1 || res.FailedCount != 0 ||
+		res.Results[0].Status != "deleted" || res.Results[1].Status != "not_found" {
+		t.Fatalf("batch %+v (%s)", res, w.Body)
+	}
+	if _, ok := e.audit.last("batch_delete_redemption_codes"); !ok {
+		t.Fatal("no audit")
+	}
+	testkit.Expect(t, e.do("POST", codesURL+"/batch-delete", e.admin(2), map[string]any{"ids": []uint{}}), 400, "request.invalid_body")
+	testkit.Expect(t, e.do("POST", codesURL+"/batch-delete", e.admin(2), map[string]any{"ids": []uint{0}}), 400, "request.invalid_body")
+	// deleted codes cannot be redeemed and disappear from the list
+	e.mode("usage")
+	testkit.Expect(t, e.redeem(1, a.Code), 400, "billing.redemption_code_unavailable")
+	var list struct {
+		Total int64 `json:"total"`
+	}
+	testkit.Decode(t, e.do("GET", codesURL, e.admin(2), nil), &list)
+	if list.Total != 0 {
+		t.Fatalf("list total %d", list.Total)
+	}
+}
+
+func TestListCodesFilters(t *testing.T) {
+	e := newEnv(t)
+	usage := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "description": "Summer Sale"})
+	period := e.mustCode(map[string]any{"mode": "period", "planID": e.planByCode("pro").ID, "durationDays": 3, "description": "pro trial"})
+	exhausted := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "maxRedemptions": 1})
+	expiring := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1, "expiresAt": e.Clock.Now().Add(time.Hour).Format(time.RFC3339)})
+	inactive := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 1})
+	e.DB.Model(&RedemptionCode{}).Where("id = ?", inactive.ID).Update("status", "inactive")
+	e.DB.Model(&RedemptionCode{}).Where("id = ?", exhausted.ID).Update("redeemed_count", 1)
+	e.Clock.Advance(2 * time.Hour)
+	type list struct {
+		Total   int64      `json:"total"`
+		Results []CodeView `json:"results"`
+	}
+	get := func(q string) list {
+		w := e.do("GET", codesURL+q, e.admin(2), nil)
+		testkit.Expect(t, w, 200, "")
+		var l list
+		testkit.Decode(t, w, &l)
+		// the list never carries plaintext
+		for _, c := range l.Results {
+			if c.Code != "" {
+				t.Fatalf("plaintext leaked in list: %+v", c)
+			}
+		}
+		return l
+	}
+	ids := func(l list) map[uint]bool {
+		m := map[uint]bool{}
+		for _, c := range l.Results {
+			m[c.ID] = true
+		}
+		return m
+	}
+	if l := get(""); l.Total != 5 || l.Results[0].ID != inactive.ID {
+		t.Fatalf("all: %d first=%d", l.Total, l.Results[0].ID)
+	}
+	if l := get("?mode=period"); l.Total != 1 || l.Results[0].ID != period.ID {
+		t.Fatalf("mode: %+v", l)
+	}
+	if l := get("?status=inactive"); l.Total != 1 || l.Results[0].ID != inactive.ID {
+		t.Fatalf("status: %+v", l)
+	}
+	if l := get("?availability=expired"); l.Total != 1 || !ids(l)[expiring.ID] {
+		t.Fatalf("expired: %+v", l)
+	}
+	if l := get("?availability=exhausted"); l.Total != 1 || !ids(l)[exhausted.ID] {
+		t.Fatalf("exhausted: %+v", l)
+	}
+	if l := get("?q=SUMMER"); l.Total != 1 || !ids(l)[usage.ID] {
+		t.Fatalf("q desc: %+v", l)
+	}
+	if l := get("?q=" + usage.CodeHint[:4]); !ids(l)[usage.ID] {
+		t.Fatalf("q hint: %+v", l)
+	}
+	// available depends on the billing mode
+	if l := get("?availability=available"); l.Total != 0 {
+		t.Fatalf("self mode available: %+v", l)
+	}
+	e.mode("usage")
+	if l := get("?availability=available"); l.Total != 1 || !ids(l)[usage.ID] {
+		t.Fatalf("usage available: %+v", l.Results)
+	}
+	e.mode("period")
+	if l := get("?availability=available"); l.Total != 2 || !ids(l)[period.ID] {
+		t.Fatalf("period available: %+v", l.Results)
+	}
+	// unknown filter values are not errors: mode and status match nothing,
+	// an unknown availability is ignored
+	if l := get("?mode=self"); l.Total != 0 {
+		t.Fatalf("unknown mode: %+v", l)
+	}
+	if l := get("?status=deleted"); l.Total != 0 {
+		t.Fatalf("unknown status: %+v", l)
+	}
+	if l := get("?availability=maybe"); l.Total != 5 {
+		t.Fatalf("unknown availability: %+v", l)
+	}
+	// pagination
+	if l := get("?page_size=2&page=3"); l.Total != 5 || len(l.Results) != 1 {
+		t.Fatalf("paging: %+v", l)
+	}
+}
+
+func TestAdminRedemptionsList(t *testing.T) {
+	e := newEnv(t)
+	e.mode("period")
+	e.users.users[7] = UserInfo{Username: "alice", DisplayName: "Alice A"}
+	a := e.mustCode(map[string]any{"mode": "usage", "creditUSD": 2, "description": "freebie"})
+	b := e.mustCode(map[string]any{"mode": "period", "planID": e.planByCode("pro").ID, "durationDays": 9})
+	testkit.Expect(t, e.redeem(7, a.Code), 200, "")
+	e.Clock.Advance(time.Minute)
+	testkit.Expect(t, e.redeem(8, b.Code), 200, "")
+	type item struct {
+		CodeID               uint   `json:"codeID"`
+		CodeHint             string `json:"codeHint"`
+		CodeDescription      string `json:"codeDescription"`
+		CodeStatus           string `json:"codeStatus"`
+		UserID               uint   `json:"userID"`
+		Username             string `json:"username"`
+		UserDisplayName      string `json:"userDisplayName"`
+		UserLabel            string `json:"userLabel"`
+		RewardType           string `json:"rewardType"`
+		PlanName             string `json:"planName"`
+		DurationDays         int    `json:"durationDays"`
+		BalanceBeforeNanousd *int64 `json:"balanceBeforeNanousd"`
+		BalanceAfterNanousd  *int64 `json:"balanceAfterNanousd"`
+		RefNo                string `json:"refNo"`
+		SnapshotJSON         string `json:"snapshotJSON"`
+	}
+	var list struct {
+		Total   int64  `json:"total"`
+		Results []item `json:"results"`
+	}
+	w := e.do("GET", "/api/v1/admin/redemptions", e.admin(2), nil)
+	testkit.Expect(t, w, 200, "")
+	testkit.Decode(t, w, &list)
+	if list.Total != 2 || list.Results[0].UserID != 8 || list.Results[1].UserID != 7 {
+		t.Fatalf("list %+v", list)
+	}
+	bal := list.Results[1]
+	if bal.Username != "alice" || bal.UserDisplayName != "Alice A" || bal.UserLabel == "" || bal.CodeDescription != "freebie" || bal.CodeHint == "" ||
+		bal.BalanceBeforeNanousd == nil || *bal.BalanceBeforeNanousd != 0 || bal.BalanceAfterNanousd == nil || *bal.BalanceAfterNanousd != 2_000_000_000 ||
+		bal.RefNo == "" || bal.CodeStatus != "active" {
+		t.Fatalf("balance item %+v", bal)
+	}
+	sub := list.Results[0]
+	if sub.RewardType != "subscription" || sub.PlanName != "Pro" || sub.DurationDays != 9 || sub.BalanceAfterNanousd != nil {
+		t.Fatalf("subscription item %+v", sub)
+	}
+	get := func(q string) int64 {
+		var l struct {
+			Total int64 `json:"total"`
+		}
+		w := e.do("GET", "/api/v1/admin/redemptions"+q, e.admin(2), nil)
+		testkit.Expect(t, w, 200, "")
+		testkit.Decode(t, w, &l)
+		return l.Total
+	}
+	if get("?user_id=7") != 1 || get("?reward_type=subscription") != 1 || get("?code_id="+uitoa(a.ID)) != 1 || get("?query=freebie") != 1 || get("?query=nomatch") != 0 {
+		t.Fatal("filters")
+	}
+	if get("?created_from="+e.Clock.Now().Add(-30*time.Second).UTC().Format(time.RFC3339)) != 1 || get("?created_to="+e.Clock.Now().Add(-30*time.Second).UTC().Format(time.RFC3339)) != 1 {
+		t.Fatal("time filters")
+	}
+	testkit.Expect(t, e.do("GET", "/api/v1/admin/redemptions?created_from=bad", e.admin(2), nil), 400, "request.invalid_query")
+	l := struct {
+		Results []item `json:"results"`
+	}{}
+	testkit.Decode(t, e.do("GET", "/api/v1/admin/redemptions?sort=created_asc", e.admin(2), nil), &l)
+	if l.Results[0].UserID != 7 {
+		t.Fatal("created_asc")
+	}
+	// deleted codes still join
+	e.DB.Model(&RedemptionCode{}).Where("id = ?", a.ID).Update("status", "deleted")
+	testkit.Decode(t, e.do("GET", "/api/v1/admin/redemptions?user_id=7", e.admin(2), nil), &l)
+	if len(l.Results) != 1 || l.Results[0].CodeStatus != "deleted" {
+		t.Fatalf("deleted join %+v", l.Results)
+	}
+	_ = strconv.Itoa
+}
