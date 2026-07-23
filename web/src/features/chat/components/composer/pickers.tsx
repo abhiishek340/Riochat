@@ -175,3 +175,169 @@ export function ToolsPicker({
 }
 
 // --- knowledge bases ----------------------------------------------------------------------------------
+
+export function KnowledgePicker({
+  selectedIds,
+  onToggle,
+  ragAvailable,
+  ragReason,
+}: {
+  selectedIds: string[];
+  onToggle: (id: string) => void;
+  ragAvailable: boolean;
+  ragReason: string;
+}) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const debounced = useDebouncedValue(query.trim(), 200);
+  const [items, setItems] = useState<KnowledgeBaseDTO[]>([]);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [state, setState] = useState<"idle" | "loading" | "error">("idle");
+
+  useEffect(() => {
+    if (!open || !ragAvailable) return;
+    let live = true;
+    setState("loading");
+    listKnowledgeBases({ q: debounced, page: 1, pageSize: 50 }).then(
+      (res) => {
+        if (!live) return;
+        setItems(res.results);
+        setTotal(res.total);
+        setPage(1);
+        setState("idle");
+      },
+      () => live && setState("error"),
+    );
+    return () => {
+      live = false;
+    };
+  }, [open, debounced, ragAvailable]);
+
+  const more = async () => {
+    const next = page + 1;
+    setState("loading");
+    try {
+      const res = await listKnowledgeBases({ q: debounced, page: next, pageSize: 50 });
+      setItems((cur) => [...cur, ...res.results.filter((r) => !cur.some((c) => c.publicID === r.publicID))]);
+      setPage(next);
+      setState("idle");
+    } catch {
+      setState("error");
+    }
+  };
+
+  const reasonKey = (r: string) => {
+    if (/host/i.test(r)) return "chatComposer.kb.reason.host";
+    if (/model/i.test(r)) return "chatComposer.kb.reason.model";
+    if (/client/i.test(r)) return "chatComposer.kb.reason.client";
+    return "chatComposer.kb.reason.store";
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <TriggerButton label={t("chatComposer.kb.title")} count={selectedIds.length} active={selectedIds.length > 0}>
+        <BookOpen />
+      </TriggerButton>
+      <PopoverContent side="top" align="start" className="w-80 p-0">
+        <div className="flex items-center justify-between border-b px-3 py-2">
+          <span className="text-sm font-medium">{t("chatComposer.kb.title")}</span>
+          <span className="text-xs text-muted-foreground">{t("chatComposer.kb.selected", { count: selectedIds.length })} / {MAX_KNOWLEDGE_BASES}</span>
+        </div>
+        {!ragAvailable ? (
+          <div className="grid gap-1 px-4 py-6 text-center">
+            <p className="text-sm font-medium">{t("chatComposer.kb.unavailable")}</p>
+            <p className="text-xs text-muted-foreground">{t(reasonKey(ragReason) as "chatComposer.kb.reason.store")}</p>
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center gap-2 border-b px-3 py-1.5">
+              <Search className="size-3.5 text-muted-foreground" />
+              <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t("chatComposer.kb.search")} aria-label={t("chatComposer.kb.search")} className="h-6 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground" />
+            </div>
+            <div className="max-h-72 overflow-auto p-1.5">
+              {state === "error" ? <p className="px-3 py-4 text-center text-sm text-destructive">{t("chatComposer.kb.loadFailed")}</p> : null}
+              {state !== "error" && items.length === 0 && state !== "loading" ? <p className="px-3 py-6 text-center text-sm text-muted-foreground">{t("chatComposer.kb.empty")}</p> : null}
+              {items.map((kb) => {
+                const ready = kb.readyFileCount > 0;
+                const on = selectedIds.includes(kb.publicID);
+                return (
+                  <label key={kb.publicID} className={cn("flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm", ready ? "cursor-pointer hover:bg-accent/50" : "opacity-60")}>
+                    <input type="checkbox" checked={on} disabled={!ready && !on} onChange={() => onToggle(kb.publicID)} className="size-4 accent-[var(--primary)]" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate">{kb.name}</span>
+                      <span className="block truncate text-xs text-muted-foreground">{ready ? t("chatComposer.kb.readyFiles", { count: kb.readyFileCount }) : t("chatComposer.kb.notReady")}</span>
+                    </span>
+                  </label>
+                );
+              })}
+              {items.length < total ? (
+                <Button variant="ghost" size="sm" className="w-full" loading={state === "loading"} onClick={() => void more()}>
+                  {t("chatComposer.kb.loadMore")}
+                </Button>
+              ) : null}
+            </div>
+          </>
+        )}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+// --- interactive components --------------------------------------------------------------------------------
+
+export function UiComponentsPicker({
+  components,
+  effective,
+  onChange,
+  onReset,
+  explicit,
+}: {
+  components: UiComponentDTO[];
+  effective: number[];
+  onChange: (ids: number[]) => void;
+  onReset: () => void;
+  explicit: boolean;
+}) {
+  const t = useT();
+  const visible = components.filter((c) => c.enabled);
+  if (visible.length === 0) return null;
+  const scopes: { id: string; label: string; items: UiComponentDTO[] }[] = [
+    { id: "builtin", label: t("chatComposer.ui.builtin"), items: visible.filter((c) => c.scope === "builtin" || c.rendererKind === "builtin") },
+    { id: "platform", label: t("chatComposer.ui.platform"), items: visible.filter((c) => c.scope === "platform" && c.rendererKind !== "builtin") },
+    { id: "user", label: t("chatComposer.ui.mine"), items: visible.filter((c) => c.scope !== "builtin" && c.scope !== "platform" && c.rendererKind !== "builtin") },
+  ].filter((s) => s.items.length > 0);
+  const toggle = (id: number) => onChange(effective.includes(id) ? effective.filter((x) => x !== id) : [...effective, id]);
+  return (
+    <Popover>
+      <TriggerButton label={t("chatComposer.ui.title")} count={effective.length} active={effective.length > 0}>
+        <LayoutGrid />
+      </TriggerButton>
+      <PopoverContent side="top" align="start" className="w-72 p-0">
+        <div className="flex items-center justify-between border-b px-3 py-2">
+          <span className="text-sm font-medium">{t("chatComposer.ui.title")}</span>
+          <button type="button" disabled={!explicit} onClick={onReset} className="text-xs text-muted-foreground hover:text-foreground disabled:opacity-40">
+            {t("chatComposer.ui.restoreDefault")}
+          </button>
+        </div>
+        <div className="max-h-72 overflow-auto p-1.5">
+          {scopes.map((s) => (
+            <div key={s.id}>
+              <div className="px-2 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{s.label}</div>
+              {s.items.map((c) => (
+                <label key={c.id} className="flex cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-accent/50">
+                  <input type="checkbox" checked={effective.includes(c.id)} onChange={() => toggle(c.id)} className="mt-0.5 size-4 accent-[var(--primary)]" />
+                  <span className="min-w-0">
+                    <span className="block truncate">{c.name}</span>
+                    {c.description ? <span className="block text-xs text-muted-foreground">{c.description}</span> : null}
+                  </span>
+                </label>
+              ))}
+            </div>
+          ))}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
