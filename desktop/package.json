@@ -1,0 +1,29 @@
+{
+  "name": "@riochat/desktop",
+  "version": "0.4.5",
+  "private": true,
+  "description": "Riochat desktop shell (Tauri 2): build, packaging and release tooling.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=20.9"
+  },
+  "scripts": {
+    "version:sync": "node scripts/version.mjs --sync",
+    "version:check": "node scripts/version.mjs --check",
+    "tauri": "tauri",
+    "sidecar": "node scripts/build-sidecar.mjs",
+    "dev": "node scripts/dev.mjs",
+    "bundle": "node scripts/version.mjs --check && node scripts/build-sidecar.mjs && tauri build",
+    "bundle:fast": "node scripts/build-fast.mjs",
+    "bundle:signed": "node scripts/build-signed.mjs",
+    "check": "node scripts/version.mjs --check && node scripts/build-sidecar.mjs && cargo check --manifest-path src-tauri/Cargo.toml",
+    "package:portable": "node scripts/package-portable.mjs",
+    "icons": "node scripts/gen-icons.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.5"
+  }
+}
