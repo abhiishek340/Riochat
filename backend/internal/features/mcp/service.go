@@ -179,3 +179,158 @@ func (s *Service) CreateServer(ctx context.Context, in ServerInput) (*ServerRow,
 	}
 	return &ServerRow{Server: created}, nil
 }
+
+// UpdateServer replaces name, URL, headers and status wholesale; the token is
+// replaced only when a non-empty one is supplied.
+func (s *Service) UpdateServer(ctx context.Context, id uint, in ServerInput) (*ServerRow, error) {
+	c, err := validateServerInput(in)
+	if err != nil {
+		return nil, err
+	}
+	enc, err := s.encryptToken(c.token)
+	if err != nil {
+		return nil, err
+	}
+	db := s.db.WithContext(ctx)
+	var srv Server
+	if err := db.First(&srv, id).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	changes := map[string]any{
+		"name": c.name, "base_url": c.baseURL, "headers_json": c.headers, "status": c.status,
+	}
+	if enc != "" {
+		changes["auth_token_enc"] = enc
+	}
+	if err := db.Model(&Server{}).Where("id = ?", id).Updates(changes).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	return s.serverRow(ctx, id)
+}
+
+func (s *Service) serverRow(ctx context.Context, id uint) (*ServerRow, error) {
+	var srv Server
+	if err := s.db.WithContext(ctx).First(&srv, id).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	rows, err := s.decorate(ctx, []Server{srv})
+	if err != nil {
+		return nil, err
+	}
+	return &rows[0], nil
+}
+
+// ListServers lists all servers in display order with live counts.
+func (s *Service) ListServers(ctx context.Context) ([]ServerRow, error) {
+	var servers []Server
+	if err := s.db.WithContext(ctx).Order("sort_order ASC, id ASC").Find(&servers).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	return s.decorate(ctx, servers)
+}
+
+func (s *Service) decorate(ctx context.Context, servers []Server) ([]ServerRow, error) {
+	rows := make([]ServerRow, len(servers))
+	if len(servers) == 0 {
+		return rows, nil
+	}
+	ids := make([]uint, len(servers))
+	for i := range servers {
+		ids[i] = servers[i].ID
+	}
+	db := s.db.WithContext(ctx)
+	var counts []struct {
+		ServerID uint
+		N        int
+	}
+	if err := db.Model(&Tool{}).Select("server_id, COUNT(*) AS n").
+		Where("server_id IN ? AND status = ?", ids, StatusActive).Group("server_id").Scan(&counts).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	active := make(map[uint]int, len(counts))
+	for _, c := range counts {
+		active[c.ServerID] = c.N
+	}
+	var flagged []uint
+	if err := db.Model(&Tool{}).Distinct().
+		Where("server_id IN ? AND (metadata_customized IS NULL OR metadata_customized = ?)", ids, true).
+		Pluck("server_id", &flagged).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	needs := make(map[uint]bool, len(flagged))
+	for _, id := range flagged {
+		needs[id] = true
+	}
+	for i := range servers {
+		rows[i] = ServerRow{Server: servers[i], ActiveToolCount: active[servers[i].ID], RequiresToolMetadataSyncConfirmation: needs[servers[i].ID]}
+	}
+	return rows, nil
+}
+
+// DeleteServer removes a server, its tools and the project-default links to
+// them in one transaction. Tool-call history is not touched.
+func (s *Service) DeleteServer(ctx context.Context, id uint) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var srv Server
+		if err := tx.First(&srv, id).Error; err != nil {
+			// Deleting what is already gone succeeds, so a repeated request
+			// (a retry, a double click) ends the same way as the first.
+			if database.IsNotFound(database.Translate(err)) {
+				return nil
+			}
+			return database.Translate(err)
+		}
+		var toolIDs []uint
+		if err := tx.Model(&Tool{}).Where("server_id = ?", id).Pluck("id", &toolIDs).Error; err != nil {
+			return database.Translate(err)
+		}
+		if err := s.links.RemoveToolLinks(ctx, tx, toolIDs); err != nil {
+			return err
+		}
+		if err := tx.Where("server_id = ?", id).Delete(&Tool{}).Error; err != nil {
+			return database.Translate(err)
+		}
+		return database.Translate(tx.Delete(&Server{}, id).Error)
+	})
+}
+
+// redactHeaders hides the values of headers that look like credentials.
+func redactHeaders(stored string) string {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stored)), &raw); err != nil || raw == nil {
+		return "{}"
+	}
+	for k, v := range raw {
+		if _, isStr := v.(string); isStr && sensitiveHeader(k) {
+			raw[k] = redactedMarker
+		}
+	}
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
+func sensitiveHeader(name string) bool {
+	n := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(name), "_", "-"))
+	if n == "cookie" || n == "set-cookie" {
+		return true
+	}
+	for _, frag := range []string{"authorization", "api-key", "apikey", "token", "secret"} {
+		if strings.Contains(n, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// lockRows asks for row locks where the database supports them.
+func lockRows(tx *gorm.DB) *gorm.DB {
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
+}
+
+// isNotFound is database.IsNotFound for readability at call sites.
+func isNotFound(err error) bool {
+	return errors.Is(err, database.ErrNotFound) || database.IsNotFound(err)
+}
