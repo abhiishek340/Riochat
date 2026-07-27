@@ -1,0 +1,53 @@
+[package]
+name = "riochat-desktop"
+version = "0.4.5"
+description = "Riochat desktop client"
+authors = ["Riochat"]
+edition = "2021"
+rust-version = "1.80"
+
+[lib]
+name = "riochat_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable", "tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+url = "2"
+percent-encoding = "2"
+log = "0.4"
+env_logger = "0.11"
+semver = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSObject"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSToolbar", "NSWindow", "NSEvent"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
