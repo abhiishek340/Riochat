@@ -1,0 +1,87 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Riochat",
+  "version": "0.4.5",
+  "identifier": "com.riochat.desktop",
+  "build": {
+    "frontendDist": "../../web/out",
+    "devUrl": "http://localhost:3000"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "font-src": "'self' data:",
+        "img-src": "'self' data: blob: http: https:",
+        "media-src": "'self' blob: data: http: https:",
+        "connect-src": "'self' ipc: http://ipc.localhost http: https:",
+        "frame-src": "'self'",
+        "object-src": "'none'",
+        "base-uri": "'self'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "dmg",
+      "app",
+      "nsis",
+      "msi",
+      "deb",
+      "appimage"
+    ],
+    "category": "Productivity",
+    "shortDescription": "Riochat desktop client",
+    "longDescription": "Desktop client for a self-hosted Riochat server.",
+    "copyright": "(c) Riochat",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/riochat-server"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "hardenedRuntime": true
+    },
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "English",
+          "SimpChinese"
+        ],
+        "displayLanguageSelector": false
+      },
+      "wix": {
+        "language": "en-US",
+        "upgradeCode": "416f18c0-1adb-51dc-ba68-b574720eb9bc"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBDRkJDQkE0MjNBRTAzRDEKUldUUkE2NGpwTXY3REZDSEJRMkg2SmRHc0JvRmoyNXBVcmJ3ajFFaHZkM3FQYzI2cUR1c2FkWjMK",
+      "endpoints": [
+        "https://github.com/riochat/riochat/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
