@@ -133,3 +133,134 @@ type VendorView struct {
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
+
+// GroupView is a display group (4.13.9).
+type GroupView struct {
+	ID        uint      `json:"id"`
+	Name      string    `json:"name"`
+	Icon      string    `json:"icon"`
+	SortOrder int       `json:"sortOrder"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// IconAssetView is a library icon.
+type IconAssetView struct {
+	Ref         string    `json:"ref"`
+	PublicID    string    `json:"publicID"`
+	ContentType string    `json:"contentType"`
+	SizeBytes   int64     `json:"sizeBytes"`
+	Width       int       `json:"width"`
+	Height      int       `json:"height"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+// IconUploadResult is the result of an icon upload.
+type IconUploadResult struct {
+	Ref         string `json:"ref"`
+	PublicID    string `json:"publicID"`
+	ContentType string `json:"contentType"`
+	SizeBytes   int64  `json:"sizeBytes"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	Reused      bool   `json:"reused"`
+}
+
+// SettingView is an llm setting row.
+type SettingView struct {
+	ID          uint      `json:"id"`
+	Key         string    `json:"key"`
+	Value       string    `json:"value"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+// BatchItem is one result of a batch delete.
+type BatchItem struct {
+	ID     uint   `json:"id"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// BatchResult is the response of a batch delete.
+type BatchResult struct {
+	Total         int         `json:"total"`
+	SuccessCount  int         `json:"successCount"`
+	NotFoundCount int         `json:"notFoundCount"`
+	FailedCount   int         `json:"failedCount"`
+	Results       []BatchItem `json:"results"`
+}
+
+// PublicReasoning is the reasoning capability served to users.
+type PublicReasoning struct {
+	Levels      []string `json:"levels"`
+	Default     string   `json:"default"`
+	ControlPath *string  `json:"controlPath"`
+	Source      string   `json:"source"`
+	Locked      bool     `json:"locked"`
+}
+
+// PublicModel is a model as listed for users (4.13.8).
+type PublicModel struct {
+	PlatformModelName     string           `json:"platformModelName"`
+	Vendor                string           `json:"vendor"`
+	VendorName            string           `json:"vendorName"`
+	VendorIcon            string           `json:"vendorIcon"`
+	DisplayGroupID        *uint            `json:"displayGroupID"`
+	DisplayGroupName      string           `json:"displayGroupName"`
+	DisplayGroupIcon      string           `json:"displayGroupIcon"`
+	KindsJSON             string           `json:"kindsJSON"`
+	Icon                  string           `json:"icon"`
+	ProtocolsJSON         string           `json:"protocolsJSON"`
+	CapabilitiesJSON      string           `json:"capabilitiesJSON"`
+	Description           string           `json:"description"`
+	SortOrder             int              `json:"sortOrder"`
+	Pricing               *Pricing         `json:"pricing"`
+	Reasoning             *PublicReasoning `json:"reasoning"`
+	Controls              []Control        `json:"controls"`
+	InputModalities       []string         `json:"inputModalities"`
+	InputModalitiesSource *string          `json:"inputModalitiesSource"`
+	OutputModalities      []string         `json:"outputModalities"`
+	ContextWindow         *int             `json:"contextWindow"`
+	Source                string           `json:"source"`
+	ProviderName          string           `json:"providerName"`
+	ProviderIcon          string           `json:"providerIcon"`
+	ProviderHost          string           `json:"providerHost"`
+
+	// modelID and groupsKey are used by internal filtering only.
+	modelID uint
+}
+
+// ModelID is the id of the platform model behind a public entry (0 for personal models).
+func (m PublicModel) ModelID() uint { return m.modelID }
+
+// ProbeResult is the result of a connectivity probe (4.13.11).
+type ProbeResult struct {
+	Success            bool        `json:"success"`
+	Status             string      `json:"status"`
+	ErrorCode          string      `json:"errorCode,omitempty"`
+	ErrorMessage       string      `json:"errorMessage,omitempty"`
+	LatencyMS          int64       `json:"latencyMS"`
+	Protocol           string      `json:"protocol"`
+	Endpoint           string      `json:"endpoint"`
+	PlatformModelID    uint        `json:"platformModelID"`
+	PlatformModelName  string      `json:"platformModelName"`
+	UpstreamID         uint        `json:"upstreamID"`
+	UpstreamName       string      `json:"upstreamName"`
+	UpstreamModelID    uint        `json:"upstreamModelID"`
+	UpstreamModelName  string      `json:"upstreamModelName"`
+	RouteID            uint        `json:"routeID"`
+	BindingCode        string      `json:"bindingCode"`
+	UpstreamStatusCode int         `json:"upstreamStatusCode,omitempty"`
+	Debug              *ProbeDebug `json:"debug,omitempty"`
+}
+
+// ProbeAllResult is the result of probing every suitable route of a model.
+type ProbeAllResult struct {
+	TotalCount       int           `json:"totalCount"`
+	SuccessCount     int           `json:"successCount"`
+	FailedCount      int           `json:"failedCount"`
+	UnsupportedCount int           `json:"unsupportedCount"`
+	Results          []ProbeResult `json:"results"`
+}

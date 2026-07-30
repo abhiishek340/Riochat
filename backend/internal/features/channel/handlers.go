@@ -483,3 +483,239 @@ func (h *handlers) listSources(c *gin.Context) {
 	}
 	httpx.Paged(c, total, list)
 }
+
+func (h *handlers) bindSource(c *gin.Context) {
+	id, ok := pathID(c, "id", ErrInvalidModelID)
+	if !ok {
+		return
+	}
+	var req bindSourceReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	v, err := h.svc.BindSource(c.Request.Context(), id, req)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"source": v})
+}
+
+func (h *handlers) updateSource(c *gin.Context) {
+	id, ok := pathID(c, "id", ErrInvalidModelID)
+	if !ok {
+		return
+	}
+	rt, ok := pathID(c, "route_id", ErrInvalidRouteID)
+	if !ok {
+		return
+	}
+	var req updateSourceReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	v, err := h.svc.UpdateSource(c.Request.Context(), id, rt, req)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"source": v})
+}
+
+// ---- vendors and display groups -------------------------------------------------------------------------
+
+func (h *handlers) listVendors(c *gin.Context) {
+	p := pagination.FromRequest(c.Request)
+	list, total, err := h.svc.ListVendors(c.Request.Context(), c.Query("q"), p.Page, p.PageSize)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, list)
+}
+
+func (h *handlers) createVendor(c *gin.Context) {
+	var req createVendorReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	v, err := h.svc.CreateVendor(c.Request.Context(), req)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"vendor": v})
+}
+
+func (h *handlers) updateVendor(c *gin.Context) {
+	var req updateVendorReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	v, err := h.svc.UpdateVendor(c.Request.Context(), c.Param("key"), req)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"vendor": v})
+}
+
+func (h *handlers) deleteVendor(c *gin.Context) {
+	if err := h.svc.DeleteVendor(c.Request.Context(), c.Param("key")); err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, nil)
+}
+
+func (h *handlers) listGroups(c *gin.Context) {
+	p := pagination.FromRequest(c.Request)
+	list, total, err := h.svc.ListGroups(c.Request.Context(), c.Query("q"), p.Page, p.PageSize)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, list)
+}
+
+func (h *handlers) createGroup(c *gin.Context) {
+	var req createGroupReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	v, err := h.svc.CreateGroup(c.Request.Context(), req)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"group": v})
+}
+
+func (h *handlers) updateGroup(c *gin.Context) {
+	id, ok := pathID(c, "id", ErrInvalidGroupID)
+	if !ok {
+		return
+	}
+	var req updateGroupReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	v, err := h.svc.UpdateGroup(c.Request.Context(), id, req)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"group": v})
+}
+
+func (h *handlers) deleteGroup(c *gin.Context) {
+	id, ok := pathID(c, "id", ErrInvalidGroupID)
+	if !ok {
+		return
+	}
+	if err := h.svc.DeleteGroup(c.Request.Context(), id); err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, nil)
+}
+
+// ---- icon assets ----------------------------------------------------------------------------------------------
+
+func (h *handlers) uploadIcon(c *gin.Context) {
+	if c.Request.ContentLength > IconMaxBodyBytes {
+		httpx.FailErr(c, ErrIconFileTooLarge)
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, IconMaxBodyBytes)
+	if err := c.Request.ParseMultipartForm(2 << 20); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			httpx.FailErr(c, ErrIconFileTooLarge)
+			return
+		}
+		httpx.FailErr(c, ErrIconFileInvalid)
+		return
+	}
+	defer c.Request.MultipartForm.RemoveAll()
+	file, _, err := c.Request.FormFile("file")
+	if err != nil {
+		httpx.FailErr(c, ErrIconFileInvalid)
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxIconBytes+1))
+	if err != nil {
+		httpx.FailErr(c, ErrIconFileInvalid)
+		return
+	}
+	out, err := h.svc.UploadIcon(c.Request.Context(), middleware.MustPrincipal(c).UserID, data)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, out)
+}
+
+func (h *handlers) listIcons(c *gin.Context) {
+	p := pagination.FromRequest(c.Request)
+	list, total, err := h.svc.ListIcons(c.Request.Context(), p.Page, p.PageSize)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.Paged(c, total, list)
+}
+
+func (h *handlers) deleteIcon(c *gin.Context) {
+	if err := h.svc.RemoveIcon(c.Request.Context(), c.Param("public_id")); err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, nil)
+}
+
+// ---- catalog and settings -----------------------------------------------------------------------------------------
+
+func (h *handlers) catalogStatus(c *gin.Context) {
+	httpx.OK(c, h.svc.CatalogStatus(c.Request.Context()))
+}
+
+func (h *handlers) catalogResolve(c *gin.Context) {
+	var req resolveCatalogReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	httpx.OK(c, h.svc.ResolveCatalog(c.Request.Context(), req))
+}
+
+func (h *handlers) catalogRefresh(c *gin.Context) {
+	st, err := h.svc.RefreshCatalog(c.Request.Context())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, st)
+}
+
+func (h *handlers) listSettings(c *gin.Context) {
+	list, err := h.svc.ListSettings(c.Request.Context())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, list)
+}
+
+func (h *handlers) patchSetting(c *gin.Context) {
+	var req patchSettingReq
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	v, err := h.svc.UpdateSetting(c.Request.Context(), c.Param("key"), req.Value)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, v)
+}
