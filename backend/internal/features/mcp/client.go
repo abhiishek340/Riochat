@@ -184,3 +184,191 @@ func parseRPCBody(contentType string, body []byte) (json.RawMessage, error) {
 	}
 	return rr.Result, nil
 }
+
+// firstEventData returns the data of the first event that has any. Lines are
+// split on LF, CRLF or CR; only "data:" lines count, with one leading space
+// removed; the lines of one event are joined with newlines.
+func firstEventData(body []byte) string {
+	text := strings.ReplaceAll(string(body), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	var lines []string
+	flush := func() (string, bool) {
+		if len(lines) == 0 {
+			return "", false
+		}
+		joined := strings.Join(lines, "\n")
+		lines = nil
+		return joined, strings.TrimSpace(joined) != ""
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if line == "" {
+			if d, ok := flush(); ok {
+				return d
+			}
+			continue
+		}
+		if rest, ok := strings.CutPrefix(line, "data:"); ok {
+			lines = append(lines, strings.TrimPrefix(rest, " "))
+		}
+	}
+	d, _ := flush()
+	return d
+}
+
+func (c *httpClient) open(ctx context.Context, ep Endpoint, timeout time.Duration) (*session, error) {
+	if timeout <= 0 {
+		timeout = defaultRPCTimeout
+	}
+	s := &session{ep: ep, tout: timeout}
+	id := c.nextID.Add(1)
+	_, err := c.post(ctx, s, rpcRequest{JSONRPC: "2.0", ID: &id, Method: "initialize", Params: map[string]any{
+		"protocolVersion": protocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": clientName, "version": clientVersion},
+	}}, true)
+	if err != nil {
+		return nil, fmt.Errorf("initialize: %w", err)
+	}
+	if _, err := c.post(ctx, s, rpcRequest{JSONRPC: "2.0", Method: "notifications/initialized"}, false); err != nil {
+		return nil, fmt.Errorf("initialized notification: %w", err)
+	}
+	return s, nil
+}
+
+// ListTools implements Client.
+func (c *httpClient) ListTools(ctx context.Context, ep Endpoint, timeout time.Duration) ([]RemoteTool, error) {
+	s, err := c.open(ctx, ep, timeout)
+	if err != nil {
+		return nil, err
+	}
+	id := c.nextID.Add(1)
+	raw, err := c.post(ctx, s, rpcRequest{JSONRPC: "2.0", ID: &id, Method: "tools/list", Params: map[string]any{}}, true)
+	if err != nil {
+		return nil, fmt.Errorf("tools/list: %w", err)
+	}
+	var out struct {
+		Tools []RemoteTool `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("tools/list result: %w", err)
+	}
+	return out.Tools, nil
+}
+
+// CallTool implements Client. The returned text is the raw result JSON.
+func (c *httpClient) CallTool(ctx context.Context, ep Endpoint, in CallInput, timeout time.Duration) (string, error) {
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return "", errors.New("mcp tool name is empty")
+	}
+	args, err := parseArguments(in.ArgumentsJSON)
+	if err != nil {
+		return "", err
+	}
+	s, err := c.open(ctx, ep, timeout)
+	if err != nil {
+		return "", err
+	}
+	id := c.nextID.Add(1)
+	raw, err := c.post(ctx, s, rpcRequest{JSONRPC: "2.0", ID: &id, Method: "tools/call", Params: map[string]any{
+		"name":      name,
+		"arguments": args,
+		"_meta": map[string]any{
+			"user_id":         in.UserID,
+			"conversation_id": in.ConversationID,
+			"request_id":      strings.TrimSpace(in.RequestID),
+		},
+	}}, true)
+	if err != nil {
+		return "", fmt.Errorf("tools/call: %w", err)
+	}
+	return normalizeCallResult(raw)
+}
+
+// parseArguments decodes tool arguments: empty is {}, anything but one JSON
+// object is an error, integers stay integers and other numbers become floats.
+func parseArguments(text string) (map[string]any, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return map[string]any{}, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(text))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, fmt.Errorf("mcp tool arguments are not valid json: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("mcp tool arguments are not valid json: trailing data")
+	}
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return nil, errors.New("mcp tool arguments must be a json object")
+	}
+	return convertNumbers(obj).(map[string]any), nil
+}
+
+// convertNumbers replaces json.Number values with int64, float64 or, when
+// neither fits, the original text.
+func convertNumbers(v any) any {
+	switch x := v.(type) {
+	case json.Number:
+		if i, err := x.Int64(); err == nil {
+			return i
+		}
+		if f, err := x.Float64(); err == nil {
+			return f
+		}
+		return x.String()
+	case map[string]any:
+		for k, e := range x {
+			x[k] = convertNumbers(e)
+		}
+		return x
+	case []any:
+		for i, e := range x {
+			x[i] = convertNumbers(e)
+		}
+		return x
+	}
+	return v
+}
+
+// normalizeCallResult turns the raw tools/call result into the stored output or
+// a ToolError.
+func normalizeCallResult(raw json.RawMessage) (string, error) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return "{}", nil
+	}
+	var res struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(text), &res); err != nil {
+		// Not an object shaped result: hand it back untouched.
+		return text, nil
+	}
+	var parts []string
+	for _, c := range res.Content {
+		if t := strings.TrimSpace(c.Text); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	joined := strings.Join(parts, "\n")
+	if res.IsError {
+		switch {
+		case joined != "":
+			return "", &ToolError{Text: joined}
+		case text != "" && text != "{}":
+			return "", &ToolError{Text: text}
+		}
+		return "", &ToolError{Text: toolErrorFallback}
+	}
+	if strings.HasPrefix(joined, wrappedProtocolError+" ") || strings.HasPrefix(joined, wrappedProtocolError+":") {
+		return "", &ToolError{Text: joined}
+	}
+	return text, nil
+}
