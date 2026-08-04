@@ -227,3 +227,218 @@ export function DeleteConversationDialog({ conversation, open, onOpenChange, def
     />
   );
 }
+
+export function ShareDialog({ conversation, open, onOpenChange, defaultMessageIds }: { conversation: ConversationDTO | null; open: boolean; onOpenChange: (open: boolean) => void; defaultMessageIds: string[] }) {
+  const t = useT();
+  const errorMessage = useErrorMessage();
+  const [share, setShare] = useState<ShareDTO | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const id = conversation?.publicID;
+
+  useEffect(() => {
+    if (!open || !id) return;
+    let live = true;
+    setLoading(true);
+    getShare(id).then(
+      (s) => live && setShare(s.status === "active" ? s : null),
+      (e) => {
+        if (live) toast.error(t("chatNav.share.loadFailed"), { description: errorMessage(e) });
+      },
+    ).finally(() => live && setLoading(false));
+    return () => {
+      live = false;
+    };
+  }, [open, id, t, errorMessage]);
+
+  const link = share ? `${window.location.origin}/share?id=${encodeURIComponent(share.shareID)}` : "";
+  const run = async (fn: () => Promise<ShareDTO | null>) => {
+    setBusy(true);
+    try {
+      setShare(await fn());
+    } catch (e) {
+      toast.error(t("chatNav.share.failed"), { description: errorMessage(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t("chatNav.share.title")}</DialogTitle>
+          <DialogDescription>{t("chatNav.share.description")}</DialogDescription>
+        </DialogHeader>
+        {loading ? (
+          <Skeleton className="h-10 w-full" />
+        ) : share ? (
+          <div className="grid gap-3">
+            <div className="flex items-center gap-2">
+              <Badge tone="success">{t("chatNav.share.active")}</Badge>
+              <span className="text-xs text-muted-foreground">{t("chatNav.share.messages", { count: share.messageCount })}</span>
+            </div>
+            <div className="flex gap-2">
+              <Input readOnly value={link} onFocus={(e) => e.currentTarget.select()} aria-label={t("chatNav.share.copy")} />
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  if (await copyText(link)) {
+                    setCopied(true);
+                    toast.success(t("chatNav.share.copied"));
+                    setTimeout(() => setCopied(false), 1500);
+                  }
+                }}
+              >
+                {copied ? <Check /> : <Copy />} {t("chatNav.share.copy")}
+              </Button>
+            </div>
+            <DialogFooter className="sm:justify-between">
+              <Button variant="outline" loading={busy} onClick={() => conversation && run(() => createShare(conversation.publicID, defaultMessageIds, true))}>
+                <Link2 /> {t("chatNav.share.regenerate")}
+              </Button>
+              <Button variant="destructive" loading={busy} onClick={() => conversation && run(async () => (await revokeShare(conversation.publicID), null))}>
+                {t("chatNav.share.revoke")}
+              </Button>
+            </DialogFooter>
+          </div>
+        ) : (
+          <DialogFooter>
+            <Badge tone="outline" className="mr-auto">
+              {t("chatNav.share.inactive")}
+            </Badge>
+            <Button loading={busy} onClick={() => conversation && run(() => createShare(conversation.publicID, defaultMessageIds))}>
+              {t("chatNav.share.create")}
+            </Button>
+          </DialogFooter>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export function ProjectDialog({ project, open, onOpenChange }: { project: ProjectDTO | null; open: boolean; onOpenChange: (open: boolean) => void }) {
+  const t = useT();
+  const errorMessage = useErrorMessage();
+  const models = useModelsState().data;
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [model, setModel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!open) return;
+    setName(project?.name ?? "");
+    setDescription(project?.description ?? "");
+    setPrompt(project?.systemPrompt ?? "");
+    setModel(project?.defaultModel ?? "");
+    setError("");
+  }, [open, project]);
+
+  const save = async () => {
+    if (!name.trim()) return setError(t("chatNav.project.nameRequired"));
+    setBusy(true);
+    try {
+      const body = { name: name.trim(), description: description.trim(), systemPrompt: prompt, defaultModel: model };
+      upsertProject(project ? await updateProject(project.publicID, body) : await createProject(body));
+      onOpenChange(false);
+    } catch (e) {
+      setError(t("chatNav.project.failed") + " " + errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{project ? t("chatNav.project.editTitle") : t("chatNav.project.createTitle")}</DialogTitle>
+        </DialogHeader>
+        <form
+          className="grid gap-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void save();
+          }}
+        >
+          <Field>
+            <FieldLabel>{t("chatNav.project.name")}</FieldLabel>
+            <Input value={name} maxLength={80} autoFocus onChange={(e) => setName(e.target.value)} placeholder={t("chatNav.project.namePlaceholder")} />
+          </Field>
+          <Field>
+            <FieldLabel>{t("chatNav.project.description")}</FieldLabel>
+            <Input value={description} maxLength={255} onChange={(e) => setDescription(e.target.value)} placeholder={t("chatNav.project.descriptionPlaceholder")} />
+          </Field>
+          <Field>
+            <FieldLabel>{t("chatNav.project.instructions")}</FieldLabel>
+            <Textarea value={prompt} maxLength={12000} rows={5} onChange={(e) => setPrompt(e.target.value)} placeholder={t("chatNav.project.instructionsPlaceholder")} />
+          </Field>
+          <Field>
+            <FieldLabel>{t("chatNav.project.defaultModel")}</FieldLabel>
+            <NativeSelect value={model} onChange={(e) => setModel(e.target.value)}>
+              <option value="">{t("chatNav.project.noDefaultModel")}</option>
+              {models.map((m) => (
+                <option key={m.platformModelName} value={m.platformModelName}>
+                  {m.platformModelName}
+                </option>
+              ))}
+            </NativeSelect>
+            <FieldHint>{t("chatNav.project.modeHint")}</FieldHint>
+          </Field>
+          <FieldError>{error}</FieldError>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+              {t("common.actions.cancel")}
+            </Button>
+            <Button type="submit" loading={busy}>
+              {project ? t("chatNav.project.save") : t("chatNav.project.create")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export function DeleteProjectDialog({ project, open, onOpenChange, onDeleted }: { project: ProjectDTO | null; open: boolean; onOpenChange: (open: boolean) => void; onDeleted?: (id: string) => void }) {
+  const t = useT();
+  const [chats, setChats] = useState(false);
+  const [files, setFiles] = useState(false);
+  useEffect(() => {
+    if (open) {
+      setChats(false);
+      setFiles(false);
+    }
+  }, [open]);
+  return (
+    <ConfirmDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={t("chatNav.project.deleteTitle")}
+      description={
+        <span className="grid gap-3">
+          <span>{t("chatNav.project.deleteDescription")}</span>
+          <label className="flex items-center gap-2 text-foreground">
+            <Switch checked={chats} onCheckedChange={setChats} aria-label={t("chatNav.project.deleteChats")} />
+            {t("chatNav.project.deleteChats")}
+          </label>
+          {chats ? (
+            <label className="flex items-center gap-2 text-foreground">
+              <Switch checked={files} onCheckedChange={setFiles} aria-label={t("chatNav.project.deleteFiles")} />
+              {t("chatNav.project.deleteFiles")}
+            </label>
+          ) : null}
+        </span>
+      }
+      confirmLabel={t("chatNav.project.delete")}
+      destructive
+      onConfirm={async () => {
+        if (!project) return;
+        await deleteProject(project.publicID, { deleteConversations: chats, deleteFiles: files });
+        removeProject(project.publicID);
+        onDeleted?.(project.publicID);
+      }}
+    />
+  );
+}
