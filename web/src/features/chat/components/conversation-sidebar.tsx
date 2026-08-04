@@ -232,3 +232,88 @@ function SidebarInner() {
     </div>
   );
 }
+
+function SidebarDialogs({
+  dialog,
+  setDialog,
+  actions,
+  defaultDeleteFiles,
+  projects,
+}: {
+  dialog: DialogState;
+  setDialog: (d: DialogState) => void;
+  actions: ReturnType<typeof useConversationActions>;
+  defaultDeleteFiles: boolean;
+  projects: ProjectDTO[];
+}) {
+  const close = () => setDialog(null);
+  const c = dialog && "conversation" in dialog ? dialog.conversation : null;
+  return (
+    <>
+      <RenameDialog conversation={c} open={dialog?.kind === "rename"} onOpenChange={(o) => !o && close()} onSave={(title) => (c ? actions.rename(c, title) : Promise.resolve(false))} />
+      <LabelsDialog conversation={c} open={dialog?.kind === "labels"} onOpenChange={(o) => !o && close()} onSave={(labels) => (c ? actions.setLabels(c, labels) : Promise.resolve(false))} />
+      <MoveDialog conversation={c} projects={projects} open={dialog?.kind === "move"} onOpenChange={(o) => !o && close()} onMove={(id, name) => (c ? actions.moveToProject(c, id, name) : Promise.resolve(false))} />
+      <DeleteConversationDialog conversation={c} open={dialog?.kind === "delete"} onOpenChange={(o) => !o && close()} defaultDeleteFiles={defaultDeleteFiles} onDelete={(files) => (c ? actions.remove(c, files) : Promise.resolve())} />
+      <ShareDialog conversation={c} open={dialog?.kind === "share"} onOpenChange={(o) => !o && close()} defaultMessageIds={[]} />
+      <ProjectDialog project={dialog?.kind === "project" ? dialog.project : null} open={dialog?.kind === "project"} onOpenChange={(o) => !o && close()} />
+      <DeleteProjectDialog
+        project={dialog?.kind === "deleteProject" ? dialog.project : null}
+        open={dialog?.kind === "deleteProject"}
+        onOpenChange={(o) => !o && close()}
+        onDeleted={() => void refreshConversations()}
+      />
+    </>
+  );
+}
+
+type RowAction = "rename" | "star" | "labels" | "move" | "delete" | "share" | "export" | "autoRename";
+
+function ConversationRow({ conversation: c, active, onAction }: { conversation: ConversationDTO; active: boolean; onAction: (a: RowAction) => void }) {
+  const t = useT();
+  const running = useConversationRunning(c.publicID);
+  const labels = parseLabels(c.labelsJSON);
+  return (
+    <div className={cn("group/row relative flex items-center rounded-lg text-[13px] hover:bg-sidebar-accent", active && "bg-sidebar-accent font-medium text-sidebar-accent-foreground")}>
+      <Link href={`/chat?conversation_id=${encodeURIComponent(c.publicID)}`} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5" aria-current={active ? "page" : undefined}>
+        {c.isStarred ? <Star className="size-3 shrink-0 fill-current text-warning" aria-hidden /> : null}
+        <span className="truncate">{c.title || t("chatNav.sidebar.untitled")}</span>
+        {labels.length > 0 ? <span className="hidden shrink-0 truncate rounded bg-muted px-1 text-[10px] text-muted-foreground xl:inline">{labels[0]}</span> : null}
+        {running ? <span role="status" aria-label={t("chatNav.sidebar.running")} className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-primary" /> : null}
+      </Link>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button type="button" aria-label={t("chatNav.sidebar.openMenu")} className="mr-1 shrink-0 rounded p-1 text-muted-foreground opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover/row:opacity-100 data-[state=open]:opacity-100 [@media(hover:none)]:opacity-100">
+            <MoreHorizontal className="size-4" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuItem onSelect={() => onAction("rename")}>
+            <Pencil /> {t("chatNav.item.rename")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onAction("autoRename")}>
+            <Wand2 /> {t("chatNav.item.autoRename")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onAction("star")}>
+            <Star /> {c.isStarred ? t("chatNav.item.unstar") : t("chatNav.item.star")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onAction("labels")}>
+            <Tags /> {t("chatNav.item.labels")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onAction("move")}>
+            <FolderInput /> {t("chatNav.item.move")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onAction("share")}>
+            <Share2 /> {t("chatNav.item.share")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onAction("export")}>
+            <Download /> {t("chatNav.item.export")}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem destructive onSelect={() => onAction("delete")}>
+            <Trash2 /> {t("chatNav.item.delete")}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
