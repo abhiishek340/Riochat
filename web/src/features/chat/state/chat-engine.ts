@@ -1464,3 +1464,15 @@ export class ChatEngine {
     for (const turn of this.active.values()) turn.controller.abort();
   }
 }
+
+function parseLabelList(json: string | undefined): string[] {
+  if (!json) return [];
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+export type { TaskKind };
