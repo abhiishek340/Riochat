@@ -200,3 +200,216 @@ export function writeControls(caps: Caps, rows: readonly ControlRow[]): Caps {
 }
 
 // --- native tools ---------------------------------------------------------------------------------
+
+export interface NativeToolRow {
+  key: string;
+  protocols: string[];
+  type: string;
+  label: string;
+  description: string;
+  provider: string;
+  enabled: boolean;
+  defaultEnabled: boolean;
+  /** JSON object text. */
+  payload: string;
+}
+
+/** Protocol names that are matched under their tool-catalog spelling. */
+export function toolProtocol(protocol: string): string {
+  return protocol === "google_generate_content" ? "gemini_generate_content" : protocol;
+}
+
+export function nativeRows(caps: Caps): NativeToolRow[] {
+  const list = Array.isArray(caps.nativeTools) ? caps.nativeTools : [];
+  const rows: NativeToolRow[] = list.flatMap((t): NativeToolRow[] => {
+    if (!isPlainObject(t)) return [];
+    return [
+      {
+        key: typeof t.key === "string" ? t.key : "",
+        protocols: Array.isArray(t.protocols) ? t.protocols.filter((p): p is string => typeof p === "string") : [],
+        type: typeof t.type === "string" ? t.type : "",
+        label: typeof t.label === "string" ? t.label : "",
+        description: typeof t.description === "string" ? t.description : "",
+        provider: typeof t.provider === "string" ? t.provider : "",
+        enabled: t.enabled !== false,
+        defaultEnabled: t.defaultEnabled === true,
+        payload: isPlainObject(t.payload) ? JSON.stringify(t.payload, null, 2) : "{}",
+      },
+    ];
+  });
+  // The legacy list of keys becomes rows (migrated on save).
+  const legacy = Array.isArray(caps.nativeToolKeys) ? caps.nativeToolKeys.filter((k): k is string => typeof k === "string") : [];
+  for (const key of legacy) if (!rows.some((r) => r.key === key)) rows.push({ key, protocols: [], type: "", label: key, description: "", provider: "", enabled: true, defaultEnabled: false, payload: "{}" });
+  return rows;
+}
+
+export type NativeIssue = "key" | "protocols" | "payload" | "type";
+
+export function validateNative(rows: readonly NativeToolRow[]): Array<{ index: number; issue: NativeIssue }> {
+  const issues: Array<{ index: number; issue: NativeIssue }> = [];
+  rows.forEach((row, index) => {
+    if (!row.enabled) return;
+    if (!row.key.trim()) issues.push({ index, issue: "key" });
+    if (row.protocols.length === 0) issues.push({ index, issue: "protocols" });
+    let payload: unknown;
+    try {
+      payload = JSON.parse(row.payload || "{}");
+    } catch {
+      issues.push({ index, issue: "payload" });
+      return;
+    }
+    if (!isPlainObject(payload)) {
+      issues.push({ index, issue: "payload" });
+      return;
+    }
+    if (!row.type.trim() && typeof payload.type !== "string") issues.push({ index, issue: "type" });
+  });
+  return issues;
+}
+
+export function writeNative(caps: Caps, rows: readonly NativeToolRow[]): Caps {
+  const out: Caps = { ...caps };
+  delete out.nativeToolKeys;
+  const tools = rows.map((row) => {
+    let payload: unknown = {};
+    try {
+      payload = JSON.parse(row.payload || "{}");
+    } catch {
+      payload = {};
+    }
+    const type = row.type.trim() || (isPlainObject(payload) && typeof payload.type === "string" ? payload.type : "");
+    const tool: Record<string, unknown> = { key: row.key.trim(), protocols: row.protocols, label: row.label.trim() || row.key.trim(), enabled: row.enabled, defaultEnabled: row.defaultEnabled, payload };
+    if (type) tool.type = type;
+    if (row.description.trim()) tool.description = row.description.trim();
+    if (row.provider.trim()) tool.provider = row.provider.trim();
+    return tool;
+  });
+  if (tools.length > 0) out.nativeTools = tools;
+  else delete out.nativeTools;
+  return out;
+}
+
+/** A catalog entry (from the model-option policy) turned into a row. */
+export interface CatalogTool {
+  toolKey: string;
+  type: string;
+  provider: string;
+  label: string;
+  description: string;
+  protocol: string;
+  payload: unknown;
+  defaultEnabled?: boolean;
+}
+
+export function rowFromCatalog(tool: CatalogTool): NativeToolRow {
+  return {
+    key: tool.toolKey,
+    protocols: [tool.protocol].filter(Boolean),
+    type: tool.type,
+    label: tool.label,
+    description: tool.description,
+    provider: tool.provider,
+    enabled: true,
+    defaultEnabled: tool.defaultEnabled === true,
+    payload: isPlainObject(tool.payload) ? JSON.stringify(tool.payload, null, 2) : "{}",
+  };
+}
+
+/** Adds a catalog tool; one that is already present only gains the protocol. */
+export function addCatalogTool(rows: readonly NativeToolRow[], tool: CatalogTool): NativeToolRow[] {
+  const at = rows.findIndex((r) => r.key === tool.toolKey);
+  if (at < 0) return [...rows, rowFromCatalog(tool)];
+  const row = rows[at] as NativeToolRow;
+  if (!tool.protocol || row.protocols.includes(tool.protocol)) return [...rows];
+  return rows.map((r, i) => (i === at ? { ...r, protocols: [...r.protocols, tool.protocol] } : r));
+}
+
+/** Catalog tools whose protocol the model's routes use, sorted by label. */
+export function catalogForProtocols(catalog: readonly CatalogTool[], routeProtocols: readonly string[]): CatalogTool[] {
+  const wanted = new Set(routeProtocols.map(toolProtocol));
+  return catalog.filter((t) => wanted.size === 0 || wanted.has(toolProtocol(t.protocol))).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+// --- prompt cache and image stream -----------------------------------------------------------------------
+
+export type CacheAvailability = "auto" | "enabled" | "disabled";
+
+export interface PromptCacheDraft {
+  availability: CacheAvailability;
+  explicit: boolean;
+}
+
+export function readPromptCache(caps: Caps): PromptCacheDraft {
+  const pc = isPlainObject(caps.promptCache) ? caps.promptCache : {};
+  const availability: CacheAvailability = pc.enabled === true ? "enabled" : pc.enabled === false ? "disabled" : "auto";
+  return { availability, explicit: pc.mode === "explicit" && availability !== "disabled" };
+}
+
+/** Auto omits `enabled`; explicit mode adds mode and ttl; disabled drops mode and ttl; legacy `retention` always goes. */
+export function writePromptCache(caps: Caps, draft: PromptCacheDraft): Caps {
+  const out: Caps = { ...caps };
+  const next: Record<string, unknown> = {};
+  if (draft.availability === "enabled") next.enabled = true;
+  if (draft.availability === "disabled") next.enabled = false;
+  if (draft.availability !== "disabled" && draft.explicit) {
+    next.mode = "explicit";
+    next.ttl = "30m";
+  }
+  if (Object.keys(next).length > 0) out.promptCache = next;
+  else delete out.promptCache;
+  return out;
+}
+
+export function cacheEditable(routeProtocols: readonly string[]): boolean {
+  return routeProtocols.some((p) => p === "openai_chat_completions" || p === "openai_responses");
+}
+
+export function imageToggleShown(routeProtocols: readonly string[]): boolean {
+  return routeProtocols.some(isImageProtocol);
+}
+
+export function readImageStream(caps: Caps): boolean {
+  const image = isPlainObject(caps.image) ? caps.image : {};
+  return image.stream !== false;
+}
+
+export function writeImageStream(caps: Caps, stream: boolean): Caps {
+  const out: Caps = { ...caps };
+  const image = isPlainObject(out.image) ? { ...out.image } : {};
+  if (stream) delete image.stream;
+  else image.stream = false;
+  if (Object.keys(image).length > 0) out.image = image;
+  else delete out.image;
+  return out;
+}
+
+export function readModalities(caps: Caps): { mode: "auto" | "custom"; chosen: string[] } {
+  const list = caps.inputModalities;
+  if (!Array.isArray(list)) return { mode: "auto", chosen: [] };
+  return { mode: "custom", chosen: list.filter((m): m is string => typeof m === "string") };
+}
+
+export function writeModalities(caps: Caps, mode: "auto" | "custom", chosen: readonly string[]): Caps {
+  const out: Caps = { ...caps };
+  if (mode === "auto") {
+    delete out.inputModalities;
+    return out;
+  }
+  out.inputModalities = ["text", ...["image", "pdf", "audio", "video"].filter((m) => chosen.includes(m))];
+  return out;
+}
+
+export function writeReasoning(caps: Caps, value: Record<string, unknown> | null): Caps {
+  const out: Caps = { ...caps };
+  if (value === null) delete out.reasoning;
+  else out.reasoning = value;
+  return out;
+}
+
+export function allIssues(rows: { controls: readonly ControlRow[]; native: readonly NativeToolRow[] }): Problem | null {
+  const c = validateControls(rows.controls)[0];
+  if (c) return problem(`adminModels.caps.issues.${c.issue}`, { row: c.index + 1 });
+  const n = validateNative(rows.native)[0];
+  if (n) return problem(`adminModels.caps.nativeIssues.${n.issue}`, { row: n.index + 1 });
+  return null;
+}
