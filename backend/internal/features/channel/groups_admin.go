@@ -429,3 +429,230 @@ func (s *Service) allModelsExist(ctx context.Context, ids []uint) (bool, error) 
 	}
 	return int(n) == len(ids), nil
 }
+
+// normalizeRules trims and checks rules; duplicates collapse. ok is false when
+// a rule is unusable.
+func normalizeRules(in []GroupRule) ([]GroupRule, bool) {
+	seen := map[GroupRule]bool{}
+	out := make([]GroupRule, 0, len(in))
+	for _, r := range in {
+		r.Type, r.Value = strings.TrimSpace(r.Type), strings.TrimSpace(r.Value)
+		switch r.Type {
+		case RuleAll:
+			r.Value = ""
+		case RuleVendor, RuleProtocol, RuleUpstream:
+			if r.Value == "" {
+				return nil, false
+			}
+		default:
+			return nil, false
+		}
+		if !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	return out, true
+}
+
+func nonZeroUnique(ids []uint) ([]uint, bool) {
+	for _, id := range ids {
+		if id == 0 {
+			return nil, false
+		}
+	}
+	out := uniqueUints(ids)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, true
+}
+
+// AdminReplaceGroupModels replaces both the manual grants and the rules of a
+// group and returns the stored state.
+func (s *Service) AdminReplaceGroupModels(ctx context.Context, id uint, modelIDs []uint, rules []GroupRule) (*GroupModelSet, error) {
+	if _, err := s.requirePermGroup(ctx, s.db, id); err != nil {
+		return nil, err
+	}
+	ids, ok := nonZeroUnique(modelIDs)
+	if !ok {
+		return nil, ErrInvalidPermGroups
+	}
+	exist, err := s.allModelsExist(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	if !exist {
+		return nil, ErrInvalidPermGroups
+	}
+	norm, ok := normalizeRules(rules)
+	if !ok {
+		return nil, ErrInvalidPermGroups
+	}
+	err = s.tx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Where("group_id = ?", id).Delete(&PermissionGroupModelAccess{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("group_id = ?", id).Delete(&PermissionGroupModelRule{}).Error; err != nil {
+			return err
+		}
+		for _, m := range ids {
+			if err := tx.Create(&PermissionGroupModelAccess{GroupID: id, PlatformModelID: m}).Error; err != nil {
+				return err
+			}
+		}
+		for _, r := range norm {
+			if err := tx.Create(&PermissionGroupModelRule{GroupID: id, RuleType: r.Type, Value: r.Value}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateCatalog()
+	return s.AdminGroupModels(ctx, id)
+}
+
+// AdminGroupMembers lists the explicit members of an ordinary group.
+func (s *Service) AdminGroupMembers(ctx context.Context, id uint) ([]uint, error) {
+	g, err := s.requirePermGroup(ctx, s.db, id)
+	if err != nil {
+		return nil, err
+	}
+	if g.IsDefault {
+		return nil, ErrDefaultGroupMembers
+	}
+	ids := []uint{}
+	err = s.db.WithContext(ctx).Model(&PermissionGroupUserAccess{}).Where("group_id = ?", id).
+		Order("user_id ASC").Pluck("user_id", &ids).Error
+	return ids, err
+}
+
+// existingUsers filters ids down to the ones that name live accounts.
+func (s *Service) existingUsers(ctx context.Context, ids []uint) ([]uint, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if s.opts.Verifier != nil {
+		return s.opts.Verifier.ExistingUserIDs(ctx, ids)
+	}
+	var found []uint
+	err := s.db.WithContext(ctx).Table("identity_users").Where("id IN ? AND deleted_at IS NULL", ids).Pluck("id", &found).Error
+	return found, err
+}
+
+// AdminReplaceGroupMembers replaces the explicit membership of an ordinary
+// group with the given users.
+func (s *Service) AdminReplaceGroupMembers(ctx context.Context, id uint, userIDs []uint) ([]uint, error) {
+	g, err := s.requirePermGroup(ctx, s.db, id)
+	if err != nil {
+		return nil, err
+	}
+	if g.IsDefault {
+		return nil, ErrDefaultGroupMembers
+	}
+	ids, ok := nonZeroUnique(userIDs)
+	if !ok {
+		return nil, ErrInvalidGroupUsers
+	}
+	found, err := s.existingUsers(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	if len(uniqueUints(found)) != len(ids) {
+		return nil, ErrInvalidGroupUsers
+	}
+	err = s.tx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Where("group_id = ?", id).Delete(&PermissionGroupUserAccess{}).Error; err != nil {
+			return err
+		}
+		for _, u := range ids {
+			if err := tx.Create(&PermissionGroupUserAccess{GroupID: id, UserID: u}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// AdminModelGroups reports which groups reach a model: by manual grant, by rule,
+// and both together.
+func (s *Service) AdminModelGroups(ctx context.Context, modelID uint) (*ModelGroupSet, error) {
+	var m PlatformModel
+	if err := s.db.WithContext(ctx).Where("id = ?", modelID).Take(&m).Error; err != nil {
+		if isNotFound(err) {
+			return nil, ErrInvalidPermGroups
+		}
+		return nil, err
+	}
+	facts, err := s.modelFacts(ctx, &m)
+	if err != nil {
+		return nil, err
+	}
+	d, err := s.loadGroupData(ctx)
+	if err != nil {
+		return nil, err
+	}
+	manual, matched, effective := map[uint]bool{}, map[uint]bool{}, map[uint]bool{}
+	for g := range d.manual[modelID] {
+		if _, ok := d.groups[g]; ok {
+			manual[g], effective[g] = true, true
+		}
+	}
+	for g, rs := range d.rules {
+		if _, ok := d.groups[g]; !ok {
+			continue
+		}
+		for _, r := range rs {
+			if ruleMatches(r, facts) {
+				matched[g], effective[g] = true, true
+				break
+			}
+		}
+	}
+	keys := func(set map[uint]bool) []uint {
+		out := make([]uint, 0, len(set))
+		for k := range set {
+			out = append(out, k)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+		return out
+	}
+	return &ModelGroupSet{
+		ManualGroupIDs: keys(manual), MatchedGroupIDs: keys(matched), EffectiveGroupIDs: keys(effective),
+		Unassigned: len(effective) == 0,
+	}, nil
+}
+
+// AdminReplaceModelGroups replaces the manual grants of one model (group rules
+// stay as they are) and returns the resulting reach.
+func (s *Service) AdminReplaceModelGroups(ctx context.Context, modelID uint, groupIDs []uint) (*ModelGroupSet, error) {
+	exist, err := s.allModelsExist(ctx, []uint{modelID})
+	if err != nil {
+		return nil, err
+	}
+	if !exist {
+		return nil, ErrInvalidPermGroups
+	}
+	ids, ok := nonZeroUnique(groupIDs)
+	if !ok {
+		return nil, ErrInvalidPermGroups
+	}
+	if len(ids) > 0 {
+		var n int64
+		if err := s.db.WithContext(ctx).Model(&PermissionGroup{}).Where("id IN ?", ids).Count(&n).Error; err != nil {
+			return nil, err
+		}
+		if int(n) != len(ids) {
+			return nil, ErrInvalidPermGroups
+		}
+	}
+	if err := s.SetModelGroups(ctx, modelID, ids); err != nil {
+		return nil, err
+	}
+	return s.AdminModelGroups(ctx, modelID)
+}
