@@ -175,3 +175,179 @@ func (h *handlers) listServers(c *gin.Context) {
 	}
 	httpx.OK(c, gin.H{"results": out})
 }
+
+type serverRequest struct {
+	Name        string `json:"name"`
+	BaseURL     string `json:"baseURL"`
+	AuthToken   string `json:"authToken"`
+	HeadersJSON string `json:"headersJSON"`
+	Status      string `json:"status"`
+}
+
+func (r serverRequest) input() ServerInput {
+	return ServerInput{Name: r.Name, BaseURL: r.BaseURL, AuthToken: r.AuthToken, HeadersJSON: r.HeadersJSON, Status: r.Status}
+}
+
+func (h *handlers) createServer(c *gin.Context) {
+	var req serverRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	row, err := h.svc.CreateServer(c.Request.Context(), req.input())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"server": toServerView(*row)})
+}
+
+func (h *handlers) updateServer(c *gin.Context) {
+	id, ok := pathID(c, ErrInvalidServerID)
+	if !ok {
+		return
+	}
+	var req serverRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	row, err := h.svc.UpdateServer(c.Request.Context(), id, req.input())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"server": toServerView(*row)})
+}
+
+func (h *handlers) deleteServer(c *gin.Context) {
+	id, ok := pathID(c, ErrInvalidServerID)
+	if !ok {
+		return
+	}
+	if err := h.svc.DeleteServer(c.Request.Context(), id); err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"deleted": true})
+}
+
+type reorderRequest struct {
+	Servers []OrderEntry `json:"servers"`
+}
+
+func (h *handlers) reorder(c *gin.Context) {
+	var req reorderRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	ordered, err := h.svc.Reorder(c.Request.Context(), req.Servers)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	type item struct {
+		Server serverView `json:"server"`
+		Tools  []toolView `json:"tools"`
+	}
+	out := make([]item, 0, len(ordered))
+	for _, o := range ordered {
+		tools := make([]toolView, 0, len(o.Tools))
+		for _, t := range o.Tools {
+			tools = append(tools, toToolView(t.Tool, t.ServerName))
+		}
+		rows, err := h.svc.decorate(c.Request.Context(), []Server{o.Server})
+		if err != nil {
+			fail(c, err)
+			return
+		}
+		out = append(out, item{Server: toServerView(rows[0]), Tools: tools})
+	}
+	httpx.OK(c, gin.H{"results": out})
+}
+
+// ---- administrator: tools ----
+
+func (h *handlers) listServerTools(c *gin.Context) {
+	id, ok := pathID(c, ErrInvalidServerID)
+	if !ok {
+		return
+	}
+	tools, err := h.svc.ListServerTools(c.Request.Context(), id)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"results": toolViews(tools)})
+}
+
+type bulkStatusRequest struct {
+	ToolIDs []uint `json:"toolIDs"`
+	Status  string `json:"status"`
+}
+
+func (h *handlers) setToolsStatus(c *gin.Context) {
+	id, ok := pathID(c, ErrInvalidServerID)
+	if !ok {
+		return
+	}
+	var req bulkStatusRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	tools, err := h.svc.SetToolsStatus(c.Request.Context(), id, req.ToolIDs, req.Status)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"results": toolViews(tools)})
+}
+
+func (h *handlers) syncServer(c *gin.Context) {
+	id, ok := pathID(c, ErrInvalidServerID)
+	if !ok {
+		return
+	}
+	overwrite := false
+	if raw := strings.TrimSpace(c.Query("overwrite_customized_metadata")); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			httpx.Fail(c, http.StatusBadRequest, ErrInvalidOverwrite)
+			return
+		}
+		overwrite = v
+	}
+	tools, err := h.svc.SyncServer(c.Request.Context(), id, overwrite)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"results": toolViews(tools)})
+}
+
+type toolRequest struct {
+	DisplayName              *string `json:"displayName"`
+	Description              *string `json:"description"`
+	AttachmentInputMode      *string `json:"attachmentInputMode"`
+	AttachmentArgument       *string `json:"attachmentArgument"`
+	AttachmentEncoding       *string `json:"attachmentEncoding"`
+	AttachmentPromptArgument *string `json:"attachmentPromptArgument"`
+	PriceNanoUSD             *int64  `json:"priceNanousd"`
+	Status                   *string `json:"status"`
+}
+
+func (h *handlers) updateTool(c *gin.Context) {
+	id, ok := pathID(c, ErrInvalidToolID)
+	if !ok {
+		return
+	}
+	var req toolRequest
+	if !httpx.BindJSON(c, &req) {
+		return
+	}
+	tool, err := h.svc.UpdateTool(c.Request.Context(), id, ToolPatch(req))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	// The updated tool is reported without its server's name.
+	httpx.OK(c, toToolView(*tool, ""))
+}
