@@ -197,3 +197,106 @@ func (s *Service) UpdateTool(ctx context.Context, id uint, patch ToolPatch) (*To
 	}
 	return &result, nil
 }
+
+// SetToolsStatus changes the status of the listed tools of one server (ids of
+// other servers are ignored) and returns all of the server's tools.
+func (s *Service) SetToolsStatus(ctx context.Context, serverID uint, toolIDs []uint, status string) ([]Tool, error) {
+	status = strings.TrimSpace(status)
+	if status != StatusActive && status != StatusInactive {
+		return nil, ErrInvalidToolStatus
+	}
+	if len(toolIDs) == 0 {
+		return nil, ErrInvalidSelection
+	}
+	if err := s.db.WithContext(ctx).Model(&Tool{}).
+		Where("server_id = ? AND id IN ?", serverID, toolIDs).Update("status", status).Error; err != nil {
+		return nil, database.Translate(err)
+	}
+	return s.ListServerTools(ctx, serverID)
+}
+
+// OrderEntry is one server in a reorder request.
+type OrderEntry struct {
+	ServerID uint   `json:"serverID"`
+	ToolIDs  []uint `json:"toolIDs"`
+}
+
+// OrderedServer is one server of the reorder response.
+type OrderedServer struct {
+	Server Server
+	Tools  []ToolRow
+}
+
+// Reorder applies a complete ordering of servers and of each server's tools.
+func (s *Service) Reorder(ctx context.Context, entries []OrderEntry) ([]OrderedServer, error) {
+	if len(entries) == 0 {
+		return nil, ErrInvalidSelection
+	}
+	var result []OrderedServer
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var servers []Server
+		if err := lockRows(tx).Order("sort_order ASC, id ASC").Find(&servers).Error; err != nil {
+			return database.Translate(err)
+		}
+		if len(entries) != len(servers) {
+			return ErrInvalidSelection
+		}
+		byID := make(map[uint]*Server, len(servers))
+		for i := range servers {
+			byID[servers[i].ID] = &servers[i]
+		}
+		seen := make(map[uint]bool, len(entries))
+		for _, e := range entries {
+			if e.ServerID == 0 || byID[e.ServerID] == nil || seen[e.ServerID] {
+				return ErrInvalidSelection
+			}
+			seen[e.ServerID] = true
+		}
+		var tools []Tool
+		if err := lockRows(tx).Find(&tools).Error; err != nil {
+			return database.Translate(err)
+		}
+		toolByID := make(map[uint]*Tool, len(tools))
+		perServer := make(map[uint]int, len(servers))
+		for i := range tools {
+			toolByID[tools[i].ID] = &tools[i]
+			perServer[tools[i].ServerID]++
+		}
+		for _, e := range entries {
+			if len(e.ToolIDs) != perServer[e.ServerID] {
+				return ErrInvalidSelection
+			}
+			dup := make(map[uint]bool, len(e.ToolIDs))
+			for _, tid := range e.ToolIDs {
+				t := toolByID[tid]
+				if tid == 0 || t == nil || t.ServerID != e.ServerID || dup[tid] {
+					return ErrInvalidSelection
+				}
+				dup[tid] = true
+			}
+		}
+		result = make([]OrderedServer, 0, len(entries))
+		for i, e := range entries {
+			srv := byID[e.ServerID]
+			srv.SortOrder = (i + 1) * sortStep
+			if err := tx.Model(&Server{}).Where("id = ?", srv.ID).Update("sort_order", srv.SortOrder).Error; err != nil {
+				return database.Translate(err)
+			}
+			rows := make([]ToolRow, 0, len(e.ToolIDs))
+			for j, tid := range e.ToolIDs {
+				t := toolByID[tid]
+				t.SortOrder = (j + 1) * sortStep
+				if err := tx.Model(&Tool{}).Where("id = ?", tid).Update("sort_order", t.SortOrder).Error; err != nil {
+					return database.Translate(err)
+				}
+				rows = append(rows, ToolRow{Tool: *t, ServerName: srv.Name})
+			}
+			result = append(result, OrderedServer{Server: *srv, Tools: rows})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
