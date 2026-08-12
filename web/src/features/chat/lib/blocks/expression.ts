@@ -323,3 +323,326 @@ function num(v: Value, op: string): number {
   if (typeof v !== "number") throw new ExprError(`${op} needs numbers`);
   return v;
 }
+
+function spend(b: Budget, n = 1): void {
+  b.steps -= n;
+  if (b.steps < 0) throw new ExprError("the formula is too expensive to evaluate");
+}
+
+// --- functions --------------------------------------------------------------------------------------------
+
+type Fn = (args: Value[], budget: Budget) => Value;
+
+function arity(name: string, args: Value[], min: number, max = min): void {
+  if (args.length < min || args.length > max) throw new ExprError(`${name} takes ${min === max ? min : `${min} to ${max}`} argument(s)`);
+}
+
+const math1 = (name: string, f: (x: number) => number): Fn => (args) => {
+  arity(name, args, 1);
+  return f(num(args[0] as Value, name));
+};
+
+function listArg(name: string, v: Value | undefined): Value[] {
+  if (!Array.isArray(v)) throw new ExprError(`${name} needs a list`);
+  return v;
+}
+
+function round10(n: number): number {
+  return Number(n.toFixed(10));
+}
+
+const FUNCS: Record<string, Fn> = {
+  abs: math1("abs", Math.abs),
+  sqrt: math1("sqrt", Math.sqrt),
+  cbrt: math1("cbrt", Math.cbrt),
+  floor: math1("floor", Math.floor),
+  ceil: math1("ceil", Math.ceil),
+  sign: math1("sign", Math.sign),
+  log: math1("log", Math.log),
+  ln: math1("ln", Math.log),
+  log10: math1("log10", Math.log10),
+  log2: math1("log2", Math.log2),
+  exp: math1("exp", Math.exp),
+  sin: math1("sin", Math.sin),
+  cos: math1("cos", Math.cos),
+  tan: math1("tan", Math.tan),
+  asin: math1("asin", Math.asin),
+  acos: math1("acos", Math.acos),
+  atan: math1("atan", Math.atan),
+  sinh: math1("sinh", Math.sinh),
+  cosh: math1("cosh", Math.cosh),
+  tanh: math1("tanh", Math.tanh),
+  pow: (args) => {
+    arity("pow", args, 2);
+    return Math.pow(num(args[0] as Value, "pow"), num(args[1] as Value, "pow"));
+  },
+  min: (args, b) => extreme("min", args, b, Math.min),
+  max: (args, b) => extreme("max", args, b, Math.max),
+  round: (args) => {
+    arity("round", args, 1, 2);
+    const v = num(args[0] as Value, "round");
+    const d = args.length > 1 ? Math.trunc(num(args[1] as Value, "round")) : 0;
+    const f = 10 ** Math.min(Math.max(d, 0), 15);
+    return Math.round(v * f) / f;
+  },
+  fixed: (args) => {
+    arity("fixed", args, 1, 2);
+    const v = num(args[0] as Value, "fixed");
+    const d = args.length > 1 ? Math.min(10, Math.max(0, Math.trunc(num(args[1] as Value, "fixed")))) : 0;
+    return Number.isFinite(v) ? v.toFixed(d) : "—";
+  },
+  clamp: (args) => {
+    arity("clamp", args, 3);
+    const [v, lo, hi] = args.map((a) => num(a as Value, "clamp")) as [number, number, number];
+    return Math.min(Math.max(v, lo), hi);
+  },
+  range: (args, b) => {
+    arity("range", args, 2, 3);
+    const start = num(args[0] as Value, "range");
+    const end = num(args[1] as Value, "range");
+    const step = args.length > 2 ? num(args[2] as Value, "range") : end >= start ? 1 : -1;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(step) || step === 0) throw new ExprError("range needs a non-zero step");
+    if ((end - start) * step < 0) throw new ExprError("range step points the wrong way");
+    const count = Math.floor((end - start) / step + 1e-9) + 1;
+    if (count > MAX_RANGE_POINTS) throw new ExprError(`range is limited to ${MAX_RANGE_POINTS} points`);
+    spend(b, count);
+    const out: number[] = [];
+    for (let k = 0; k < count; k++) out.push(round10(start + k * step));
+    return out;
+  },
+  sum: (args, b) => {
+    arity("sum", args, 1);
+    const list = listArg("sum", args[0]);
+    spend(b, list.length);
+    return list.reduce<number>((acc, x) => acc + num(x, "sum"), 0);
+  },
+  avg: (args, b) => {
+    arity("avg", args, 1);
+    const list = listArg("avg", args[0]);
+    if (list.length === 0) throw new ExprError("avg of an empty list");
+    spend(b, list.length);
+    return list.reduce<number>((acc, x) => acc + num(x, "avg"), 0) / list.length;
+  },
+  len: (args) => {
+    arity("len", args, 1);
+    const v = args[0] as Value;
+    if (typeof v === "string") return Array.from(v).length;
+    if (Array.isArray(v)) return v.length;
+    throw new ExprError("len needs a list or text");
+  },
+  contains: (args, b) => {
+    arity("contains", args, 2);
+    const [hay, needle] = args as [Value, Value];
+    if (typeof hay === "string") return typeof needle === "string" ? hay.includes(needle) : hay.includes(show(needle));
+    if (Array.isArray(hay)) {
+      spend(b, hay.length);
+      return hay.some((x) => deepEqual(x, needle));
+    }
+    throw new ExprError("contains needs text or a list");
+  },
+};
+
+function extreme(name: string, args: Value[], b: Budget, f: (...n: number[]) => number): Value {
+  let values: Value[];
+  if (args.length === 1 && Array.isArray(args[0])) {
+    values = args[0];
+    spend(b, values.length);
+  } else {
+    if (args.length > 64) throw new ExprError(`${name} takes at most 64 numbers`);
+    values = args;
+  }
+  if (values.length === 0) throw new ExprError(`${name} of an empty list`);
+  return f(...values.map((v) => num(v, name)));
+}
+
+// --- evaluation -------------------------------------------------------------------------------------------------
+
+export type Scope = Readonly<Record<string, Value | undefined>>;
+
+function lookup(name: string, scope: Scope): Value {
+  if (Object.prototype.hasOwnProperty.call(scope, name) && scope[name] !== undefined) return scope[name] as Value;
+  if (name === "pi") return Math.PI;
+  if (name === "e") return Math.E;
+  throw new ExprError(`unknown variable ${name}`);
+}
+
+function evalNode(n: Node, scope: Scope, b: Budget): Value {
+  spend(b);
+  switch (n.k) {
+    case "num":
+    case "str":
+    case "bool":
+      return n.v;
+    case "null":
+      return null;
+    case "list":
+      return n.items.map((x) => evalNode(x, scope, b));
+    case "var":
+      return lookup(n.name, scope);
+    case "un": {
+      const v = evalNode(n.arg, scope, b);
+      return n.op === "!" ? !truthy(v) : -num(v, "-");
+    }
+    case "cond":
+      return truthy(evalNode(n.c, scope, b)) ? evalNode(n.a, scope, b) : evalNode(n.b, scope, b);
+    case "member": {
+      const o = evalNode(n.obj, scope, b);
+      if (FORBIDDEN_PROPS.has(n.name)) throw new ExprError(`${n.name} is not allowed`);
+      if (n.name === "length" && (Array.isArray(o) || typeof o === "string")) return o.length;
+      if (o && typeof o === "object" && !Array.isArray(o) && Object.prototype.hasOwnProperty.call(o, n.name)) return (o as Record<string, Value>)[n.name] as Value;
+      throw new ExprError(`unknown property ${n.name}`);
+    }
+    case "index": {
+      const o = evalNode(n.obj, scope, b);
+      const i = evalNode(n.index, scope, b);
+      if (Array.isArray(o)) {
+        if (typeof i !== "number" || !Number.isInteger(i) || i < 0 || i >= o.length) throw new ExprError("list index out of range");
+        return o[i] as Value;
+      }
+      if (o && typeof o === "object" && typeof i === "string") {
+        if (FORBIDDEN_PROPS.has(i)) throw new ExprError(`${i} is not allowed`);
+        if (Object.prototype.hasOwnProperty.call(o, i)) return (o as Record<string, Value>)[i] as Value;
+        throw new ExprError(`unknown property ${i}`);
+      }
+      throw new ExprError("cannot read an element here");
+    }
+    case "call": {
+      const args = n.args.map((a) => evalNode(a, scope, b));
+      return (FUNCS[n.name] as Fn)(args, b);
+    }
+    case "bin": {
+      if (n.op === "&&") {
+        const l = evalNode(n.l, scope, b);
+        return truthy(l) ? evalNode(n.r, scope, b) : l;
+      }
+      if (n.op === "||") {
+        const l = evalNode(n.l, scope, b);
+        return truthy(l) ? l : evalNode(n.r, scope, b);
+      }
+      const l = evalNode(n.l, scope, b);
+      const r = evalNode(n.r, scope, b);
+      switch (n.op) {
+        case "+":
+          if (typeof l === "string" || typeof r === "string") return show(l) + show(r);
+          return num(l, "+") + num(r, "+");
+        case "-":
+          return num(l, "-") - num(r, "-");
+        case "*":
+          return num(l, "*") * num(r, "*");
+        case "/":
+          return num(l, "/") / num(r, "/");
+        case "%":
+          return num(l, "%") % num(r, "%");
+        case "^":
+          return Math.pow(num(l, "^"), num(r, "^"));
+        case "==":
+          return deepEqual(l, r);
+        case "!=":
+          return !deepEqual(l, r);
+        default: {
+          if (typeof l === "string" && typeof r === "string") {
+            return n.op === "<" ? l < r : n.op === "<=" ? l <= r : n.op === ">" ? l > r : l >= r;
+          }
+          const a = num(l, n.op);
+          const c = num(r, n.op);
+          return n.op === "<" ? a < c : n.op === "<=" ? a <= c : n.op === ">" ? a > c : a >= c;
+        }
+      }
+    }
+  }
+}
+
+// --- public api ------------------------------------------------------------------------------------------------------
+
+export interface Compiled {
+  source: string;
+  ast: Node;
+  /** Names the formula reads as variables (the constants pi and e excluded). */
+  vars: string[];
+  evaluate: (scope?: Scope, budget?: Budget) => Value;
+}
+
+function collectVars(n: Node, out: Set<string>): void {
+  switch (n.k) {
+    case "var":
+      if (n.name !== "pi" && n.name !== "e") out.add(n.name);
+      return;
+    case "list":
+      n.items.forEach((x) => collectVars(x, out));
+      return;
+    case "un":
+      collectVars(n.arg, out);
+      return;
+    case "bin":
+      collectVars(n.l, out);
+      collectVars(n.r, out);
+      return;
+    case "cond":
+      collectVars(n.c, out);
+      collectVars(n.a, out);
+      collectVars(n.b, out);
+      return;
+    case "member":
+      collectVars(n.obj, out);
+      return;
+    case "index":
+      collectVars(n.obj, out);
+      collectVars(n.index, out);
+      return;
+    case "call":
+      n.args.forEach((x) => collectVars(x, out));
+      return;
+    default:
+      return;
+  }
+}
+
+export function compile(source: string): Compiled {
+  if (source.length > MAX_SOURCE) throw new ExprError("the formula is too long");
+  const ast = new Parser(tokenize(source)).parse();
+  const vars = new Set<string>();
+  collectVars(ast, vars);
+  return {
+    source,
+    ast,
+    vars: [...vars],
+    evaluate: (scope = {}, budget = { steps: DEFAULT_STEPS }) => evalNode(ast, scope, budget),
+  };
+}
+
+export function evaluate(source: string, scope: Scope = {}, steps = DEFAULT_STEPS): Value {
+  return compile(source).evaluate(scope, { steps });
+}
+
+function couldBeNumber(n: Node): boolean {
+  switch (n.k) {
+    case "num":
+    case "var":
+    case "member":
+    case "index":
+      return true;
+    case "un":
+      return n.op === "-";
+    case "bin":
+      return ["+", "-", "*", "/", "%", "^"].includes(n.op);
+    case "cond":
+      return couldBeNumber(n.a) || couldBeNumber(n.b);
+    case "call":
+      return !["fixed", "contains", "range"].includes(n.name);
+    default:
+      return false;
+  }
+}
+
+/** A formula that must yield a number: rejects comparisons, logic, lists and text at compile time. */
+export function compileNumeric(source: string): Compiled {
+  const c = compile(source);
+  if (!couldBeNumber(c.ast)) throw new ExprError("only numeric formulas are allowed here");
+  return c;
+}
+
+export function evalNumeric(c: Compiled, vars: Record<string, number>, budget?: Budget): number {
+  const v = c.evaluate(vars, budget);
+  if (typeof v !== "number") throw new ExprError("the formula did not produce a number");
+  return v;
+}
