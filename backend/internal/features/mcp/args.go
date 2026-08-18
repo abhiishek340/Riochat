@@ -160,3 +160,163 @@ func numericValue(v any) (float64, bool) {
 	}
 	return 0, false
 }
+
+// jsonEqual compares decoded JSON values, numbers numerically.
+func jsonEqual(a, b any) bool {
+	if fa, ok := numericValue(a); ok {
+		fb, ok := numericValue(b)
+		return ok && fa == fb
+	}
+	switch x := a.(type) {
+	case nil:
+		return b == nil
+	case string:
+		y, ok := b.(string)
+		return ok && x == y
+	case bool:
+		y, ok := b.(bool)
+		return ok && x == y
+	case []any:
+		y, ok := b.([]any)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if !jsonEqual(x[i], y[i]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		y, ok := b.(map[string]any)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for k, e := range x {
+			o, ok := y[k]
+			if !ok || !jsonEqual(e, o) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// decodeObject reads exactly one JSON object from text (empty text is {}).
+func decodeObject(text string) (map[string]any, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return map[string]any{}, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(text))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, errors.New("arguments must be one valid JSON object")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("arguments must be one JSON object without trailing data")
+	}
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return nil, errors.New("arguments must be a JSON object")
+	}
+	return obj, nil
+}
+
+// prepareArguments validates and normalizes the model's arguments for a tool.
+// It returns the canonical JSON text of the (possibly coerced) object. When the
+// schema is not usable, only the object shape is enforced.
+func prepareArguments(text, schemaJSON string) (string, error) {
+	obj, err := decodeObject(text)
+	if err != nil {
+		return "", &ArgumentError{Issues: []string{err.Error()}}
+	}
+	var issues []string
+	if schema, ok := parseSchemaObject(schemaJSON); ok {
+		issues = checkAgainstSchema(obj, schema)
+	}
+	if len(issues) > 0 {
+		return "", &ArgumentError{Issues: issues}
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(convertNumbers(obj)); err != nil {
+		return "", &ArgumentError{Issues: []string{"arguments cannot be encoded"}}
+	}
+	return strings.TrimSpace(buf.String()), nil
+}
+
+func checkAgainstSchema(obj, schema map[string]any) []string {
+	props, _ := schema["properties"].(map[string]any)
+	var issues []string
+	names := make([]string, 0, len(obj))
+	for k := range obj {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		prop, ok := props[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		value := obj[name]
+		if types := declaredTypes(prop); len(types) > 0 {
+			fitted, ok := fitAny(value, types)
+			if !ok {
+				issues = append(issues, fmt.Sprintf("%s: expected %s, received %s", name, strings.Join(types, " or "), kindOf(value)))
+				continue
+			}
+			obj[name] = fitted
+			value = fitted
+		}
+		if enum, ok := prop["enum"].([]any); ok {
+			found := false
+			for _, e := range enum {
+				if jsonEqual(value, e) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				issues = append(issues, fmt.Sprintf("%s: value is not one of the allowed values", name))
+			}
+		}
+	}
+	if req, ok := schema["required"].([]any); ok {
+		for _, r := range req {
+			name, ok := r.(string)
+			if !ok {
+				continue
+			}
+			if _, present := obj[name]; present {
+				continue
+			}
+			expected := "a value"
+			if prop, ok := props[name].(map[string]any); ok {
+				if types := declaredTypes(prop); len(types) > 0 {
+					expected = strings.Join(types, " or ")
+				}
+			}
+			issues = append(issues, fmt.Sprintf("%s: required, expected %s, received nothing", name, expected))
+		}
+	}
+	return issues
+}
+
+// fitAny tries exact matches against every declared type first, then coercions.
+func fitAny(v any, types []string) (any, bool) {
+	for _, t := range types {
+		if out, ok := fitExact(v, t); ok {
+			return out, true
+		}
+	}
+	for _, t := range types {
+		if out, ok := fitCoerced(v, t); ok {
+			return out, true
+		}
+	}
+	return nil, false
+}
