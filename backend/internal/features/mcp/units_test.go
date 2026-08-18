@@ -209,3 +209,184 @@ func TestPrepareArguments(t *testing.T) {
 		t.Fatalf("a schema without properties: %q %v", got, err)
 	}
 }
+
+func TestModelToolName(t *testing.T) {
+	cases := map[string]string{
+		"get weather!": "get_weather",
+		"9lives":       "tool_9lives",
+		"search":       "search",
+		"  ":           "",
+		"!!!":          "",
+		"a..b//c":      "a_b_c",
+		"-lead":        "lead",
+		"_lead":        "lead",
+		"trail__":      "trail",
+		"x-y_z":        "x-y_z",
+		// Non-ASCII sample written as escape sequences (CJK / wide characters), so this file stays ASCII-only.
+		"\u65e5\u672c\u8a9e":          "",
+		"tool/näme":                   "tool_n_me",
+		"1":                           "tool_1",
+		strings.Repeat("a", 70):       strings.Repeat("a", 64),
+		"9" + strings.Repeat("b", 70): "tool_9" + strings.Repeat("b", 58),
+	}
+	for in, want := range cases {
+		if got := modelToolName(in); got != want {
+			t.Errorf("modelToolName(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if n := len(modelToolName(strings.Repeat("a", 70))); n != 64 {
+		t.Fatalf("70-char name must be exactly 64 bytes, got %d", n)
+	}
+}
+
+func TestUniqueModelName(t *testing.T) {
+	used := map[string]bool{}
+	var got []string
+	for i := 0; i < 3; i++ {
+		n := uniqueModelName("search", used)
+		used[n] = true
+		got = append(got, n)
+	}
+	if strings.Join(got, ",") != "search,search_2,search_3" {
+		t.Fatalf("got %v", got)
+	}
+	long := strings.Repeat("a", 64)
+	used = map[string]bool{long: true}
+	n := uniqueModelName(long, used)
+	if len(n) != 64 || !strings.HasSuffix(n, "_2") {
+		t.Fatalf("suffix must fit the limit: %q (%d)", n, len(n))
+	}
+}
+
+func TestUserContextSigning(t *testing.T) {
+	now := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	claims := UserContextClaims{UserID: 7, ConversationID: 9, RequestID: "req-1", Audience: "https://a.example/mcp", JTI: newJTI(), ExpiresAt: now.Add(5 * time.Minute).Unix()}
+	tok, err := SignUserContext("s", claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 || parts[0] != "v1" || strings.ContainsAny(tok, "=+/") {
+		t.Fatalf("token shape: %q", tok)
+	}
+	if parts[2] != userContextMAC("s", parts[1]) {
+		t.Fatal("mac must be HMAC-SHA256 over the encoded payload")
+	}
+	got, err := VerifyUserContext("s", tok, now)
+	if err != nil || got != claims {
+		t.Fatalf("verify: %+v %v", got, err)
+	}
+	raw, _ := b64.DecodeString(parts[1])
+	for _, f := range []string{`"user_id":7`, `"conversation_id":9`, `"request_id":"req-1"`, `"aud":"https://a.example/mcp"`, `"jti":`, `"exp":`} {
+		if !strings.Contains(string(raw), f) {
+			t.Errorf("payload lacks %s: %s", f, raw)
+		}
+	}
+	// Optional fields are omitted.
+	tok2, _ := SignUserContext("s", UserContextClaims{UserID: 1, Audience: "a", JTI: "j", ExpiresAt: now.Unix() + 10})
+	raw2, _ := b64.DecodeString(strings.Split(tok2, ".")[1])
+	if strings.Contains(string(raw2), "conversation_id") || strings.Contains(string(raw2), "request_id") {
+		t.Fatalf("zero conversation and empty request id are omitted: %s", raw2)
+	}
+	// Failure modes.
+	if _, err := VerifyUserContext("other", tok, now); !errors.Is(err, ErrUserContextInvalid) {
+		t.Fatalf("wrong secret: %v", err)
+	}
+	forged := parts[0] + "." + b64.EncodeToString([]byte(`{"user_id":8,"aud":"a","jti":"j","exp":99999999999}`)) + "." + parts[2]
+	if _, err := VerifyUserContext("s", forged, now); !errors.Is(err, ErrUserContextInvalid) {
+		t.Fatalf("tampered payload: %v", err)
+	}
+	if _, err := VerifyUserContext("s", tok, now.Add(6*time.Minute)); !errors.Is(err, ErrUserContextExpired) {
+		t.Fatalf("expired: %v", err)
+	}
+	if _, err := VerifyUserContext("s", "v2."+parts[1]+"."+parts[2], now); !errors.Is(err, ErrUserContextInvalid) {
+		t.Fatalf("version: %v", err)
+	}
+	if _, err := VerifyUserContext("s", "garbage", now); !errors.Is(err, ErrUserContextInvalid) {
+		t.Fatalf("garbage: %v", err)
+	}
+	for _, secret := range []string{"", "   "} {
+		if _, err := SignUserContext(secret, claims); !errors.Is(err, ErrSigningUnavailable) {
+			t.Fatalf("blank secret %q: %v", secret, err)
+		}
+	}
+	if newJTI() == newJTI() {
+		t.Fatal("jti must be fresh")
+	}
+}
+
+func TestHeaderParsing(t *testing.T) {
+	got := parseHeadersLenient(` {" X-A ":" 1 ","  ":"drop","N":5,"P":"${RIOCHAT_SIGNED_USER_CONTEXT}"} `)
+	if len(got) != 2 || got["X-A"] != "1" || got["P"] != SignedContextPlaceholder {
+		t.Fatalf("got %v", got)
+	}
+	if h := parseHeadersLenient("garbage"); h != nil {
+		t.Fatalf("bad json yields none: %v", h)
+	}
+	clean := withoutPlaceholders(map[string]string{"P": " ${RIOCHAT_SIGNED_USER_CONTEXT} ", "K": "v"})
+	if len(clean) != 1 || clean["K"] != "v" {
+		t.Fatalf("got %v", clean)
+	}
+}
+
+func TestEndpointDialGuard(t *testing.T) {
+	for _, addr := range []string{"169.254.169.254:80", "100.100.100.200:80", "[fd00:ec2::254]:80", "0.0.0.0:80", "224.0.0.1:80", "[fe80::1%eth0]:80", "[::ffff:169.254.169.254]:80"} {
+		if err := dialGuard("tcp", addr, nil); err == nil {
+			t.Errorf("%s must be refused", addr)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1:80", "10.1.2.3:443", "[::1]:80", "93.184.216.34:443"} {
+		if err := dialGuard("tcp", addr, nil); err != nil {
+			t.Errorf("%s must be allowed: %v", addr, err)
+		}
+	}
+	if err := dialGuard("tcp", "example.com:80", nil); err == nil {
+		t.Error("a name at dial time is unexpected and refused")
+	}
+}
+
+func TestSanitizeToolOutput(t *testing.T) {
+	blob := strings.Repeat("QUJD", 1200)
+	in := `{"content":[{"type":"image","data":"` + blob + `","mimeType":"image/png"},{"type":"text","text":"hello <world>"}],"blob":"` + strings.Repeat("A", 100) + `","url":"data:image/png;base64,` + strings.Repeat("AAAA", 100) + `"}`
+	out := SanitizeToolOutput(in)
+	if strings.Contains(out, blob) || strings.Contains(out, "AAAAAAAA") {
+		t.Fatalf("binary survived: %.200s", out)
+	}
+	if !strings.Contains(out, "hello <world>") || !strings.Contains(out, "[binary data omitted]") {
+		t.Fatalf("text must stay and binary be marked: %s", out)
+	}
+	if got := SanitizeToolOutput("plain text result"); got != "plain text result" {
+		t.Fatalf("plain: %q", got)
+	}
+	if got := SanitizeToolOutput(blob); got != "[binary data omitted]" {
+		t.Fatalf("bare blob: %.40q", got)
+	}
+	long := strings.Repeat("word ", 1000)
+	if got := SanitizeToolOutput(`{"t":"` + long + `"}`); !strings.Contains(got, "word word") {
+		t.Fatal("ordinary long text must survive")
+	}
+}
+
+func TestTrimHeadTail(t *testing.T) {
+	s := strings.Repeat("a", 100) + strings.Repeat("b", 100)
+	got := TrimHeadTail(s, 40)
+	if !strings.HasPrefix(got, strings.Repeat("a", 20)) || !strings.HasSuffix(got, strings.Repeat("b", 20)) || !strings.Contains(got, "[trimmed]") {
+		t.Fatalf("got %q", got)
+	}
+	if TrimHeadTail("short", 40) != "short" {
+		t.Fatal("short text is untouched")
+	}
+	// Non-ASCII sample written as escape sequences (CJK / wide characters), so this file stays ASCII-only.
+	if TrimHeadTail("\u5b57\u5b57\u5b57\u5b57", 2) == "\u5b57\u5b57\u5b57\u5b57" {
+		t.Fatal("runes, not bytes")
+	}
+}
+
+func TestGuidance(t *testing.T) {
+	if g := guidanceText("  "); !strings.HasPrefix(g, "# tool_use") {
+		t.Fatalf("default must start with the heading: %.30q", g)
+	}
+	if g := guidanceText("  custom rules  "); g != "custom rules" {
+		t.Fatalf("custom: %q", g)
+	}
+}
