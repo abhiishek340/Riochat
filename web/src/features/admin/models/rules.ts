@@ -185,3 +185,188 @@ export function updateModelBody(form: ModelForm, capabilitiesJSON: string): Reco
 }
 
 // --- initial sources -----------------------------------------------------------------------------
+
+export interface SourceDraft {
+  key: string;
+  upstreamID: number;
+  upstreamModelID: number;
+  protocol: string;
+  priority: string;
+  weight: string;
+}
+
+export function blankSource(key: string): SourceDraft {
+  return { key, upstreamID: 0, upstreamModelID: 0, protocol: "", priority: "1", weight: "1" };
+}
+
+/** A row with nothing chosen is ignored. */
+export function hasSelection(row: SourceDraft): boolean {
+  return row.upstreamID > 0 || row.upstreamModelID > 0 || row.protocol !== "";
+}
+
+export type SourceIssue = "upstream" | "model" | "protocol" | "priority" | "weight" | "duplicate";
+
+export function validateSources(rows: readonly SourceDraft[]): { index: number; issue: SourceIssue } | null {
+  const seen = new Set<string>();
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index] as SourceDraft;
+    if (!hasSelection(row)) continue;
+    if (row.upstreamID <= 0) return { index, issue: "upstream" };
+    if (row.upstreamModelID <= 0) return { index, issue: "model" };
+    if (!row.protocol) return { index, issue: "protocol" };
+    if (parsePositiveInt(row.priority) === null) return { index, issue: "priority" };
+    if (parsePositiveInt(row.weight) === null) return { index, issue: "weight" };
+    const id = `${row.upstreamID}/${row.upstreamModelID}/${row.protocol}`;
+    if (seen.has(id)) return { index, issue: "duplicate" };
+    seen.add(id);
+  }
+  return null;
+}
+
+export function sourceBody(row: SourceDraft): Record<string, unknown> {
+  return {
+    upstreamID: row.upstreamID,
+    upstreamModelID: row.upstreamModelID,
+    protocol: row.protocol,
+    priority: parsePositiveInt(row.priority) ?? 1,
+    weight: parsePositiveInt(row.weight) ?? 1,
+    status: "active",
+  };
+}
+
+export function sourcesToBind(rows: readonly SourceDraft[]): SourceDraft[] {
+  return rows.filter(hasSelection);
+}
+
+// --- order ----------------------------------------------------------------------------------------
+
+export interface OrderGroup {
+  key: string;
+  name: string;
+  icon: string;
+  models: PlatformModel[];
+}
+
+/** Models grouped by display group, otherwise vendor; groups appear where their first model does. */
+export function groupForOrder(models: readonly PlatformModel[]): OrderGroup[] {
+  const groups: OrderGroup[] = [];
+  const index = new Map<string, OrderGroup>();
+  for (const m of models) {
+    const hasGroup = (m.displayGroupID ?? 0) > 0;
+    const key = hasGroup ? `g:${m.displayGroupID}` : `v:${m.vendor || "unknown"}`;
+    let g = index.get(key);
+    if (!g) {
+      g = hasGroup ? { key, name: m.displayGroupName, icon: m.displayGroupIcon, models: [] } : { key, name: m.vendorName || m.vendor, icon: m.vendorIcon, models: [] };
+      index.set(key, g);
+      groups.push(g);
+    }
+    g.models.push(m);
+  }
+  return groups;
+}
+
+export function flattenOrder(groups: readonly OrderGroup[]): number[] {
+  return groups.flatMap((g) => g.models.map((m) => m.id));
+}
+
+// --- global circuit breaker ------------------------------------------------------------------------
+
+export const BREAKER_KEY = "circuit_breaker.defaults";
+
+/** Enabled iff the stored JSON object has `enabled === true`; anything else, including invalid JSON, is off. */
+export function breakerEnabled(value: string | undefined | null): boolean {
+  if (!value) return false;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isPlainObject(parsed) && parsed.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Writes only `enabled`; every other key is kept. Invalid stored JSON starts from an empty object. */
+export function withBreaker(value: string | undefined | null, enabled: boolean): string {
+  let base: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = value ? JSON.parse(value) : {};
+    if (isPlainObject(parsed)) base = parsed;
+  } catch {
+    base = {};
+  }
+  return JSON.stringify({ ...base, enabled });
+}
+
+// --- catalog sync outcome ------------------------------------------------------------------------------
+
+export interface SyncSide {
+  ok: boolean;
+  count?: number;
+  error?: string;
+}
+
+export type SyncOutcome = { kind: "success" } | { kind: "warning"; failed: "catalog" | "openrouter"; error: string } | { kind: "error"; errors: string[] };
+
+/** Both ok is a success, one failing is a warning that names it, both failing is an error. */
+export function syncOutcome(catalog: SyncSide, openrouter: SyncSide): SyncOutcome {
+  if (catalog.ok && openrouter.ok) return { kind: "success" };
+  if (!catalog.ok && !openrouter.ok) return { kind: "error", errors: [catalog.error ?? "", openrouter.error ?? ""].filter(Boolean) };
+  return catalog.ok ? { kind: "warning", failed: "openrouter", error: openrouter.error ?? "" } : { kind: "warning", failed: "catalog", error: catalog.error ?? "" };
+}
+
+// --- presentation ------------------------------------------------------------------------------------------
+
+const VENDOR_KEY = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+export function normalizeVendorKey(text: string): string {
+  return text.trim().toLowerCase();
+}
+
+export function validateVendor(input: { key: string; name: string }, creating: boolean): "key" | "name" | null {
+  if (creating && !VENDOR_KEY.test(normalizeVendorKey(input.key))) return "key";
+  if (input.name.trim() === "") return "name";
+  return null;
+}
+
+export interface InUse {
+  count: number;
+  names: string[];
+  more: number;
+}
+
+/** What the server says about a vendor that is still referenced (details of `llm.model_vendor_in_use`). */
+export function readVendorUsage(details: unknown): InUse {
+  const d = isPlainObject(details) ? details : {};
+  const models = Array.isArray(d.models) ? d.models.filter(isPlainObject).map((m) => (typeof m.platformModelName === "string" ? m.platformModelName : "")).filter(Boolean) : [];
+  const count = typeof d.referenceCount === "number" ? d.referenceCount : models.length;
+  return { count, names: models.slice(0, 3), more: Math.max(0, count - Math.min(3, models.length)) };
+}
+
+export function readIconUsage(details: unknown): number {
+  const d = isPlainObject(details) ? details : {};
+  return typeof d.referenceCount === "number" ? d.referenceCount : 0;
+}
+
+// --- icon upload ----------------------------------------------------------------------------------------------
+
+export const ICON_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
+export const ICON_MAX_BYTES = 1024 * 1024;
+
+export function iconFileProblem(file: { type: string; size: number }): "type" | "size" | null {
+  if (!(ICON_TYPES as readonly string[]).includes(file.type)) return "type";
+  if (file.size <= 0 || file.size > ICON_MAX_BYTES) return "size";
+  return null;
+}
+
+/** The assumed open circuit of a source that was just opened by the admin. */
+export function guessCircuitUntil(now: number): string {
+  return new Date(now + 24 * 3600 * 1000).toISOString();
+}
+
+/** Protocols a source of a model with these kinds may use; the current value is always kept. */
+export function protocolChoices(kinds: readonly string[], current = ""): string[] {
+  const wanted = new Set<string>();
+  for (const k of kinds) for (const p of PROTOCOLS_BY_KIND[k as Kind] ?? []) wanted.add(p);
+  const list = wanted.size === 0 ? [...PROTOCOLS] : [...wanted];
+  if (current && !list.includes(current)) list.push(current);
+  return sortProtocols(list);
+}
