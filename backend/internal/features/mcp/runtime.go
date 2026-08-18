@@ -258,3 +258,219 @@ func (s *Service) ResolveRunTools(ctx context.Context, selected []uint) (*RunToo
 	}
 	return rt, nil
 }
+
+func (s *Service) logSkip(t Tool, err error) {
+	if s.log != nil {
+		s.log.Info("mcp_tool_skipped", logx.F("tool_id", t.ID), logx.F("reason", err.Error()))
+	}
+}
+
+var errServerUnavailable = errors.New("mcp server is missing or inactive")
+
+// bind snapshots what is needed to call a tool.
+func (s *Service) bind(servers map[uint]Server, t Tool, cfg RuntimeSettings) (*binding, error) {
+	srv, ok := servers[t.ServerID]
+	if !ok || srv.Status != StatusActive {
+		return nil, errServerUnavailable
+	}
+	if _, err := checkEndpoint(srv.BaseURL); err != nil {
+		return nil, err
+	}
+	token, err := s.decryptToken(srv.AuthTokenEnc)
+	if err != nil {
+		return nil, err
+	}
+	schema := strings.TrimSpace(t.InputSchemaJSON)
+	return &binding{
+		baseURL: srv.BaseURL, token: token, headers: parseHeadersLenient(srv.HeadersJSON),
+		timeout:  time.Duration(cfg.ToolTimeoutSeconds) * time.Second,
+		serverID: srv.ID, serverName: srv.Name, toolID: t.ID, toolName: t.Name, displayName: t.DisplayName,
+		schema: schema, price: t.PriceNanoUSD, attach: t.attachment(),
+	}, nil
+}
+
+// CallRequest is one model-requested tool call.
+type CallRequest struct {
+	// ModelName is the name the model used (a Specs name).
+	ModelName string
+	// ArgumentsJSON is the model's argument text.
+	ArgumentsJSON  string
+	UserID         uint
+	ConversationID uint
+	RequestID      string
+}
+
+// Tool types recorded on tool-call rows.
+const (
+	ToolTypeMCP        = "mcp"
+	ToolTypeAttachment = "mcp_attachment"
+)
+
+// Call statuses recorded on tool-call rows.
+const (
+	CallRequested = "requested"
+	CallSuccess   = "success"
+	CallError     = "error"
+)
+
+// CallOutcome is the result of one call, ready to be recorded.
+type CallOutcome struct {
+	// ToolType is ToolTypeMCP, or ToolTypeAttachment for image processing.
+	ToolType   string
+	ModelName  string
+	ToolName   string
+	ServerID   uint
+	ServerName string
+	Status     string
+	// Input is the normalized argument JSON (or an audit summary for images).
+	Input string
+	// Output is the stored result text on success ("{}" when empty).
+	Output string
+	// Error is the stored error text on failure.
+	Error string
+	// ModelOutput is what the model should see: sanitized and bounded.
+	ModelOutput string
+	LatencyMS   int64
+	// Repeated marks an identical call answered from the earlier result.
+	Repeated bool
+	// Billable is true when the call reached the server and succeeded.
+	Billable bool
+	// Fatal marks a call to a tool that is not enabled for the run.
+	Fatal bool
+}
+
+// Call validates and executes one tool call of the run.
+func (rt *RunTools) Call(ctx context.Context, req CallRequest) CallOutcome {
+	b := rt.bindings[req.ModelName]
+	if b == nil {
+		rt.mu.Lock()
+		rt.fatal = true
+		rt.mu.Unlock()
+		msg := fmt.Sprintf("tool %q is not enabled for this run", req.ModelName)
+		return CallOutcome{ToolType: ToolTypeMCP, ModelName: req.ModelName, ToolName: req.ModelName, Status: CallError, Input: strings.TrimSpace(req.ArgumentsJSON),
+			Error: msg, ModelOutput: msg, Fatal: true}
+	}
+	base := CallOutcome{ToolType: ToolTypeMCP, ModelName: req.ModelName, ToolName: b.toolName, ServerID: b.serverID, ServerName: b.serverName}
+	normalized, err := prepareArguments(req.ArgumentsJSON, b.schema)
+	if err != nil {
+		base.Status, base.Input, base.Error = CallError, strings.TrimSpace(req.ArgumentsJSON), err.Error()
+		base.ModelOutput = base.Error
+		return base
+	}
+	base.Input = normalized
+
+	key := fmt.Sprintf("%d\x00%s\x00%s", b.serverID, b.toolName, normalized)
+	rt.mu.Lock()
+	if e, ok := rt.seen[key]; ok {
+		rt.mu.Unlock()
+		select {
+		case <-e.done:
+		case <-ctx.Done():
+			base.Status, base.Error = CallError, ctx.Err().Error()
+			base.ModelOutput = base.Error
+			return base
+		}
+		out := e.outcome
+		out.ModelName = req.ModelName
+		out.Repeated, out.Billable, out.LatencyMS = true, false, 0
+		return out
+	}
+	entry := &callEntry{done: make(chan struct{})}
+	rt.seen[key] = entry
+	rt.mu.Unlock()
+
+	out := rt.execute(ctx, b, base, req, normalized)
+	entry.outcome = out
+	close(entry.done)
+	return out
+}
+
+// execute performs the remote call with concurrency limiting, signing and
+// retries, and records usage.
+func (rt *RunTools) execute(ctx context.Context, b *binding, out CallOutcome, req CallRequest, args string) CallOutcome {
+	s := rt.svc
+	fail := func(err error) CallOutcome {
+		out.Status, out.Error, out.Output = CallError, err.Error(), ""
+		out.ModelOutput = trimHeadTail(out.Error, maxModelOutputRune)
+		return out
+	}
+	if s.client == nil {
+		return fail(ErrClientUnavailable)
+	}
+	headers, err := s.signedHeaders(b, req)
+	if err != nil {
+		return fail(err)
+	}
+	if err := s.limiter.acquire(ctx, rt.cfg.MaxConcurrentCalls); err != nil {
+		return fail(err)
+	}
+	defer s.limiter.release()
+
+	ep := Endpoint{BaseURL: b.baseURL, Token: b.token, Headers: headers}
+	in := CallInput{Name: b.toolName, ArgumentsJSON: args, UserID: req.UserID, ConversationID: req.ConversationID, RequestID: req.RequestID}
+	started := s.clock.Now()
+	attempts := 1 + rt.cfg.RetryCount
+	var result string
+	for attempt := 1; ; attempt++ {
+		result, err = s.client.CallTool(ctx, ep, in, b.timeout)
+		if err == nil || attempt >= attempts || ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-time.After(time.Duration(attempt) * retryBackoffStep):
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	out.LatencyMS = s.clock.Now().Sub(started).Milliseconds()
+	if err != nil {
+		res := fail(err)
+		res.LatencyMS = out.LatencyMS
+		return res
+	}
+	if strings.TrimSpace(result) == "" {
+		result = "{}"
+	}
+	out.Status, out.Output, out.Billable = CallSuccess, result, true
+	out.ModelOutput = trimHeadTail(SanitizeToolOutput(result), maxModelOutputRune)
+	rt.mu.Lock()
+	rt.usage = append(rt.usage, UsageItem{ServerID: b.serverID, ServerName: b.serverName, ToolName: b.toolName, Count: 1, PriceNanoUSD: b.price})
+	rt.mu.Unlock()
+	return out
+}
+
+// signedHeaders returns the headers for a call, substituting one freshly
+// signed user context for every placeholder value (all get the same token, and
+// retries reuse it).
+func (s *Service) signedHeaders(b *binding, req CallRequest) (map[string]string, error) {
+	headers := make(map[string]string, len(b.headers))
+	need := false
+	for k, v := range b.headers {
+		headers[k] = v
+		if isPlaceholder(v) {
+			need = true
+		}
+	}
+	if !need {
+		return headers, nil
+	}
+	secret := ""
+	if s.signKey != nil {
+		secret = s.signKey()
+	}
+	tok, err := SignUserContext(secret, UserContextClaims{
+		UserID: req.UserID, ConversationID: req.ConversationID, RequestID: strings.TrimSpace(req.RequestID),
+		Audience: b.baseURL, JTI: newJTI(), ExpiresAt: s.clock.Now().Add(userContextTTL).Unix(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("user-context signing failed: %w", err)
+	}
+	for k, v := range headers {
+		if isPlaceholder(v) {
+			headers[k] = tok
+		}
+	}
+	return headers, nil
+}
