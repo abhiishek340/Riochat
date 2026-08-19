@@ -108,3 +108,239 @@ pub struct Sidecar {
     info: Mutex<Option<Info>>,
     child: Mutex<Option<CommandChild>>,
 }
+
+impl Sidecar {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.info.lock().map(|i| i.is_some()).unwrap_or(false)
+    }
+
+    /// Returns the origin of the running server, starting one if needed.
+    pub async fn ensure_running(self: &Arc<Self>, app: &AppHandle, launch: &Launch) -> Result<String, ShellError> {
+        let _gate = self.gate.lock().await;
+        if let Some(origin) = self.current_origin() {
+            return Ok(origin);
+        }
+        self.start_locked(app, launch).await
+    }
+
+    /// Takes the single-use sign-in grant, restarting the server when the grant
+    /// was already consumed or no server runs. Returns `(origin, grant)`.
+    pub async fn take_grant(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        launch: &Launch,
+    ) -> Result<(String, String), ShellError> {
+        let _gate = self.gate.lock().await;
+        if let Some(found) = self.take_current_grant() {
+            return Ok(found);
+        }
+        // consumed or absent: a fresh process gives a fresh grant
+        self.kill_now();
+        self.start_locked(app, launch).await?;
+        self.take_current_grant()
+            .ok_or_else(|| ShellError::sidecar("the local server did not provide a sign-in grant"))
+    }
+
+    fn current_origin(&self) -> Option<String> {
+        self.info.lock().ok()?.as_ref().map(|i| i.origin.clone())
+    }
+
+    fn take_current_grant(&self) -> Option<(String, String)> {
+        let mut guard = self.info.lock().ok()?;
+        let info = guard.as_mut()?;
+        let grant = info.grant.take()?;
+        Some((info.origin.clone(), grant))
+    }
+
+    async fn start_locked(self: &Arc<Self>, app: &AppHandle, launch: &Launch) -> Result<String, ShellError> {
+        std::fs::create_dir_all(&launch.data_dir)
+            .map_err(|e| ShellError::sidecar(format!("cannot create the local data folder: {e}")))?;
+        let data_dir = launch.data_dir.to_string_lossy().into_owned();
+        let mut command = app
+            .shell()
+            .sidecar(PROGRAM)
+            .map_err(|e| ShellError::sidecar(format!("cannot find the local server: {e}")))?
+            .args(["--local", "--data-dir", data_dir.as_str()]);
+        for (k, v) in &launch.env {
+            command = command.env(k, v);
+        }
+        let (mut rx, child) = command
+            .spawn()
+            .map_err(|e| ShellError::sidecar(format!("cannot start the local server: {e}")))?;
+        let pid = child.pid();
+        let ready = match wait_for_ready(&mut rx, READY_TIMEOUT).await {
+            Ok(r) => r,
+            Err(message) => {
+                let _ = child.kill();
+                return Err(ShellError::sidecar(message));
+            }
+        };
+        if let Ok(mut slot) = self.child.lock() {
+            *slot = Some(child);
+        }
+        if let Ok(mut slot) = self.info.lock() {
+            *slot = Some(Info {
+                origin: ready.origin.clone(),
+                pid,
+                grant: Some(ready.grant.clone()).filter(|g| !g.is_empty()),
+            });
+        }
+        // keep draining output so the pipe never fills, and notice an exit
+        let me = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    CommandEvent::Stderr(b) => forward_stderr(&b),
+                    CommandEvent::Error(e) => log::warn!("[sidecar] {e}"),
+                    CommandEvent::Terminated(_) => break,
+                    _ => {}
+                }
+            }
+            me.forget(pid);
+        });
+        Ok(ready.origin)
+    }
+
+    /// Forgets the server when it exited on its own (matched by process id).
+    fn forget(&self, pid: u32) {
+        if let Ok(mut info) = self.info.lock() {
+            if info.as_ref().map(|i| i.pid) == Some(pid) {
+                *info = None;
+                if let Ok(mut child) = self.child.lock() {
+                    *child = None;
+                }
+                log::info!("[sidecar] process {pid} exited");
+            }
+        }
+    }
+
+    /// Synchronous best-effort kill that never waits on the start lock. Used
+    /// for restarts and at application exit.
+    pub fn kill_now(&self) {
+        if let Ok(mut info) = self.info.lock() {
+            *info = None;
+        }
+        if let Ok(mut child) = self.child.lock() {
+            if let Some(c) = child.take() {
+                let _ = c.kill();
+            }
+        }
+    }
+
+    pub fn stop(&self) {
+        self.kill_now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri::async_runtime::{block_on, channel};
+    use tauri_plugin_shell::process::TerminatedPayload;
+
+    const READY: &str =
+        r#"{"type":"ready","version":"0.4.5","origin":"http://127.0.0.1:54321","grant":"g-secret","pid":99}"#;
+
+    #[test]
+    fn parses_only_ready_lines() {
+        let r = parse_ready_line(READY).unwrap();
+        assert_eq!(r.origin, "http://127.0.0.1:54321");
+        assert_eq!(r.grant, "g-secret");
+        assert_eq!(r.pid, 99);
+        assert!(parse_ready_line("starting up...").is_none());
+        assert!(parse_ready_line(r#"{"type":"log","msg":"x"}"#).is_none());
+        assert!(parse_ready_line(r#"{"type":"ready","origin":""}"#).is_none());
+        assert!(parse_ready_line("  ").is_none());
+        assert!(!format!("{r:?}").contains("g-secret"));
+    }
+
+    fn feed(events: Vec<CommandEvent>, keep_open: bool) -> Receiver<CommandEvent> {
+        let (tx, rx) = channel(16);
+        block_on(async {
+            for e in events {
+                tx.send(e).await.unwrap();
+            }
+        });
+        if keep_open {
+            std::mem::forget(tx);
+        }
+        rx
+    }
+
+    fn out(s: &str) -> CommandEvent {
+        CommandEvent::Stdout(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn ready_after_noise() {
+        let mut rx = feed(
+            vec![
+                out("not json"),
+                out(r#"{"type":"log"}"#),
+                CommandEvent::Stderr(b"warn: something".to_vec()),
+                out(READY),
+            ],
+            true,
+        );
+        let r = block_on(wait_for_ready(&mut rx, Duration::from_secs(2))).unwrap();
+        assert_eq!(r.origin, "http://127.0.0.1:54321");
+    }
+
+    #[test]
+    fn failure_cases() {
+        let mut rx = feed(vec![CommandEvent::Error("spawn failed".into())], true);
+        assert!(block_on(wait_for_ready(&mut rx, Duration::from_secs(2)))
+            .unwrap_err()
+            .contains("spawn failed"));
+
+        let mut rx = feed(
+            vec![CommandEvent::Terminated(TerminatedPayload {
+                code: Some(3),
+                signal: None,
+            })],
+            true,
+        );
+        assert_eq!(
+            block_on(wait_for_ready(&mut rx, Duration::from_secs(2))).unwrap_err(),
+            "sidecar exited before ready (code 3)"
+        );
+
+        let mut rx = feed(vec![], false);
+        assert_eq!(
+            block_on(wait_for_ready(&mut rx, Duration::from_secs(2))).unwrap_err(),
+            "sidecar output closed before ready"
+        );
+
+        let mut rx = feed(vec![out("nothing useful")], true);
+        assert_eq!(
+            block_on(wait_for_ready(&mut rx, Duration::from_millis(100))).unwrap_err(),
+            "sidecar did not become ready in time"
+        );
+    }
+
+    #[test]
+    fn grant_is_single_use_in_memory() {
+        let s = Sidecar::default();
+        *s.info.lock().unwrap() = Some(Info {
+            origin: "http://127.0.0.1:1".into(),
+            pid: 7,
+            grant: Some("g".into()),
+        });
+        assert!(s.is_running());
+        assert_eq!(
+            s.take_current_grant(),
+            Some(("http://127.0.0.1:1".to_string(), "g".to_string()))
+        );
+        assert_eq!(s.take_current_grant(), None);
+        assert_eq!(s.current_origin().as_deref(), Some("http://127.0.0.1:1"));
+        // a different pid exiting does not clear it
+        s.forget(8);
+        assert!(s.is_running());
+        s.forget(7);
+        assert!(!s.is_running());
+    }
+}
