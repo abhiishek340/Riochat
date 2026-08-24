@@ -268,3 +268,167 @@ export function AddProviderDialog({
     </>
   );
 }
+
+export function EditProviderDialog({
+  provider,
+  onOpenChange,
+  access,
+  onSaved,
+}: {
+  provider: PersonalProvider | null;
+  onOpenChange: (open: boolean) => void;
+  access: ProviderAccess;
+  onSaved: (provider: PersonalProvider) => void;
+}) {
+  const t = useT();
+  const errorMessage = useErrorMessage();
+  const open = provider !== null;
+  const [name, setName] = useState("");
+  const [icon, setIcon] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [selection, setSelection] = useState<SelectedModel[]>([]);
+  const [live, setLive] = useState<AvailableModel[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const seededFor = useRef<string | null>(null);
+  const providerRef = useRef(provider);
+  if (provider) providerRef.current = provider;
+  const shown = provider ?? providerRef.current;
+
+  const refresh = async (target: PersonalProvider, signal?: AbortSignal) => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      setLive(await fetchProviderModels(target.id, target.protocol, signal));
+    } catch (e) {
+      if (signal?.aborted || isAbortError(e)) return;
+      setLoadError(errorMessage(e));
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  };
+
+  // Form state is re-seeded only when a different provider is opened; a list
+  // refresh keeps whatever has been edited.
+  useEffect(() => {
+    if (!provider) {
+      seededFor.current = null;
+      return;
+    }
+    if (seededFor.current === provider.id) return;
+    seededFor.current = provider.id;
+    setName(provider.name);
+    setIcon(provider.icon);
+    setApiKey("");
+    setSelection(provider.models.map((m) => ({ name: m.name, protocols: [...m.protocols] })));
+    setLive([]);
+    setPickerOpen(false);
+    const controller = new AbortController();
+    void refresh(provider, controller.signal);
+    return () => {
+      // A re-run for the same provider (development double effects, quick
+      // reopen) must seed and load again, not trust the aborted attempt.
+      controller.abort();
+      seededFor.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider?.id]);
+
+  const available = shown ? mergeAvailable(live, shown.models) : [];
+  const perModel = access.modelProtocols.length > 0;
+  const known = shown ? recognizeProvider(shown.baseURL) : undefined;
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!provider || saving || loading || selection.length === 0) return;
+    const body: UpdateInput = {};
+    const nextName = name.trim();
+    if (nextName && nextName !== provider.name) body.name = nextName;
+    if (icon !== provider.icon) body.icon = icon;
+    if (apiKey.trim()) body.apiKey = apiKey.trim();
+    if (modelsChanged(provider.models, selection)) body.models = toRequestModels(selection, perModel);
+    if (Object.keys(body).length === 0) {
+      onOpenChange(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      const next = await updateProvider(provider.id, body);
+      onSaved(next);
+      toast.success(t("settings.models.toasts.saved"));
+      onOpenChange(false);
+    } catch (err) {
+      toast.error(t("settings.models.toasts.saveFailed"), { description: errorMessage(err) });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={(next) => (saving ? undefined : onOpenChange(next))}>
+        <DialogContent className="max-w-lg">
+          <form onSubmit={(e) => void save(e)} className="grid gap-4">
+            <DialogHeader>
+              <DialogTitle>{t("settings.models.form.editTitle")}</DialogTitle>
+              <DialogDescription>{t("settings.models.form.editDescription")}</DialogDescription>
+            </DialogHeader>
+            <Field>
+              <FieldLabel>{t("settings.models.form.name")}</FieldLabel>
+              <Input value={name} maxLength={64} autoComplete="off" disabled={saving} onChange={(e) => setName(e.target.value)} />
+            </Field>
+            <Field>
+              <FieldLabel>{t("settings.models.form.icon")}</FieldLabel>
+              <IconPicker value={icon} onChange={setIcon} automaticSlug={known?.icon} disabled={saving} />
+            </Field>
+            <Field>
+              <FieldLabel>{t("settings.models.form.baseURL")}</FieldLabel>
+              <Input value={shown?.baseURL ?? ""} readOnly disabled className="font-mono text-[13px]" />
+              <FieldHint>{t("settings.models.form.baseURLLocked")}</FieldHint>
+            </Field>
+            <Field>
+              <FieldLabel>{t("settings.models.form.rotateKey")}</FieldLabel>
+              <Input
+                type="password"
+                value={apiKey}
+                disabled={saving}
+                autoComplete="new-password"
+                spellCheck={false}
+                placeholder={shown?.keyHint ? t("settings.models.form.keyKept", { hint: shown.keyHint }) : t("settings.models.form.keyKeptPlain")}
+                onChange={(e) => setApiKey(e.target.value)}
+              />
+              <FieldHint>{t("settings.models.form.rotateKeyHint")}</FieldHint>
+            </Field>
+            <Field>
+              <FieldLabel>{t("settings.models.form.models")}</FieldLabel>
+              <ModelsField selection={selection} disabled={saving} onOpen={() => setPickerOpen(true)} />
+              {loadError ? <FieldHint className="text-warning-foreground dark:text-warning">{t("settings.models.form.listFailed", { reason: loadError })}</FieldHint> : null}
+            </Field>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)}>
+                {t("common.actions.cancel")}
+              </Button>
+              <Button type="submit" loading={saving} disabled={loading || selection.length === 0}>
+                {t("common.actions.save")}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+      <ModelPicker
+        open={pickerOpen && open}
+        onOpenChange={setPickerOpen}
+        available={available}
+        loading={loading}
+        error={loadError}
+        selected={selection}
+        offeredProtocols={access.modelProtocols}
+        fallbackProtocol={shown?.protocol ?? ""}
+        onRefresh={provider ? () => void refresh(provider) : undefined}
+        onConfirm={setSelection}
+      />
+    </>
+  );
+}
