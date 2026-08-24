@@ -268,3 +268,297 @@ export function DataTableView({ props }: { props: Props }) {
 }
 
 // --- card grid / stat grid -----------------------------------------------------------------------------------------
+
+export function CardGridView({ props }: { props: Props }) {
+  const t = useT();
+  const items = list(props.items).map(rec).slice(0, 120);
+  const tags = useMemo(() => [...new Set(items.map((i) => str(i.tag)).filter(Boolean))].slice(0, 12), [items]);
+  const [tag, setTag] = useState("");
+  const shown = tag ? items.filter((i) => str(i.tag) === tag) : items;
+  const cols = Math.max(1, Math.min(4, Math.trunc(num(props.columns, 3))));
+  if (items.length === 0) return <p className="text-sm text-muted-foreground">{t("chatBlocks.empty")}</p>;
+  return (
+    <div className="min-w-0">
+      {tags.length > 1 ? (
+        <div className="mb-2 flex flex-wrap gap-1.5" role="group">
+          {["", ...tags].map((x) => (
+            <button
+              key={x || "all"}
+              type="button"
+              aria-pressed={tag === x}
+              onClick={() => setTag(x)}
+              className={cn("rounded-full border px-2.5 py-0.5 text-xs", tag === x ? "border-primary bg-primary text-primary-foreground" : "hover:bg-muted")}
+            >
+              {x || t("chatBlocks.all")}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${Math.round(640 / cols)}px), 1fr))` }}>
+        {shown.map((item, i) => (
+          <div key={i} className="rounded-xl border bg-card p-3">
+            {safeImageSrc(item.image) ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={safeImageSrc(item.image)} alt={str(item.title)} referrerPolicy="no-referrer" loading="lazy" className="mb-2 h-28 w-full rounded-lg object-cover" />
+            ) : null}
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-sm font-medium">{str(item.title)}</p>
+              {str(item.tag) ? <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{str(item.tag)}</span> : null}
+            </div>
+            {str(item.text) ? <p className="mt-1 text-sm text-muted-foreground">{str(item.text)}</p> : null}
+          </div>
+        ))}
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">{t("chatBlocks.items", { count: shown.length })}</p>
+    </div>
+  );
+}
+
+export function StatGridView({ props }: { props: Props }) {
+  const items = list(props.items).map(rec).slice(0, 24);
+  return (
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(8.5rem,1fr))] gap-2">
+      {items.map((s, i) => {
+        const delta = str(s.delta);
+        const up = delta.startsWith("+");
+        const down = delta.startsWith("-") || delta.startsWith("−");
+        return (
+          <div key={i} className="rounded-xl border bg-card p-3">
+            <p className="text-xs text-muted-foreground">{str(s.label)}</p>
+            <p className="mt-0.5 text-xl font-semibold tabular-nums">
+              {display(s.value)}
+              {str(s.unit) ? <span className="ml-0.5 text-sm font-normal text-muted-foreground">{str(s.unit)}</span> : null}
+            </p>
+            {delta ? <p className={cn("text-xs", up && "text-success", down && "text-destructive", !up && !down && "text-muted-foreground")}>{delta}</p> : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// --- diff ---------------------------------------------------------------------------------------------------------
+
+const LINE_CLASS = { same: "", add: "bg-success/15", del: "bg-destructive/15" } as const;
+const MARK = { same: " ", add: "+", del: "-" } as const;
+
+export function DiffView({ props }: { props: Props }) {
+  const t = useT();
+  const { copy, copied } = useCopy();
+  const idBase = useId();
+  const before = str(props.before);
+  const after = str(props.after);
+  const [split, setSplit] = useState(bool(props.split, false));
+  const [expanded, setExpanded] = useState(false);
+  const [cursor, setCursor] = useState(-1);
+  const lines = useMemo(() => diffLines(before, after), [before, after]);
+  const rows = useMemo(() => foldDiff(lines, 3, expanded), [lines, expanded]);
+  const starts = useMemo(() => changeStarts(rows), [rows]);
+  const hiddenTotal = rows.reduce((n, r) => n + (r.type === "fold" ? r.count : 0), 0);
+  const jump = (dir: 1 | -1) => {
+    if (starts.length === 0) return;
+    const next = (cursor + dir + starts.length) % starts.length;
+    setCursor(next);
+    document.getElementById(`${idBase}-r${starts[next]}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+  };
+  const renderLine = (l: DiffLine, key: string | number, extra?: ReactNode) => (
+    <div key={key} className={cn("flex gap-2 whitespace-pre-wrap break-words px-2", LINE_CLASS[l.kind])}>
+      <span className="w-8 shrink-0 select-none text-right text-muted-foreground/70">{l.kind === "add" ? l.newNo : l.oldNo || l.newNo}</span>
+      <span className="w-3 shrink-0 select-none text-muted-foreground">{MARK[l.kind]}</span>
+      <span className="min-w-0 flex-1">{l.text || " "}</span>
+      {extra}
+    </div>
+  );
+  return (
+    <div className="min-w-0 rounded-xl border">
+      <div className="flex flex-wrap items-center gap-1 border-b bg-muted/40 px-2 py-1 text-xs">
+        <span className="text-muted-foreground">
+          {t("chatBlocks.diff.before")} → {t("chatBlocks.diff.after")}
+        </span>
+        <div className="ml-auto flex items-center gap-0.5">
+          <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => setSplit((v) => !v)}>
+            {split ? t("chatBlocks.diff.unified") : t("chatBlocks.diff.split")}
+          </Button>
+          <Button variant="ghost" size="sm" className="h-6 px-1.5" disabled={starts.length === 0} onClick={() => jump(-1)} aria-label={t("chatBlocks.diff.prevChange")}>
+            <ChevronLeft className="size-3.5 rotate-90" />
+          </Button>
+          <Button variant="ghost" size="sm" className="h-6 px-1.5" disabled={starts.length === 0} onClick={() => jump(1)} aria-label={t("chatBlocks.diff.nextChange")}>
+            <ChevronRight className="size-3.5 rotate-90" />
+          </Button>
+          <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-xs" onClick={() => void copy(after).then((ok) => !ok && toast.error(t("chatBlocks.copyFailed")))}>
+            <Copy className="size-3" />
+            {copied ? t("chatBlocks.copied") : t("chatBlocks.diff.copyAfter")}
+          </Button>
+        </div>
+      </div>
+      <div className="max-h-96 overflow-auto py-1 font-mono text-xs leading-5">
+        {rows.map((r, i) => {
+          if (r.type === "fold") {
+            return (
+              <button key={i} id={`${idBase}-r${i}`} type="button" onClick={() => setExpanded(true)} className="block w-full bg-muted/50 px-2 py-0.5 text-center text-[11px] text-muted-foreground hover:bg-muted">
+                {t("chatBlocks.diff.hidden", { count: r.count })}
+              </button>
+            );
+          }
+          if (!split) return <div id={`${idBase}-r${i}`} key={i}>{renderLine(r.line, i)}</div>;
+          const l = r.line;
+          return (
+            <div id={`${idBase}-r${i}`} key={i} className="grid grid-cols-2 gap-px">
+              <div className={cn("whitespace-pre-wrap break-words px-2", l.kind === "del" && LINE_CLASS.del, l.kind === "add" && "opacity-0")}>{l.kind === "add" ? " " : l.text || " "}</div>
+              <div className={cn("whitespace-pre-wrap break-words px-2", l.kind === "add" && LINE_CLASS.add, l.kind === "del" && "opacity-0")}>{l.kind === "del" ? " " : l.text || " "}</div>
+            </div>
+          );
+        })}
+      </div>
+      {expanded && hiddenTotal === 0 && lines.some((l) => l.kind === "same") ? (
+        <button type="button" className="w-full border-t px-2 py-1 text-xs text-muted-foreground hover:bg-muted" onClick={() => setExpanded(false)}>
+          {t("chatBlocks.diff.collapse")}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+// --- image gallery -----------------------------------------------------------------------------------------------------
+
+export function GalleryView({ props }: { props: Props }) {
+  const t = useT();
+  const images = list(props.images)
+    .map(rec)
+    .map((i) => ({ src: safeImageSrc(i.src), alt: str(i.alt), caption: str(i.caption) }))
+    .filter((i) => i.src)
+    .slice(0, 40);
+  const [at, setAt] = useState(0);
+  if (images.length === 0) return <p className="text-sm text-muted-foreground">{t("chatBlocks.empty")}</p>;
+  const cur = images[Math.min(at, images.length - 1)]!;
+  return (
+    <figure className="min-w-0">
+      <div className="relative overflow-hidden rounded-xl border bg-muted/30">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={cur.src} alt={cur.alt} referrerPolicy="no-referrer" className="mx-auto max-h-80 w-auto max-w-full object-contain" />
+        {images.length > 1 ? (
+          <>
+            <Button variant="secondary" size="sm" className="absolute left-2 top-1/2 h-8 -translate-y-1/2 px-2" onClick={() => setAt((at - 1 + images.length) % images.length)} aria-label={t("chatBlocks.gallery.prev")}>
+              <ChevronLeft className="size-4" />
+            </Button>
+            <Button variant="secondary" size="sm" className="absolute right-2 top-1/2 h-8 -translate-y-1/2 px-2" onClick={() => setAt((at + 1) % images.length)} aria-label={t("chatBlocks.gallery.next")}>
+              <ChevronRight className="size-4" />
+            </Button>
+          </>
+        ) : null}
+      </div>
+      <figcaption className="mt-1 flex justify-between gap-2 text-xs text-muted-foreground">
+        <span>{cur.caption}</span>
+        <span>{images.length > 1 ? `${Math.min(at, images.length - 1) + 1} / ${images.length}` : t("chatBlocks.gallery.count", { count: images.length })}</span>
+      </figcaption>
+    </figure>
+  );
+}
+
+// --- quiz ------------------------------------------------------------------------------------------------------------------
+
+export function QuizView({ props }: { props: Props }) {
+  const t = useT();
+  const questions = list(props.questions)
+    .map(rec)
+    .map((q) => ({ question: str(q.question), options: list(q.options).map((o) => str(o)).slice(0, 8), answer: Math.trunc(num(q.answer, -1)), explain: str(q.explain) }))
+    .filter((q) => q.question && q.options.length > 1)
+    .slice(0, 50);
+  const [step, setStep] = useState(0);
+  const [picked, setPicked] = useState<number | null>(null);
+  const [correct, setCorrect] = useState(0);
+  const [done, setDone] = useState(false);
+  if (questions.length === 0) return <p className="text-sm text-muted-foreground">{t("chatBlocks.invalid", { component: "quiz" })}</p>;
+  if (done) {
+    return (
+      <div className="rounded-xl border p-4 text-center">
+        <p className="text-lg font-semibold">{t("chatBlocks.quiz.score", { correct, total: questions.length })}</p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-2"
+          onClick={() => {
+            setStep(0);
+            setPicked(null);
+            setCorrect(0);
+            setDone(false);
+          }}
+        >
+          {t("chatBlocks.reset")}
+        </Button>
+      </div>
+    );
+  }
+  const q = questions[step]!;
+  const answered = picked !== null;
+  const last = step === questions.length - 1;
+  return (
+    <div className="rounded-xl border p-3">
+      <p className="text-xs text-muted-foreground">{t("chatBlocks.quiz.step", { step: step + 1 })} / {questions.length}</p>
+      <p className="mt-1 font-medium">{q.question}</p>
+      <ul className="mt-2 space-y-1.5">
+        {q.options.map((o, i) => {
+          const isAnswer = i === q.answer;
+          return (
+            <li key={i}>
+              <button
+                type="button"
+                disabled={answered}
+                onClick={() => {
+                  setPicked(i);
+                  if (isAnswer) setCorrect((c) => c + 1);
+                }}
+                className={cn(
+                  "w-full rounded-lg border px-3 py-1.5 text-left text-sm transition-colors",
+                  !answered && "hover:bg-muted",
+                  answered && isAnswer && "border-success bg-success/15",
+                  answered && picked === i && !isAnswer && "border-destructive bg-destructive/10",
+                )}
+              >
+                {o}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {answered && q.explain ? <p className="mt-2 text-sm text-muted-foreground">{q.explain}</p> : null}
+      {answered ? (
+        <div className="mt-2 flex justify-end">
+          <Button
+            size="sm"
+            onClick={() => {
+              if (last) setDone(true);
+              else {
+                setStep(step + 1);
+                setPicked(null);
+              }
+            }}
+          >
+            {last ? t("chatBlocks.quiz.done") : t("chatBlocks.quiz.next")}
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function renderCatalog(component: string, props: Props): ReactNode {
+  switch (component) {
+    case "chart":
+      return <ChartView props={props} />;
+    case "data-table":
+      return <DataTableView props={props} />;
+    case "card-grid":
+      return <CardGridView props={props} />;
+    case "stat-grid":
+      return <StatGridView props={props} />;
+    case "diff":
+      return <DiffView props={props} />;
+    case "image-gallery":
+      return <GalleryView props={props} />;
+    case "quiz":
+      return <QuizView props={props} />;
+    default:
+      return null;
+  }
+}
