@@ -580,3 +580,301 @@ func TestConcurrencyLimiterBoundsCalls(t *testing.T) {
 		t.Fatalf("peak concurrency %d, limit 2", peak.Load())
 	}
 }
+
+func TestLimiterAbandonsWaitWhenContextEnds(t *testing.T) {
+	l := &callLimiter{}
+	if err := l.acquire(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := l.acquire(ctx, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v", err)
+	}
+	l.release()
+	if err := l.acquire(context.Background(), 1); err != nil {
+		t.Fatalf("the abandoned waiter must not leak a slot: %v", err)
+	}
+	l.release()
+	if l.active != 0 || len(l.waiters) != 0 {
+		t.Fatalf("state: %d %d", l.active, len(l.waiters))
+	}
+}
+
+func TestLimiterWakesWaitersInOrder(t *testing.T) {
+	l := &callLimiter{}
+	_ = l.acquire(context.Background(), 1)
+	var order []int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := l.acquire(context.Background(), 1); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			order = append(order, i)
+			mu.Unlock()
+			l.release()
+		}()
+		time.Sleep(20 * time.Millisecond)
+	}
+	l.release()
+	wg.Wait()
+	if len(order) != 3 {
+		t.Fatalf("order %v", order)
+	}
+}
+
+func TestValidateToolDefaults(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	srv, ids := runFixture(t, h, toolOf("a", "", "", imageSchema), toolOf("b", "", "", imageSchema), toolOf("c", "", "", nil))
+	if err := h.svc.ValidateToolDefaults(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.ValidateToolDefaults(ctx, []uint{ids[0], ids[2], ids[2], 0}); err != nil {
+		t.Fatalf("valid list: %v", err)
+	}
+	if err := h.svc.ValidateMCPTools(ctx, 5, []uint{ids[2]}); err != nil {
+		t.Fatalf("port adapter: %v", err)
+	}
+	if err := h.svc.ValidateToolDefaults(ctx, []uint{9999}); !errors.Is(err, ErrInvalidSelection) {
+		t.Fatalf("unknown: %v", err)
+	}
+	h.db.Model(&Tool{}).Where("id = ?", ids[2]).Update("status", "inactive")
+	if err := h.svc.ValidateToolDefaults(ctx, []uint{ids[2]}); !errors.Is(err, ErrInvalidSelection) {
+		t.Fatalf("inactive tool: %v", err)
+	}
+	bindImage(t, h, ids[0], "base64")
+	bindImage(t, h, ids[1], "base64")
+	if err := h.svc.ValidateToolDefaults(ctx, []uint{ids[0], ids[1]}); !errors.Is(err, ErrMultipleProcessors) {
+		t.Fatalf("two processors: %v", err)
+	}
+	h.db.Model(&Server{}).Where("id = ?", srv.ID).Update("status", "inactive")
+	if err := h.svc.ValidateToolDefaults(ctx, []uint{ids[0]}); !errors.Is(err, ErrInvalidSelection) {
+		t.Fatalf("inactive server: %v", err)
+	}
+}
+
+func TestAnalyzeImages(t *testing.T) {
+	h := newHarness(t)
+	_, ids := runFixture(t, h, toolOf("vision", "Vision Tool", "", imageSchema), toolOf("other", "", "", nil))
+	bindImage(t, h, ids[0], "data_url")
+	h.db.Model(&Tool{}).Where("id = ?", ids[0]).Update("price_nanousd", 40)
+	var got atomic.Value
+	h.fake.OnCall(func(name string, args map[string]any, _ int) mcptest.Reply {
+		got.Store(args)
+		return mcptest.Reply{Result: mcptest.Text("a cat")}
+	})
+	rt := resolve(t, h, ids...)
+	data := []byte("PNGDATA")
+	res, err := rt.AnalyzeImages(context.Background(), []ImageInput{{FileName: "cat.png", MimeType: "image/png", Data: data}}, "  what is this?  ", CallRequest{UserID: 1})
+	if err != nil || len(res) != 1 {
+		t.Fatalf("%v %v", res, err)
+	}
+	args := got.Load().(map[string]any)
+	wantImg := "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)
+	if args["image"] != wantImg || args["prompt"] != "what is this?" {
+		t.Fatalf("arguments: %v", args)
+	}
+	a := res[0]
+	if a.Text != "a cat" || a.Label != "Vision Tool / cat.png" || a.Format() != "[Vision Tool / cat.png]\na cat" {
+		t.Fatalf("analysis: %+v", a)
+	}
+	o := a.Outcome
+	if o.ToolType != ToolTypeAttachment || o.Status != CallSuccess || strings.Contains(o.Input, wantImg) || strings.Contains(o.Input, "PNGDATA") {
+		t.Fatalf("outcome: %+v", o)
+	}
+	for _, f := range []string{"cat.png", "image/png", "data_url", `"bytes":7`} {
+		if !strings.Contains(o.Input, f) {
+			t.Errorf("audit summary lacks %s: %s", f, o.Input)
+		}
+	}
+	if u := rt.Usage(); len(u) != 1 || u[0].Count != 1 || u[0].PriceNanoUSD != 40 {
+		t.Fatalf("usage: %+v", u)
+	}
+	// No processor or no images: nothing to do.
+	if res, err := resolve(t, h, ids[1]).AnalyzeImages(context.Background(), []ImageInput{{Data: data}}, "", CallRequest{}); res != nil || err != nil {
+		t.Fatalf("no processor: %v %v", res, err)
+	}
+	if res, err := rt.AnalyzeImages(context.Background(), nil, "", CallRequest{}); res != nil || err != nil {
+		t.Fatalf("no images: %v %v", res, err)
+	}
+}
+
+func TestAnalyzeImagesBase64AndBudgets(t *testing.T) {
+	h := newHarness(t)
+	_, ids := runFixture(t, h, toolOf("vision", "", "", imageSchema))
+	bindImage(t, h, ids[0], "base64")
+	// Non-ASCII sample written as escape sequences (CJK / wide characters), so this file stays ASCII-only.
+	long := strings.Repeat("\u5b57", 9000)
+	h.fake.OnCall(func(string, map[string]any, int) mcptest.Reply { return mcptest.Reply{Result: mcptest.Text(long)} })
+	rt := resolve(t, h, ids...)
+	one, err := rt.AnalyzeImages(context.Background(), []ImageInput{{FileName: "a.png", MimeType: "image/png", Data: []byte("x")}}, "", CallRequest{})
+	if err != nil || len([]rune(one[0].Text)) != 6000 {
+		t.Fatalf("a single analysis is cut to 6000 characters: %d %v", len([]rune(one[0].Text)), err)
+	}
+	if one[0].Label != "vision / a.png" {
+		t.Fatalf("label falls back to the real name: %q", one[0].Label)
+	}
+	imgs := make([]ImageInput, 4)
+	for i := range imgs {
+		imgs[i] = ImageInput{FileName: "i.png", MimeType: "image/png", Data: []byte("x")}
+	}
+	many, err := rt.AnalyzeImages(context.Background(), imgs, "", CallRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, a := range many {
+		total += len([]rune(a.Text))
+		if len([]rune(a.Text)) != 4000 {
+			t.Fatalf("16000 split evenly over 4 images: %d", len([]rune(a.Text)))
+		}
+	}
+	if total != 16000 {
+		t.Fatalf("total %d", total)
+	}
+	// Plain base64 without a wrapper.
+	var args atomic.Value
+	h.fake.OnCall(func(_ string, a map[string]any, _ int) mcptest.Reply {
+		args.Store(a)
+		return mcptest.Reply{Result: mcptest.Text("ok")}
+	})
+	if _, err := rt.AnalyzeImages(context.Background(), []ImageInput{{FileName: "b.png", MimeType: "image/png", Data: []byte("hi")}}, "q", CallRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if args.Load().(map[string]any)["image"] != base64.StdEncoding.EncodeToString([]byte("hi")) {
+		t.Fatalf("base64 encoding: %v", args.Load())
+	}
+	// More images than the per-run call limit.
+	h.set.update(func(s *RuntimeSettings) { s.MaxToolCallsPerRun = 2 })
+	rt2 := resolve(t, h, ids...)
+	if _, err := rt2.AnalyzeImages(context.Background(), imgs, "", CallRequest{}); !errors.Is(err, ErrImageProcessing) {
+		t.Fatalf("too many images: %v", err)
+	}
+	if _, err := rt.AnalyzeImages(context.Background(), []ImageInput{{FileName: "big", Data: make([]byte, maxProcessorImageBytes+1)}}, "", CallRequest{}); !errors.Is(err, ErrImageProcessing) {
+		t.Fatalf("too many bytes: %v", err)
+	}
+}
+
+func TestAnalyzeImagesFailures(t *testing.T) {
+	h := newHarness(t)
+	_, ids := runFixture(t, h, toolOf("vision", "", "", imageSchema))
+	bindImage(t, h, ids[0], "base64")
+	rt := resolve(t, h, ids...)
+	img := []ImageInput{{FileName: "a.png", MimeType: "image/png", Data: []byte("x")}}
+	ctx := context.Background()
+
+	// A remote failure is persisted as an error row and fails the run.
+	h.fake.OnCall(func(string, map[string]any, int) mcptest.Reply { return mcptest.Reply{Status: 500} })
+	res, err := rt.AnalyzeImages(ctx, img, "", CallRequest{})
+	if !errors.Is(err, ErrImageProcessing) || len(res) != 1 || res[0].Outcome.Status != CallError || res[0].Outcome.ToolType != ToolTypeAttachment {
+		t.Fatalf("remote failure: %+v %v", res, err)
+	}
+	if len(rt.Usage()) != 0 {
+		t.Fatal("failed calls are not billed")
+	}
+	// No extractable text still bills the successful upstream call.
+	h.fake.OnCall(func(string, map[string]any, int) mcptest.Reply {
+		return mcptest.Reply{Result: map[string]any{"content": []any{map[string]any{"type": "image", "data": "zzz"}}}}
+	})
+	res, err = rt.AnalyzeImages(ctx, img, "", CallRequest{})
+	if !errors.Is(err, ErrImageProcessing) || res[0].Outcome.Status != CallError || !strings.Contains(res[0].Outcome.Error, "no text") {
+		t.Fatalf("empty analysis: %+v %v", res, err)
+	}
+	if u := rt.Usage(); len(u) != 1 || u[0].Count != 1 {
+		t.Fatalf("a successful upstream call is metered even if extraction fails: %+v", u)
+	}
+	// The tool reported an error.
+	h.fake.OnCall(func(string, map[string]any, int) mcptest.Reply {
+		return mcptest.Reply{Result: map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "bad image"}}}}
+	})
+	if _, err = rt.AnalyzeImages(ctx, img, "", CallRequest{}); !errors.Is(err, ErrImageProcessing) {
+		t.Fatalf("isError: %v", err)
+	}
+	// The first failure stops the loop.
+	imgs := []ImageInput{img[0], img[0], img[0]}
+	h.fake.Reset()
+	res, err = rt.AnalyzeImages(ctx, imgs, "", CallRequest{})
+	if err == nil || len(res) != 1 || h.fake.Count("tools/call") != 1 {
+		t.Fatalf("stops at the first failure: %d results, %d calls", len(res), h.fake.Count("tools/call"))
+	}
+}
+
+func TestReencryptTokens(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	a := h.server("a", func(in *ServerInput) { in.AuthToken = "token-a" })
+	b := h.server("b")
+	c := h.server("c", func(in *ServerInput) { in.AuthToken = "token-c" })
+	newRing, err := secretbox.NewKeyRing("brand-new-active-key-0123456789", []string{"test-active-key-0123456789"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := ReencryptTokens(ctx, h.db, newRing)
+	if err != nil || n != 2 {
+		t.Fatalf("changed %d: %v", n, err)
+	}
+	onlyNew, _ := secretbox.NewKeyRing("brand-new-active-key-0123456789", nil)
+	for id, want := range map[uint]string{a.ID: "token-a", c.ID: "token-c"} {
+		var srv Server
+		h.db.First(&srv, id)
+		if plain, _, err := onlyNew.Decrypt(srv.AuthTokenEnc); err != nil || plain != want {
+			t.Fatalf("server %d: %q %v", id, plain, err)
+		}
+	}
+	var untouched Server
+	h.db.First(&untouched, b.ID)
+	if untouched.AuthTokenEnc != "" {
+		t.Fatal("empty tokens stay empty")
+	}
+	if n, err = ReencryptTokens(ctx, h.db, newRing); err != nil || n != 0 {
+		t.Fatalf("second pass must be a no-op: %d %v", n, err)
+	}
+	// A token that cannot be decrypted stops the pass with an error.
+	h.db.Model(&Server{}).Where("id = ?", a.ID).Update("auth_token_enc", "v1:Zm9v")
+	if _, err = ReencryptTokens(ctx, h.db, newRing); err == nil {
+		t.Fatal("undecryptable token must surface")
+	}
+}
+
+func TestSyncedToolsSurviveFromDatabaseShape(t *testing.T) {
+	h := newHarness(t)
+	// Tables, columns and the unique key match the persistence contract.
+	for _, col := range []string{"id", "created_at", "updated_at", "name", "base_url", "auth_token_enc", "headers_json", "status", "sort_order", "tool_count", "last_synced_at", "last_error"} {
+		if !h.db.Migrator().HasColumn(&Server{}, col) {
+			t.Errorf("mcp_servers lacks %s", col)
+		}
+	}
+	for _, col := range []string{"id", "created_at", "updated_at", "server_id", "name", "display_name", "description", "metadata_customized", "input_schema_json",
+		"attachment_input_mode", "attachment_argument", "attachment_encoding", "attachment_prompt_argument", "price_nanousd", "status", "sort_order"} {
+		if !h.db.Migrator().HasColumn(&Tool{}, col) {
+			t.Errorf("mcp_tools lacks %s", col)
+		}
+	}
+	if h.db.Migrator().HasColumn(&Server{}, "deleted_at") || h.db.Migrator().HasColumn(&Tool{}, "deleted_at") {
+		t.Error("the contract has no deleted_at columns")
+	}
+	if err := h.db.Create(&Tool{ServerID: 1, Name: "dup", Status: "active"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.Create(&Tool{ServerID: 1, Name: "dup", Status: "active"}).Error; err == nil {
+		t.Error("(server_id, name) must be unique")
+	}
+	if err := h.db.Create(&Tool{ServerID: 2, Name: "dup"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var def Tool
+	h.db.First(&def, "server_id = ?", 2)
+	if def.Status != "inactive" || def.AttachmentInputMode != "none" || def.InputSchemaJSON != "{}" || def.MetadataCustomized != nil {
+		t.Errorf("column defaults: %+v", def)
+	}
+	if err := migrateAgain(h); err != nil {
+		t.Errorf("migrations must be idempotent: %v", err)
+	}
+}
