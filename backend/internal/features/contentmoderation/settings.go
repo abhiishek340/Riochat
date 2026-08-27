@@ -135,3 +135,159 @@ func (s *configStore) get(ctx context.Context) (Config, error) {
 	s.mu.Unlock()
 	return c, nil
 }
+
+// read loads the configuration from the database, applying defaults for absent
+// or unusable values. An undecryptable key or an invalid stored policy is an
+// error.
+func (s *configStore) read(ctx context.Context) (Config, error) {
+	var rows []settingRow
+	if err := s.db.WithContext(ctx).Where("namespace = ?", settingsNamespace).Find(&rows).Error; err != nil {
+		return Config{}, database.Translate(err)
+	}
+	kv := make(map[string]string, len(rows))
+	for _, r := range rows {
+		kv[r.Key] = r.Value
+	}
+	cfg := defaultConfig()
+	if v, ok := kv[keyEnabled]; ok {
+		b, err := strconv.ParseBool(strings.TrimSpace(v))
+		cfg.Enabled = err == nil && b
+	}
+	if v := strings.TrimSpace(kv[keyBaseURL]); v != "" {
+		cfg.BaseURL = v
+	}
+	if v := strings.TrimSpace(kv[keyModel]); v != "" {
+		cfg.Model = v
+	}
+	cfg.TimeoutSeconds = positiveInt(kv[keyTimeoutSeconds], cfg.TimeoutSeconds)
+	cfg.MaxConcurrency = positiveInt(kv[keyMaxConcurrency], cfg.MaxConcurrency)
+	cfg.QueueCapacity = positiveInt(kv[keyQueueCapacity], cfg.QueueCapacity)
+
+	if enc := strings.TrimSpace(kv[keyAPIKey]); enc != "" {
+		plain, _, err := s.secrets.Decrypt(enc)
+		if err != nil {
+			return Config{}, fmt.Errorf("content moderation: decrypt api key: %w", err)
+		}
+		cfg.APIKey = strings.TrimSpace(plain)
+	}
+
+	policy, err := parseStoredPolicy(kv[keyPolicyJSON], kv[keyPolicyVersion])
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Policy = policy
+	return cfg, nil
+}
+
+func positiveInt(raw string, def int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 1 {
+		return def
+	}
+	return n
+}
+
+// parseStoredPolicy reads policy_json (which carries the version) and falls
+// back to the separate policy_version row when the JSON has none.
+func parseStoredPolicy(policyJSON, versionRaw string) (Policy, error) {
+	var p Policy
+	if strings.TrimSpace(policyJSON) != "" {
+		if err := json.Unmarshal([]byte(policyJSON), &p); err != nil {
+			return Policy{}, fmt.Errorf("content moderation: stored policy is unreadable: %w", err)
+		}
+		norm, err := p.normalize()
+		if err != nil {
+			return Policy{}, fmt.Errorf("content moderation: stored policy is invalid: %w", err)
+		}
+		norm.Version = p.Version
+		p = norm
+	}
+	if p.Version == 0 {
+		if v, err := strconv.ParseInt(strings.TrimSpace(versionRaw), 10, 64); err == nil && v > 0 {
+			p.Version = v
+		}
+	}
+	return p.nonNil(), nil
+}
+
+type settingValue struct {
+	key, value, valueType, description string
+}
+
+// write stores all nine keys in one transaction. Existing rows keep their type
+// and description; only value and updated_at change.
+func (s *configStore) write(ctx context.Context, cfg Config) error {
+	encKey := ""
+	if cfg.APIKey != "" {
+		enc, err := s.secrets.Encrypt(cfg.APIKey)
+		if err != nil {
+			return fmt.Errorf("content moderation: encrypt api key: %w", err)
+		}
+		encKey = enc
+	}
+	policy, err := json.Marshal(cfg.Policy.nonNil())
+	if err != nil {
+		return err
+	}
+	values := []settingValue{
+		{keyEnabled, strconv.FormatBool(cfg.Enabled), "bool", "Whether content moderation is enabled"},
+		{keyBaseURL, cfg.BaseURL, "string", "Moderation service base URL"},
+		{keyAPIKey, encKey, "string", "Moderation service API key (encrypted)"},
+		{keyModel, cfg.Model, "string", "Moderation model"},
+		{keyTimeoutSeconds, strconv.Itoa(cfg.TimeoutSeconds), "int", "Per-check timeout in seconds"},
+		{keyMaxConcurrency, strconv.Itoa(cfg.MaxConcurrency), "int", "Maximum concurrent checks"},
+		{keyQueueCapacity, strconv.Itoa(cfg.QueueCapacity), "int", "Maximum waiting checks"},
+		{keyPolicyJSON, string(policy), "json", "Moderation category policy"},
+		{keyPolicyVersion, strconv.FormatInt(cfg.Policy.Version, 10), "int", "Moderation policy version"},
+	}
+	now := s.clock.Now()
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, v := range values {
+			row := settingRow{
+				Namespace: settingsNamespace, Key: v.key, Value: v.value,
+				ValueType: v.valueType, Description: v.description,
+				CreatedAt: now, UpdatedAt: now,
+			}
+			res := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "namespace"}, {Name: "key"}},
+				DoUpdates: clause.Assignments(map[string]any{"value": v.value, "updated_at": now}),
+			}).Create(&row)
+			if res.Error != nil {
+				return database.Translate(res.Error)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.invalidate()
+	return nil
+}
+
+// reencrypt re-encrypts the stored API key with the active key. It reports
+// whether a row changed.
+func (s *configStore) reencrypt(ctx context.Context) (bool, error) {
+	var row settingRow
+	err := s.db.WithContext(ctx).Where(&settingRow{Namespace: settingsNamespace, Key: keyAPIKey}).First(&row).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if strings.TrimSpace(row.Value) == "" {
+		return false, nil
+	}
+	next, changed, err := s.secrets.Reencrypt(row.Value)
+	if err != nil || !changed {
+		return false, err
+	}
+	err = s.db.WithContext(ctx).Model(&settingRow{}).Where("id = ?", row.ID).
+		Updates(map[string]any{"value": next, "updated_at": s.clock.Now()}).Error
+	if err != nil {
+		return false, err
+	}
+	s.invalidate()
+	return true, nil
+}
