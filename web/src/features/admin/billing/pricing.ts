@@ -186,3 +186,205 @@ export function filterRows<T extends { name: string; vendor: string }>(rows: rea
 }
 
 // --- export / import ------------------------------------------------------------------------
+
+export interface ExportEntry {
+  currency: string;
+  isFree: boolean;
+  pricingMode: PricingMode;
+  inputUSDPerMTokens: number;
+  cacheReadUSDPerMTokens: number;
+  cacheWriteUSDPerMTokens: number;
+  cacheWritePriceBasis?: string;
+  outputUSDPerMTokens: number;
+  callUSDPerCall: number;
+  durationUSDPerSecond: number;
+  tieredPricing?: unknown;
+  schedulePricing?: unknown;
+}
+
+/** An object keyed by model name (sorted); prices outside the entry's mode are zero. */
+export function exportPricing(prices: readonly ModelPrice[]): Record<string, ExportEntry> {
+  const out: Record<string, ExportEntry> = {};
+  for (const price of [...prices].sort((a, b) => a.platformModelName.localeCompare(b.platformModelName))) {
+    const body = bodyFromForm(price.platformModelName, formFromPrice(price));
+    const entry: ExportEntry = {
+      currency: body.currency,
+      isFree: body.isFree,
+      pricingMode: body.pricingMode,
+      inputUSDPerMTokens: body.inputUSDPerMTokens,
+      cacheReadUSDPerMTokens: body.cacheReadUSDPerMTokens,
+      cacheWriteUSDPerMTokens: body.cacheWriteUSDPerMTokens,
+      outputUSDPerMTokens: body.outputUSDPerMTokens,
+      callUSDPerCall: body.callUSDPerCall,
+      durationUSDPerSecond: body.durationUSDPerSecond,
+    };
+    if (price.cacheWritePriceBasis) entry.cacheWritePriceBasis = price.cacheWritePriceBasis;
+    if (body.pricingMode === "tiered" && body.tieredPricingJSON) entry.tieredPricing = JSON.parse(body.tieredPricingJSON);
+    if (body.schedulePricingJSON) entry.schedulePricing = JSON.parse(body.schedulePricingJSON);
+    out[price.platformModelName] = entry;
+  }
+  return out;
+}
+
+export type ImportErrorKind =
+  | "syntax"
+  | "notObject"
+  | "emptyName"
+  | "duplicate"
+  | "entryNotObject"
+  | "mode"
+  | "basis"
+  | "durationNotVideo"
+  | "number"
+  | "tiers"
+  | "tierLimit"
+  | "schedule"
+  | "unknownModels"
+  | "empty";
+
+export interface ImportError {
+  kind: ImportErrorKind;
+  name?: string;
+  field?: string;
+  /** For unknown models: the first few names and how many more there are. */
+  names?: string[];
+  more?: number;
+}
+
+export interface ImportPlan {
+  body: PriceBody;
+}
+
+export type ImportResult = { ok: true; entries: PriceBody[] } | { ok: false; errors: ImportError[] };
+
+const NUMBER_FIELDS = ["inputUSDPerMTokens", "cacheReadUSDPerMTokens", "cacheWriteUSDPerMTokens", "outputUSDPerMTokens", "callUSDPerCall", "durationUSDPerSecond"] as const;
+
+function numberField(entry: Record<string, unknown>, key: string): number | "bad" {
+  const v = entry[key];
+  if (v === undefined || v === null || v === "") return 0;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return "bad";
+  return v;
+}
+
+/**
+ * Checks an import file against the models that can be priced. Unknown names
+ * abort the whole import (the error lists up to five and counts the rest).
+ */
+export function parseImport(text: string, known: ReadonlyMap<string, { kindsJSON: string }>): ImportResult {
+  let root: unknown;
+  try {
+    root = JSON.parse(text);
+  } catch {
+    return { ok: false, errors: [{ kind: "syntax" }] };
+  }
+  if (!isPlainObject(root)) return { ok: false, errors: [{ kind: "notObject" }] };
+  const errors: ImportError[] = [];
+  const seen = new Set<string>();
+  const unknown: string[] = [];
+  const entries: PriceBody[] = [];
+  for (const [rawName, raw] of Object.entries(root)) {
+    const name = rawName.trim();
+    if (!name) {
+      errors.push({ kind: "emptyName" });
+      continue;
+    }
+    if (seen.has(name)) {
+      errors.push({ kind: "duplicate", name });
+      continue;
+    }
+    seen.add(name);
+    if (!isPlainObject(raw)) {
+      errors.push({ kind: "entryNotObject", name });
+      continue;
+    }
+    const model = known.get(name);
+    if (!model) {
+      unknown.push(name);
+      continue;
+    }
+    const mode = raw.pricingMode;
+    if (typeof mode !== "string" || !isPricingMode(mode)) {
+      errors.push({ kind: "mode", name });
+      continue;
+    }
+    const basis = raw.cacheWritePriceBasis;
+    if (basis !== undefined && basis !== "direct" && basis !== "anthropic_5m") {
+      errors.push({ kind: "basis", name });
+      continue;
+    }
+    if (mode === "duration" && !isVideoModel(model.kindsJSON)) {
+      errors.push({ kind: "durationNotVideo", name });
+      continue;
+    }
+    const numbers: Record<string, number> = {};
+    let badField: string | null = null;
+    for (const key of NUMBER_FIELDS) {
+      const value = numberField(raw, key);
+      if (value === "bad") {
+        badField = key;
+        break;
+      }
+      numbers[key] = value;
+    }
+    if (badField) {
+      errors.push({ kind: "number", name, field: badField });
+      continue;
+    }
+    let tieredText = "";
+    if (mode === "tiered") {
+      const tiered = raw.tieredPricing ?? (typeof raw.tieredPricingJSON === "string" ? safeParse(raw.tieredPricingJSON) : undefined);
+      const tiers = isPlainObject(tiered) ? tiered.tiers : undefined;
+      if (!Array.isArray(tiers) || tiers.length === 0) {
+        errors.push({ kind: "tiers", name });
+        continue;
+      }
+      let bad = false;
+      for (const tier of tiers) {
+        const limit = isPlainObject(tier) ? tier.upToTokens : undefined;
+        if (!isPlainObject(tier) || (limit !== undefined && (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0))) bad = true;
+      }
+      if (bad) {
+        errors.push({ kind: "tierLimit", name });
+        continue;
+      }
+      tieredText = JSON.stringify({ tiers });
+    }
+    const scheduleSource = raw.schedulePricing ?? (typeof raw.schedulePricingJSON === "string" ? safeParse(raw.schedulePricingJSON) : undefined);
+    let scheduleText = "";
+    if (scheduleSource !== undefined && scheduleSource !== null && scheduleSource !== "") {
+      const periods = parseSchedule(JSON.stringify(scheduleSource));
+      if (periods.length === 0 || validateSchedule(periods).length > 0 || periods.some((p) => canonicalizeTime(p.start) === null)) {
+        errors.push({ kind: "schedule", name });
+        continue;
+      }
+      scheduleText = scheduleJson(periods);
+    }
+    entries.push({
+      platformModelName: name,
+      currency: typeof raw.currency === "string" && raw.currency.trim() ? raw.currency.trim() : "USD",
+      isFree: raw.isFree === true,
+      pricingMode: mode,
+      inputUSDPerMTokens: numbers.inputUSDPerMTokens ?? 0,
+      cacheReadUSDPerMTokens: numbers.cacheReadUSDPerMTokens ?? 0,
+      cacheWriteUSDPerMTokens: numbers.cacheWriteUSDPerMTokens ?? 0,
+      cacheWritePriceBasis: basis === "anthropic_5m" ? "anthropic_5m" : "direct",
+      outputUSDPerMTokens: numbers.outputUSDPerMTokens ?? 0,
+      callUSDPerCall: numbers.callUSDPerCall ?? 0,
+      durationUSDPerSecond: numbers.durationUSDPerSecond ?? 0,
+      tieredPricingJSON: tieredText,
+      schedulePricingJSON: scheduleText,
+    });
+  }
+  if (unknown.length > 0) return { ok: false, errors: [{ kind: "unknownModels", names: unknown.slice(0, 5), more: Math.max(0, unknown.length - 5) }] };
+  if (errors.length > 0) return { ok: false, errors };
+  if (entries.length === 0) return { ok: false, errors: [{ kind: "empty" }] };
+  return { ok: true, entries };
+}
+
+function safeParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
