@@ -211,3 +211,255 @@ function EntryHeader({ entry }: { entry: LinkEntry }) {
     </div>
   );
 }
+
+function SingleImport({ entry, existing, max, access }: { entry: LinkEntry; existing: PersonalProvider[]; max: number; access: Access }) {
+  const t = useT();
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const atLimit = max > 0 && existing.length >= max;
+  const duplicate = !atLimit && existing.some((p) => p.host === entry.host);
+
+  return (
+    <Frame>
+      <Message title={t("settings.import.title")} body={t("settings.import.intro")} />
+      <EntryHeader entry={entry} />
+      <Warning tone="danger">
+        <ShieldAlert className="mr-1 inline size-4 align-text-bottom" />
+        {t("settings.import.securityWarning", { host: entry.host })}
+      </Warning>
+      {duplicate ? <Warning>{t("settings.import.duplicate", { host: entry.host })}</Warning> : null}
+      {atLimit ? <Warning>{t("settings.import.limitReached", { max })}</Warning> : null}
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button variant="outline" onClick={() => leave(router, "/chat")}>
+          {t("common.actions.cancel")}
+        </Button>
+        {atLimit ? (
+          <Button onClick={() => leave(router, "/settings/models")}>{t("settings.import.manage")}</Button>
+        ) : (
+          <Button onClick={() => setOpen(true)}>{t("common.actions.continue")}</Button>
+        )}
+      </div>
+      <AddProviderDialog
+        open={open}
+        onOpenChange={setOpen}
+        access={access}
+        source="link"
+        locked
+        initial={{ name: entry.name, baseURL: entry.baseURL, apiKey: entry.key, protocol: entry.protocol }}
+        onCreated={() => {
+          toast.success(t("settings.import.imported"));
+          leave(router, "/settings/models");
+        }}
+      />
+    </Frame>
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function BatchImport({ entries, existing, max, access }: { entries: LinkEntry[]; existing: PersonalProvider[]; max: number; access: Access }) {
+  const t = useT();
+  const router = useRouter();
+  const errorMessage = useErrorMessage();
+  const [statuses, setStatuses] = useState<EntryStatus[]>(() => entries.map(() => ({ kind: "pending" })));
+  const statusRef = useRef(statuses);
+  const [running, setRunning] = useState(false);
+  const [attempted, setAttempted] = useState(false);
+  const [created, setCreated] = useState(0);
+  const [selecting, setSelecting] = useState<number | null>(null);
+  const cancelled = useRef(false);
+  const errorRef = useRef(errorMessage);
+  errorRef.current = errorMessage;
+
+  useEffect(() => {
+    cancelled.current = false;
+    return () => {
+      cancelled.current = true;
+    };
+  }, []);
+
+  const free = max > 0 ? max - existing.length - created : Number.POSITIVE_INFINITY;
+  const noSlots = max > 0 && max - existing.length <= 0;
+  const perModel = access.modelProtocols.length > 0;
+
+  const report = useCallback((index: number, status: EntryStatus) => {
+    const next = statusRef.current.map((s, i) => (i === index ? status : s));
+    statusRef.current = next;
+    if (!cancelled.current) setStatuses(next);
+  }, []);
+
+  const deps: BatchDeps = {
+    probe: (entry) => probeProvider({ protocol: entry.protocol ?? resolveProtocol(entry.baseURL), baseURL: entry.baseURL, apiKey: entry.key }),
+    create: (entry, models: AvailableModel[]) => {
+      const protocol = entry.protocol ?? resolveProtocol(entry.baseURL);
+      return createProvider({
+        name: entry.name,
+        protocol,
+        baseURL: entry.baseURL,
+        apiKey: entry.key,
+        models: toRequestModels(
+          models.map((m) => ({ name: m.name, protocols: m.suggestedProtocols.length ? m.suggestedProtocols : [protocol] })),
+          perModel,
+        ),
+        source: "link",
+      });
+    },
+    sleep,
+    cancelled: () => cancelled.current,
+    describe: (e) => errorRef.current(e),
+    report,
+    throttle: (e) => (e instanceof ApiError && e.status === 429 ? { retryAfter: e.retryAfterSeconds } : null),
+  };
+
+  const run = async (indices: number[]) => {
+    if (running) return;
+    setRunning(true);
+    const outcome = await runBatch(entries, indices, free === Number.POSITIVE_INFINITY ? 1_000_000 : Math.max(0, free), deps);
+    if (cancelled.current) return;
+    setRunning(false);
+    setAttempted(true);
+    setCreated((c) => c + outcome.imported);
+    if (outcome.imported > 0) toast.success(t("settings.import.batchDone", { count: outcome.imported }));
+    if (statusRef.current.every((s) => s.kind === "imported")) leave(router, "/settings/models");
+  };
+
+  const pendingIndices = () => statusRef.current.flatMap((s, i) => (s.kind === "imported" ? [] : [i]));
+  const slotsLeft = free === Number.POSITIVE_INFINITY ? Number.POSITIVE_INFINITY : Math.max(0, free);
+  const pendingCount = statuses.filter((s) => s.kind !== "imported").length;
+
+  if (noSlots) {
+    return (
+      <Frame>
+        <Message
+          title={t("settings.import.batchTitle", { count: entries.length })}
+          body={t("settings.import.limitReached", { max })}
+          actions={
+            <>
+              <Button variant="outline" onClick={() => leave(router, "/chat")}>
+                {t("common.actions.cancel")}
+              </Button>
+              <Button onClick={() => leave(router, "/settings/models")}>{t("settings.import.manage")}</Button>
+            </>
+          }
+        />
+      </Frame>
+    );
+  }
+
+  const label = (status: EntryStatus): ReactNode => {
+    const effective: EntryStatus = status.kind !== "imported" && slotsLeft <= 0 ? { kind: "overLimit" } : status;
+    switch (effective.kind) {
+      case "pending":
+        return <span className="text-muted-foreground">{t("settings.import.status.pending")}</span>;
+      case "probing":
+        return <Busy>{t("settings.import.status.probing")}</Busy>;
+      case "saving":
+        return <Busy>{t("settings.import.status.saving")}</Busy>;
+      case "throttled":
+        return <Busy>{t("settings.import.status.throttled", { seconds: effective.seconds })}</Busy>;
+      case "imported":
+        return (
+          <span className="inline-flex items-center gap-1 text-success">
+            <Check className="size-3.5" /> {t("settings.import.status.imported", { count: effective.count })}
+          </span>
+        );
+      case "noModels":
+        return <span className="text-warning-foreground dark:text-warning">{t("settings.import.status.noModels")}</span>;
+      case "needsSelection":
+        return <span className="text-warning-foreground dark:text-warning">{t("settings.import.status.needsSelection", { count: effective.count })}</span>;
+      case "failed":
+        return <span className="text-destructive">{t("settings.import.status.failed", { message: effective.message })}</span>;
+      case "overLimit":
+        return <span className="text-muted-foreground">{t("settings.import.status.overLimit")}</span>;
+    }
+  };
+
+  const action = (status: EntryStatus, index: number): ReactNode => {
+    if (status.kind === "needsSelection")
+      return (
+        <Button size="sm" variant="outline" disabled={running} onClick={() => setSelecting(index)}>
+          {t("settings.import.selectModels")}
+        </Button>
+      );
+    if (status.kind === "noModels" || status.kind === "failed")
+      return (
+        <Button size="sm" variant="outline" disabled={running} onClick={() => void run([index])}>
+          {t("common.actions.retry")}
+        </Button>
+      );
+    return null;
+  };
+
+  const done = attempted && !running;
+  const selectedEntry = selecting === null ? null : (entries[selecting] ?? null);
+
+  return (
+    <Frame>
+      <Message title={t("settings.import.batchTitle", { count: entries.length })} body={t("settings.import.batchIntro")} />
+      <Warning tone="danger">{t("settings.import.batchSecurity")}</Warning>
+      {Number.isFinite(slotsLeft) && slotsLeft < pendingCount ? <Warning>{t("settings.import.slotsLeft", { count: slotsLeft })}</Warning> : null}
+      <ul className="grid max-h-[45vh] gap-2 overflow-y-auto pr-1">
+        {entries.map((entry, index) => {
+          const status = statuses[index] ?? ({ kind: "pending" } as EntryStatus);
+          const dup = status.kind === "pending" ? existing.find((p) => p.host === entry.host) : undefined;
+          const Icon = iconFor("", recognizeProvider(entry.baseURL)?.icon);
+          return (
+            <li key={`${entry.baseURL}-${index}`} className="grid gap-1.5 rounded-lg border bg-background p-3">
+              <div className="flex items-center gap-2.5">
+                <Icon className="size-4 shrink-0 text-muted-foreground" />
+                <span className="truncate text-sm font-medium">{entryName(entry)}</span>
+              </div>
+              <span className="break-all font-mono text-xs text-muted-foreground">{entry.baseURL}</span>
+              <span className="font-mono text-xs text-muted-foreground">{maskKey(entry.key)}</span>
+              {dup ? <Badge tone="warning" className="w-fit">{t("settings.import.existing", { name: dup.name || dup.host })}</Badge> : null}
+              <div className="flex items-center justify-between gap-2 text-[13px]">
+                <span>{label(status)}</span>
+                {action(status, index)}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button variant="outline" onClick={() => leave(router, "/chat")}>
+          {t("common.actions.cancel")}
+        </Button>
+        {done ? (
+          <Button onClick={() => leave(router, "/settings/models")}>{t("settings.import.done")}</Button>
+        ) : (
+          <Button loading={running} disabled={running || pendingCount === 0} onClick={() => void run(pendingIndices())}>
+            {t("settings.import.importAll")}
+          </Button>
+        )}
+      </div>
+      <AddProviderDialog
+        open={selectedEntry !== null}
+        onOpenChange={(open) => !open && setSelecting(null)}
+        access={access}
+        source="link"
+        locked
+        initial={selectedEntry ? { name: selectedEntry.name, baseURL: selectedEntry.baseURL, apiKey: selectedEntry.key, protocol: selectedEntry.protocol } : undefined}
+        onCreated={(provider) => {
+          if (selecting !== null) {
+            report(selecting, { kind: "imported", count: provider.models.length });
+            setCreated((c) => c + 1);
+            if (statusRef.current.every((s) => s.kind === "imported")) {
+              toast.success(t("settings.import.batchDone", { count: entries.length }));
+              leave(router, "/settings/models");
+            }
+          }
+        }}
+      />
+    </Frame>
+  );
+}
+
+function Busy({ children }: { children: ReactNode }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+      <Loader2 className="size-3.5 animate-spin" /> {children}
+    </span>
+  );
+}
