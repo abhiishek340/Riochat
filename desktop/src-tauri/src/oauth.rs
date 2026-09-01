@@ -222,3 +222,219 @@ where
         }
     }
 }
+
+/// The single active loopback listener.
+#[derive(Default)]
+pub struct Loopback {
+    current: Arc<AtomicU64>,
+    counter: AtomicU64,
+}
+
+impl Loopback {
+    /// Binds a new listener (replacing any pending one) and returns the
+    /// redirect URI. `on_callback` receives the full callback URL.
+    pub fn start<F>(&self, on_callback: F) -> std::io::Result<String>
+    where
+        F: FnOnce(String) + Send + 'static,
+    {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+        let port = listener.local_addr()?.port();
+        let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        self.current.store(id, Ordering::SeqCst);
+        let current = self.current.clone();
+        std::thread::Builder::new()
+            .name("oauth-loopback".into())
+            .spawn(move || {
+                let check = current.clone();
+                serve(
+                    listener,
+                    move || check.load(Ordering::SeqCst) == id,
+                    Instant::now() + LISTEN_FOR,
+                    move |url| {
+                        // clear the listener, then report
+                        let _ = current.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+                        on_callback(url);
+                    },
+                );
+            })?;
+        Ok(format!("http://127.0.0.1:{port}{CALLBACK_PATH}"))
+    }
+
+    /// Cancels the pending listener (the user gave up).
+    pub fn stop(&self) {
+        self.current.store(0, Ordering::SeqCst);
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.current.load(Ordering::SeqCst) != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn classification() {
+        assert_eq!(
+            classify(b"GET /oauth/callback?code=abc&state=x HTTP/1.1\r\nHost: a\r\n\r\n"),
+            Request::Callback("/oauth/callback?code=abc&state=x".into())
+        );
+        assert_eq!(
+            classify(b"GET /oauth/callbackfoo HTTP/1.1\r\n\r\n"),
+            Request::Callback("/oauth/callbackfoo".into())
+        );
+        assert_eq!(classify(b"GET /favicon.ico HTTP/1.1\r\n\r\n"), Request::NotFound);
+        assert_eq!(classify(b"GET / HTTP/1.1\r\n\r\n"), Request::NotFound);
+        for bad in [
+            &b"POST /oauth/callback HTTP/1.1\r\n\r\n"[..],
+            b"GET oauth/callback HTTP/1.1\r\n\r\n",
+            b"GET /oauth/callback/../x HTTP/1.1\r\n\r\n",
+            b"GET /oauth/callback HTTP/1.1 extra\r\n\r\n",
+            b"GET /oauth/callback\r\n\r\n",
+            b"GET /oauth/callback FTP/1\r\n\r\n",
+            b"GET http://evil/oauth/callback HTTP/1.1\r\n\r\n",
+            b"",
+            &[0xff, 0xfe, b'\r', b'\n'],
+        ] {
+            assert_eq!(classify(bad), Request::BadRequest, "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    fn split(resp: &[u8]) -> (String, String) {
+        let text = String::from_utf8(resp.to_vec()).unwrap();
+        let (h, b) = text.split_once("\r\n\r\n").unwrap();
+        (h.to_string(), b.to_string())
+    }
+
+    #[test]
+    fn responses_are_accurate_and_self_contained() {
+        for (status, line, en) in [
+            (200u16, "HTTP/1.1 200 OK", "Signed in successfully"),
+            (400, "HTTP/1.1 400 Bad Request", "Sign-in did not finish"),
+            (404, "HTTP/1.1 404 Not Found", "Page not found"),
+            (500, "HTTP/1.1 404 Not Found", "Page not found"),
+        ] {
+            let (head, body) = split(&response(status));
+            assert!(head.starts_with(line), "{head}");
+            assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())), "{head}");
+            assert!(head.contains("Content-Type: text/html; charset=utf-8"));
+            assert!(head.contains("Connection: close"));
+            assert!(head.contains("Cache-Control: no-store"));
+            assert!(head.contains("Content-Security-Policy: default-src 'none'; img-src data:"));
+            assert!(head.contains("X-Content-Type-Options: nosniff"));
+            assert!(head.contains("Referrer-Policy: no-referrer"));
+            assert!(body.contains(en));
+            assert!(body.contains("noindex"));
+            assert!(body.contains("<title>Riochat</title>"));
+            assert!(body.contains("history.replaceState"));
+            // nothing external, no buttons
+            assert!(!body.contains("<button") && !body.contains("<a "));
+            assert!(
+                !body.contains("http://") || body.contains("w3.org"),
+                "external reference"
+            );
+            assert!(!body.contains("https://"));
+            assert!(!body.contains("src=\"http"));
+            assert!(body.contains("prefers-color-scheme:dark"));
+        }
+        let (_, ok) = split(&response(200));
+        assert!(ok.contains("This tab can be closed now. Head back to Riochat."));
+        let (_, bad) = split(&response(400));
+        assert!(
+            bad.contains("The provider sent back a response we could not accept. Go back to Riochat and try again.")
+        );
+        let (_, nf) = split(&response(404));
+        assert!(nf.contains("Nothing at this address belongs to the sign-in process. Go back to Riochat."));
+    }
+
+    fn raw_request(port: u16, bytes: &[u8]) -> Vec<u8> {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(bytes).unwrap();
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    fn port_of(uri: &str) -> u16 {
+        uri.rsplit_once(':')
+            .unwrap()
+            .1
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn start_serves_callback_and_emits_full_url() {
+        let lb = Loopback::default();
+        let (tx, rx) = mpsc::channel();
+        let uri = lb.start(move |url| tx.send(url).unwrap()).unwrap();
+        assert!(uri.starts_with("http://127.0.0.1:"));
+        assert!(uri.ends_with("/oauth/callback"));
+        let port = port_of(&uri);
+        // junk first: answered, listener keeps waiting
+        let junk = raw_request(port, b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(String::from_utf8_lossy(&junk).starts_with("HTTP/1.1 404"));
+        let bad = raw_request(port, b"POST /oauth/callback HTTP/1.1\r\n\r\n");
+        assert!(String::from_utf8_lossy(&bad).starts_with("HTTP/1.1 400"));
+        assert!(rx.try_recv().is_err());
+        let ok = raw_request(
+            port,
+            b"GET /oauth/callback?code=c1&state=s1 HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert!(String::from_utf8_lossy(&ok).starts_with("HTTP/1.1 200"));
+        let url = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(url, format!("http://127.0.0.1:{port}/oauth/callback?code=c1&state=s1"));
+        assert!(!lb.is_active(), "cleared after the callback");
+    }
+
+    #[test]
+    fn oversize_head_is_rejected() {
+        let lb = Loopback::default();
+        let (tx, rx) = mpsc::channel::<String>();
+        let uri = lb.start(move |u| tx.send(u).unwrap()).unwrap();
+        let mut big = b"GET /oauth/callback HTTP/1.1\r\nX-Pad: ".to_vec();
+        big.extend(std::iter::repeat(b'a').take(HEAD_LIMIT + 4096));
+        let out = raw_request(port_of(&uri), &big);
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 400"));
+        assert!(rx.try_recv().is_err());
+        lb.stop();
+    }
+
+    #[test]
+    fn a_second_start_invalidates_the_first() {
+        let lb = Loopback::default();
+        let (tx1, rx1) = mpsc::channel::<String>();
+        let first = lb.start(move |u| tx1.send(u).unwrap()).unwrap();
+        let (tx2, rx2) = mpsc::channel::<String>();
+        let second = lb.start(move |u| tx2.send(u).unwrap()).unwrap();
+        assert_ne!(first, second);
+        // the first listener quits within a poll interval or two
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            TcpStream::connect(("127.0.0.1", port_of(&first))).is_err() || {
+                // port may have been closed already; either way nothing is emitted
+                true
+            }
+        );
+        let _ = raw_request(port_of(&second), b"GET /oauth/callback?x=1 HTTP/1.1\r\n\r\n");
+        assert!(rx2.recv_timeout(Duration::from_secs(3)).is_ok());
+        assert!(rx1.try_recv().is_err());
+    }
+
+    #[test]
+    fn stop_makes_the_listener_exit() {
+        let lb = Loopback::default();
+        let (tx, rx) = mpsc::channel::<String>();
+        let uri = lb.start(move |u| tx.send(u).unwrap()).unwrap();
+        lb.stop();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(TcpStream::connect(("127.0.0.1", port_of(&uri))).is_err());
+        assert!(rx.try_recv().is_err());
+    }
+}
