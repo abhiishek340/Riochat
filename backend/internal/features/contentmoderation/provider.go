@@ -238,3 +238,240 @@ func dataURLItem(img Image) map[string]any {
 	url := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img.Data)
 	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
 }
+
+func itemURLLen(item any) int {
+	m := item.(map[string]any)
+	return len(m["image_url"].(map[string]any)["url"].(string))
+}
+
+func withCheckDeadline(ctx context.Context, cc ClientConfig) (context.Context, context.CancelFunc) {
+	d := cc.Timeout
+	if d <= 0 {
+		d = defaultTimeout
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+func mergeResponse(dst, src *Response) {
+	if src == nil {
+		return
+	}
+	dst.Results = append(dst.Results, src.Results...)
+	if src.Model != "" {
+		dst.Model = src.Model
+	}
+	if src.ID != "" {
+		dst.ID = src.ID
+	}
+}
+
+type wireResult struct {
+	Flagged                   bool                `json:"flagged"`
+	Categories                map[string]bool     `json:"categories"`
+	CategoryScores            map[string]float64  `json:"category_scores"`
+	CategoryAppliedInputTypes map[string][]string `json:"category_applied_input_types"`
+}
+
+type wireResponse struct {
+	ID      string       `json:"id"`
+	Model   string       `json:"model"`
+	Results []wireResult `json:"results"`
+}
+
+// call performs one logical request: at most two attempts sharing ctx's
+// deadline.
+func (p *httpProvider) call(ctx context.Context, cc ClientConfig, input []any) (*Response, error) {
+	endpoint, err := ModerationEndpoint(cc.BaseURL)
+	if err != nil {
+		return nil, &ProviderError{Code: CodeServiceError, cause: err}
+	}
+	model := strings.TrimSpace(cc.Model)
+	if model == "" {
+		model = defaultModel
+	}
+	body, err := json.Marshal(map[string]any{"model": model, "input": input})
+	if err != nil {
+		return nil, &ProviderError{Code: CodeServiceError, cause: err}
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, wait, retry, err := p.attempt(ctx, endpoint, cc.APIKey, body)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !retry || attempt == 1 {
+			break
+		}
+		if serr := p.sleep(ctx, wait); serr != nil {
+			return nil, deadlineOrCancel(ctx, serr)
+		}
+	}
+	return nil, lastErr
+}
+
+// deadlineOrCancel turns a context failure into the right error: our own
+// deadline is a timeout, a caller cancellation passes through.
+func deadlineOrCancel(ctx context.Context, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return &ProviderError{Code: CodeTimeout, cause: err}
+	}
+	return err
+}
+
+// attempt sends one HTTP request. It reports whether a retry is allowed and
+// how long to wait first.
+func (p *httpProvider) attempt(ctx context.Context, endpoint, apiKey string, body []byte) (resp *Response, wait time.Duration, retry bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, false, &ProviderError{Code: CodeServiceError, cause: err}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := strings.TrimSpace(apiKey); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	httpResp, err := p.doer.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, 0, false, deadlineOrCancel(ctx, ctx.Err())
+		}
+		if isTimeoutErr(err) {
+			return nil, 0, true, &ProviderError{Code: CodeTimeout, cause: err}
+		}
+		return nil, 0, transientNetworkErr(err), &ProviderError{Code: CodeNetworkError, cause: err}
+	}
+	defer httpResp.Body.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(httpResp.Body, maxResponseBytes))
+	status := httpResp.StatusCode
+	switch {
+	case status == http.StatusTooManyRequests:
+		return nil, p.retryAfter(httpResp.Header.Get("Retry-After")), true, &ProviderError{Code: CodeRateLimited, Status: status}
+	case status < 200 || status > 299:
+		retryable := status >= 500
+		var w time.Duration
+		if retryable {
+			w = p.retryAfter(httpResp.Header.Get("Retry-After"))
+		}
+		return nil, w, retryable, &ProviderError{Code: CodeServiceError, Status: status,
+			cause: fmt.Errorf("moderation service returned status %d", status)}
+	}
+	if readErr != nil {
+		if ctx.Err() != nil {
+			return nil, 0, false, deadlineOrCancel(ctx, ctx.Err())
+		}
+		return nil, 0, transientNetworkErr(readErr), &ProviderError{Code: CodeNetworkError, cause: readErr}
+	}
+	parsed, perr := parseResponse(raw)
+	if perr != nil {
+		return nil, 0, false, &ProviderError{Code: CodeInvalidResponse, cause: perr}
+	}
+	return parsed, 0, false, nil
+}
+
+func parseResponse(raw []byte) (*Response, error) {
+	var w wireResponse
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return nil, err
+	}
+	if len(w.Results) == 0 {
+		return nil, errors.New("moderation response has no results")
+	}
+	out := &Response{ID: w.ID, Model: w.Model}
+	for _, r := range w.Results {
+		if r.Categories == nil {
+			return nil, errors.New("moderation result lacks categories")
+		}
+		out.Results = append(out.Results, ModerationResult{
+			Flagged: r.Flagged, Categories: r.Categories,
+			CategoryScores: r.CategoryScores, AppliedInputTypes: r.CategoryAppliedInputTypes,
+		})
+	}
+	return out, nil
+}
+
+func (p *httpProvider) retryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(h); err == nil {
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(h); err == nil {
+		d = t.Sub(p.now())
+	}
+	if d < 0 {
+		return 0
+	}
+	if d > maxRetryWait {
+		return maxRetryWait
+	}
+	return d
+}
+
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// transientNetworkErr reports whether a transport failure merits a retry:
+// connection reset or refused, unexpected EOF, or a timeout.
+func transientNetworkErr(err error) bool {
+	switch {
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNREFUSED),
+		errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+		return true
+	}
+	return isTimeoutErr(err)
+}
+
+// hitDecision is the outcome of evaluating a response against a policy scope.
+type hitDecision struct {
+	Hit        bool
+	Categories []string
+	Scores     map[string]float64
+	// FirstResult is the index of the first result item carrying a hit, or -1.
+	FirstResult int
+}
+
+// decideHit applies the hit rule: a category counts only when it is selected
+// for the scope, its boolean is true and it applies to the scope's modality.
+// The provider's overall "flagged" value is ignored.
+func decideHit(resp *Response, selected []string, modality string) hitDecision {
+	dec := hitDecision{FirstResult: -1, Scores: map[string]float64{}}
+	if resp == nil || len(selected) == 0 {
+		return dec
+	}
+	seen := map[string]bool{}
+	for i, r := range resp.Results {
+		for _, cat := range selected {
+			if !r.Categories[cat] || !appliesTo(r.AppliedInputTypes[cat], modality) {
+				continue
+			}
+			if dec.FirstResult < 0 {
+				dec.FirstResult = i
+			}
+			if seen[cat] {
+				continue
+			}
+			seen[cat] = true
+			dec.Categories = append(dec.Categories, cat)
+			dec.Scores[cat] = r.CategoryScores[cat]
+		}
+	}
+	sort.Strings(dec.Categories)
+	dec.Hit = len(dec.Categories) > 0
+	return dec
+}
+
+func appliesTo(types []string, modality string) bool {
+	if len(types) == 0 {
+		return true
+	}
+	for _, t := range types {
+		if strings.EqualFold(strings.TrimSpace(t), modality) {
+			return true
+		}
+	}
+	return false
+}
