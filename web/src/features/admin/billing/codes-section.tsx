@@ -344,3 +344,117 @@ export function CodesSection({ config, plans }: { config: BillingConfig; plans: 
     </Section>
   );
 }
+
+function CreateCodesDialog({ open, plans, defaultMode, onOpenChange, onCreated }: { open: boolean; plans: BillingPlan[]; defaultMode: "usage" | "period"; onOpenChange: (open: boolean) => void; onCreated: (codes: RedemptionCode[]) => void }) {
+  const t = useT();
+  const message = useErrorMessage();
+  const [form, setForm] = useState<CodeForm>(blankCodeForm(defaultMode));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (open) {
+      setForm({ ...blankCodeForm(defaultMode), planId: plans[0] ? String(plans[0].id) : "" });
+      setError(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+  const set = <K extends keyof CodeForm>(key: K, value: CodeForm[K]) => setForm((f) => ({ ...f, [key]: value }));
+  const submit = async () => {
+    if (busy) return;
+    const found = validateCreate(form);
+    if (found) {
+      setError(problemText(t, found));
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const items = await createCodes(createBody(form));
+      onCreated(items);
+      onOpenChange(false);
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{t("adminBilling.codes.createTitle")}</DialogTitle>
+          <DialogDescription>{t("adminBilling.codes.createBody")}</DialogDescription>
+        </DialogHeader>
+        <form
+          className="grid gap-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>{t("adminBilling.codes.form.mode")}</FieldLabel>
+              <OptionSelect value={form.mode} onChange={(v) => set("mode", v === "period" ? "period" : "usage")} options={[{ value: "usage", label: t("adminBilling.codes.modes.usage") }, { value: "period", label: t("adminBilling.codes.modes.period") }]} className="w-full" />
+            </Field>
+            <Field>
+              <FieldLabel>{t("adminBilling.codes.form.quantity")}</FieldLabel>
+              <Input inputMode="numeric" value={form.quantity} onChange={(e) => set("quantity", e.target.value)} />
+            </Field>
+          </div>
+          <Field>
+            <FieldLabel>{t("adminBilling.codes.form.custom")}</FieldLabel>
+            <Input value={form.code} onChange={(e) => set("code", e.target.value)} autoComplete="off" spellCheck={false} />
+            <FieldHint>{t("adminBilling.codes.form.customHint")}</FieldHint>
+          </Field>
+          {form.mode === "usage" ? (
+            <Field required>
+              <FieldLabel>{t("adminBilling.codes.form.credit")}</FieldLabel>
+              <Input inputMode="decimal" value={form.creditUSD} onChange={(e) => set("creditUSD", e.target.value)} />
+            </Field>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field required>
+                <FieldLabel>{t("adminBilling.codes.form.plan")}</FieldLabel>
+                <OptionSelect value={form.planId} onChange={(v) => set("planId", v)} placeholder={t("adminBilling.codes.form.choosePlan")} options={plans.map((p) => ({ value: String(p.id), label: p.name }))} className="w-full" />
+              </Field>
+              <Field required>
+                <FieldLabel>{t("adminBilling.codes.form.days")}</FieldLabel>
+                <Input inputMode="numeric" value={form.durationDays} onChange={(e) => set("durationDays", e.target.value)} />
+              </Field>
+            </div>
+          )}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>{t("adminBilling.codes.form.max")}</FieldLabel>
+              <Input inputMode="numeric" value={form.maxRedemptions} onChange={(e) => set("maxRedemptions", e.target.value)} />
+              <FieldHint>{t("adminBilling.codes.form.maxHint")}</FieldHint>
+            </Field>
+            <Field>
+              <FieldLabel>{t("adminBilling.codes.form.perUser")}</FieldLabel>
+              <Input inputMode="numeric" value={form.perUserLimit} onChange={(e) => set("perUserLimit", e.target.value)} />
+            </Field>
+          </div>
+          <Field>
+            <FieldLabel>{t("adminBilling.codes.form.expires")}</FieldLabel>
+            <Input type="datetime-local" value={form.expiresAt} onChange={(e) => set("expiresAt", e.target.value)} />
+            <FieldHint>{t("adminBilling.codes.form.expiresHint")}</FieldHint>
+          </Field>
+          <Field>
+            <FieldLabel>{t("adminBilling.codes.form.note")}</FieldLabel>
+            <Textarea rows={2} value={form.description} maxLength={255} onChange={(e) => set("description", e.target.value)} />
+          </Field>
+          <FieldError>{error}</FieldError>
+          <DialogFooter>
+            <Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+              {t("common.actions.cancel")}
+            </Button>
+            <Button type="submit" loading={busy}>
+              {t("common.actions.create")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
