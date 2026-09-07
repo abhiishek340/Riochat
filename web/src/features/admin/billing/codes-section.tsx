@@ -458,3 +458,217 @@ function CreateCodesDialog({ open, plans, defaultMode, onOpenChange, onCreated }
     </Dialog>
   );
 }
+
+function EditCodeDialog({ code, onOpenChange, onSaved }: { code: RedemptionCode | null; onOpenChange: (open: boolean) => void; onSaved: (code: RedemptionCode) => void }) {
+  const t = useT();
+  const message = useErrorMessage();
+  const shown = useSnapshot(code);
+  const [form, setForm] = useState<EditForm | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (code) {
+      setForm(editFormOf(code));
+      setError(null);
+    }
+  }, [code]);
+  if (!shown || !form) return <Dialog open={false} onOpenChange={() => undefined} />;
+  const set = <K extends keyof EditForm>(key: K, value: EditForm[K]) => setForm((f) => (f ? { ...f, [key]: value } : f));
+  const submit = async () => {
+    const found = validateEditChange(shown, form);
+    if (found) {
+      setError(problemText(t, found));
+      return;
+    }
+    const body = editBody(shown, form);
+    if (Object.keys(body).length === 0) {
+      onOpenChange(false);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      onSaved(await patchCode(shown.id, body));
+      onOpenChange(false);
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open={code !== null} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t("adminBilling.codes.editTitle", { code: shown.codeHint })}</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <label className="flex items-center gap-3 text-sm font-medium">
+            <Switch checked={form.status === "active"} onCheckedChange={(on) => set("status", on ? "active" : "inactive")} />
+            {t("adminBilling.codes.statuses.active")}
+          </label>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>{t("adminBilling.codes.form.max")}</FieldLabel>
+              <Input inputMode="numeric" value={form.maxRedemptions} onChange={(e) => set("maxRedemptions", e.target.value)} />
+              <FieldHint>{t("adminBilling.codes.form.maxHint")}</FieldHint>
+            </Field>
+            <Field>
+              <FieldLabel>{t("adminBilling.codes.form.perUser")}</FieldLabel>
+              <Input inputMode="numeric" value={form.perUserLimit} onChange={(e) => set("perUserLimit", e.target.value)} />
+            </Field>
+          </div>
+          <Field>
+            <FieldLabel>{t("adminBilling.codes.form.expires")}</FieldLabel>
+            <Input type="datetime-local" value={form.expiresAt} onChange={(e) => set("expiresAt", e.target.value)} />
+            <FieldHint>{t("adminBilling.codes.form.expiresHint")}</FieldHint>
+          </Field>
+          <Field>
+            <FieldLabel>{t("adminBilling.codes.form.note")}</FieldLabel>
+            <Textarea rows={2} value={form.description} maxLength={255} onChange={(e) => set("description", e.target.value)} />
+          </Field>
+          <FieldError>{error}</FieldError>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+            {t("common.actions.cancel")}
+          </Button>
+          <Button loading={busy} onClick={submit}>
+            {t("common.actions.save")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Plain codes are shown once, with copy buttons. */
+function ShownCodesDialog({ codes, onClose }: { codes: RedemptionCode[] | null; onClose: () => void }) {
+  const t = useT();
+  const shown = useSnapshot(codes);
+  const list = shown ?? [];
+  const all = list.map((c) => c.code ?? "").filter(Boolean).join("\n");
+  const copy = async (text: string) => {
+    if (await copyText(text)) toast.success(t("adminCommon.toast.copied"));
+    else toast.error(t("adminCommon.toast.copyFailed"));
+  };
+  return (
+    <Dialog open={codes !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t("adminBilling.codes.shownTitle")}</DialogTitle>
+          <DialogDescription>{t("adminBilling.codes.shownBody")}</DialogDescription>
+        </DialogHeader>
+        <ul className="max-h-72 space-y-1 overflow-auto rounded-lg border p-2">
+          {list.map((c) => (
+            <li key={c.id} className="flex items-center justify-between gap-2 rounded px-2 py-1 hover:bg-muted/50">
+              <span className="break-all font-mono text-[13px]">{c.code}</span>
+              <Button variant="ghost" size="icon-sm" aria-label={t("common.actions.copy")} onClick={() => void copy(c.code ?? "")}>
+                <Copy />
+              </Button>
+            </li>
+          ))}
+        </ul>
+        <DialogFooter>
+          {list.length > 1 ? (
+            <Button variant="outline" onClick={() => void copy(all)}>
+              <Copy />
+              {t("adminBilling.codes.copyAll")}
+            </Button>
+          ) : null}
+          <Button onClick={onClose}>{t("common.actions.close")}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function RecordsDialog({ code, onClose }: { code: RedemptionCode | null; onClose: () => void }) {
+  const t = useT();
+  const { locale } = useI18n();
+  const notify = useNotify();
+  const shown = useSnapshot(code);
+  const [page, setPage] = useState(1);
+  const [rows, setRows] = useState<CodeRedemption[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    if (!code) return;
+    // Another code starts clean: no rows of the previous one while this one loads.
+    setPage(1);
+    setRows([]);
+    setTotal(0);
+  }, [code]);
+  useEffect(() => {
+    if (!code) return;
+    const controller = new AbortController();
+    setLoading(true);
+    setFailed(false);
+    listCodeRedemptions(code.id, page, 25, controller.signal).then(
+      (r) => {
+        setRows(r.results);
+        setTotal(r.total);
+        setLoading(false);
+      },
+      (error: unknown) => {
+        if (isAbortError(error)) return;
+        setLoading(false);
+        setFailed(true);
+        notify.error("adminBilling.codes.recordsFailed", error);
+      },
+    );
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code, page, attempt]);
+  const money = (nano: number | null) => (nano === null ? "-" : formatUsdTable(nano / 1e9, locale));
+  return (
+    <Dialog open={code !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>{t("adminBilling.codes.recordsTitle", { code: shown?.codeHint ?? "" })}</DialogTitle>
+        </DialogHeader>
+        <div className={`max-h-[50vh] overflow-auto rounded-lg border ${loading ? "opacity-60" : ""}`}>
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-muted/90 text-left text-xs uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2">{t("adminBilling.codes.recordColumns.user")}</th>
+                <th className="px-3 py-2">{t("adminBilling.codes.recordColumns.reward")}</th>
+                <th className="px-3 py-2">{t("adminBilling.codes.recordColumns.time")}</th>
+                <th className="px-3 py-2">{t("adminBilling.codes.recordColumns.balance")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id} className="border-t">
+                  <td className="px-3 py-2">{r.userLabel || r.userDisplayName || r.username || `#${r.userID}`}</td>
+                  <td className="px-3 py-2">{r.rewardType === "plan" ? `${r.planName} · ${t("adminBilling.codes.days", { count: r.durationDays })}` : formatCredit(r.creditUSD, locale)}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">{formatDateTime(r.createdAt, locale)}</td>
+                  <td className="whitespace-nowrap px-3 py-2 tabular-nums">
+                    {money(r.balanceBeforeNanousd)} → {money(r.balanceAfterNanousd)}
+                  </td>
+                </tr>
+              ))}
+              {rows.length === 0 && !loading && failed ? (
+                <tr>
+                  <td colSpan={4} className="p-3">
+                    <LoadError message={t("adminBilling.codes.recordsFailed")} onRetry={() => setAttempt((n) => n + 1)} />
+                  </td>
+                </tr>
+              ) : null}
+              {rows.length === 0 && !loading && !failed ? (
+                <tr>
+                  <td colSpan={4} className="h-20 text-center text-muted-foreground">
+                    {t("adminBilling.codes.noRecords")}
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+        <Pagination page={page} pageSize={25} total={total} onPage={setPage} />
+      </DialogContent>
+    </Dialog>
+  );
+}
