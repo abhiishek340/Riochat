@@ -133,3 +133,171 @@ pub fn read_os() -> Detected {
     let pac = key.get_value::<String, _>("AutoConfigURL").unwrap_or_default();
     from_windows_values(enabled, &server, &over, &pac)
 }
+
+/// Parses the output of `scutil --proxy` (the system dynamic store).
+pub fn parse_scutil(output: &str) -> Detected {
+    use std::collections::HashMap;
+    let mut flat: HashMap<String, String> = HashMap::new();
+    let mut exceptions: Vec<String> = Vec::new();
+    let mut in_exceptions = false;
+    for line in output.lines() {
+        let t = line.trim();
+        if in_exceptions {
+            if t.starts_with('}') {
+                in_exceptions = false;
+            } else if let Some((_, v)) = t.split_once(" : ") {
+                exceptions.push(v.trim().to_string());
+            }
+            continue;
+        }
+        let Some((k, v)) = t.split_once(" : ") else {
+            continue;
+        };
+        if k == "ExceptionsList" {
+            in_exceptions = true;
+            continue;
+        }
+        flat.insert(k.trim().to_string(), v.trim().to_string());
+    }
+    let on = |k: &str| flat.get(k).map(|v| v == "1").unwrap_or(false);
+    let endpoint = |prefix: &str, socks: bool| -> Option<Endpoint> {
+        if !on(&format!("{prefix}Enable")) {
+            return None;
+        }
+        let host = flat.get(&format!("{prefix}Proxy"))?;
+        let port = flat.get(&format!("{prefix}Port"))?;
+        let addr = if socks {
+            format!("socks5://{host}:{port}")
+        } else {
+            format!("http://{host}:{port}")
+        };
+        canonicalize(&addr).ok()
+    };
+    let socks = endpoint("SOCKS", true);
+    let http = endpoint("HTTP", false).or_else(|| socks.clone());
+    let https = endpoint("HTTPS", false).or(socks);
+    let have = http.is_some() || https.is_some();
+    Detected {
+        bypass: if have {
+            bypass::normalize(&exceptions.join(","))
+        } else {
+            String::new()
+        },
+        http,
+        https,
+        pac: on("ProxyAutoConfigEnable"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn read_os() -> Detected {
+    match std::process::Command::new("/usr/sbin/scutil").arg("--proxy").output() {
+        Ok(out) if out.status.success() => parse_scutil(&String::from_utf8_lossy(&out.stdout)),
+        _ => Detected::default(),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn read_os() -> Detected {
+    Detected::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |name: &str| owned.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn environment_prefers_specific_over_all() {
+        let d = from_environment(env(&[
+            ("HTTP_PROXY", "http://a:1"),
+            ("ALL_PROXY", "socks5://b:2"),
+            ("NO_PROXY", "intra.corp"),
+        ]));
+        assert_eq!(d.http.unwrap().address(), "http://a:1");
+        assert_eq!(d.https.unwrap().address(), "socks5://b:2");
+        assert_eq!(d.bypass, "intra.corp,localhost,127.0.0.0/8,::1");
+    }
+
+    #[test]
+    fn environment_accepts_lowercase_and_ignores_garbage() {
+        let d = from_environment(env(&[("https_proxy", "p.corp:8080"), ("http_proxy", "https://x:1")]));
+        assert!(d.http.is_none());
+        assert_eq!(d.https.unwrap().address(), "http://p.corp:8080");
+        let none = from_environment(env(&[("NO_PROXY", "a")]));
+        assert!(!none.has_proxy());
+        assert_eq!(none.bypass, "");
+    }
+
+    #[test]
+    fn windows_single_and_per_scheme() {
+        let (h, s) = parse_windows_proxy("proxy.corp:3128");
+        assert_eq!(h.unwrap().address(), "http://proxy.corp:3128");
+        assert_eq!(s.unwrap().address(), "http://proxy.corp:3128");
+
+        let (h, s) = parse_windows_proxy("https=sec:8443; http=plain:8080");
+        assert_eq!(h.unwrap().address(), "http://plain:8080");
+        assert_eq!(s.unwrap().address(), "http://sec:8443");
+
+        let (h, s) = parse_windows_proxy("socks=sx:1080;ftp=ignored:21");
+        assert_eq!(h.unwrap().address(), "socks5://sx:1080");
+        assert_eq!(s.unwrap().address(), "socks5://sx:1080");
+
+        let (h, s) = parse_windows_proxy("http=only:80\tsocks=sx:1080");
+        assert_eq!(h.unwrap().address(), "http://only:80");
+        assert_eq!(s.unwrap().address(), "socks5://sx:1080");
+        assert_eq!(parse_windows_proxy(""), (None, None));
+    }
+
+    #[test]
+    fn windows_values_and_pac() {
+        let d = from_windows_values(true, "p:1", "10.*;<local>", "");
+        assert!(d.has_proxy());
+        assert_eq!(d.bypass, "10.0.0.0/8,localhost,127.0.0.0/8,::1");
+        assert!(!d.pac);
+        let d = from_windows_values(false, "p:1", "", "http://wpad/proxy.pac");
+        assert!(!d.has_proxy());
+        assert!(d.pac);
+    }
+
+    const SCUTIL: &str = r#"<dictionary> {
+  ExceptionsList : <array> {
+    0 : *.local
+    1 : 169.254/16
+  }
+  ExcludeSimpleHostnames : 1
+  FTPPassive : 1
+  HTTPEnable : 1
+  HTTPPort : 8080
+  HTTPProxy : proxy.corp
+  HTTPSEnable : 0
+  ProxyAutoConfigEnable : 0
+  SOCKSEnable : 1
+  SOCKSPort : 1080
+  SOCKSProxy : sx.corp
+}
+"#;
+
+    #[test]
+    fn scutil_output() {
+        let d = parse_scutil(SCUTIL);
+        assert_eq!(d.http.unwrap().address(), "http://proxy.corp:8080");
+        // https falls back to the socks proxy
+        assert_eq!(d.https.unwrap().address(), "socks5://sx.corp:1080");
+        assert_eq!(d.bypass, ".local,169.254.0.0/16,localhost,127.0.0.0/8,::1");
+        assert!(!d.pac);
+    }
+
+    #[test]
+    fn scutil_pac_only() {
+        let d = parse_scutil(
+            "<dictionary> {\n  ProxyAutoConfigEnable : 1\n  ProxyAutoConfigURLString : http://x/p.pac\n}\n",
+        );
+        assert!(!d.has_proxy());
+        assert!(d.pac);
+    }
+}
