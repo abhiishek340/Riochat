@@ -232,3 +232,151 @@ function AnnouncementsContent() {
     </AdminPage>
   );
 }
+
+/** Priority editor: blank/unchanged/Escape discard, junk reports an error, a number commits on blur or Enter. */
+export function PriorityCell({ value, disabled, label, onCommit, onInvalid }: { value: number; disabled: boolean; label: string; onCommit: (value: number) => void; onInvalid: () => void }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  // Escape blurs the field; the blur handler must not commit what Escape threw away.
+  const discarded = useRef(false);
+  const shown = draft ?? String(value);
+  const finish = (commit: boolean) => {
+    const text = draft;
+    setDraft(null);
+    if (discarded.current) {
+      discarded.current = false;
+      return;
+    }
+    if (!commit || text === null) return;
+    const parsed = parsePriorityInput(text);
+    if (parsed.kind === "blank") return;
+    if (parsed.kind === "invalid") return onInvalid();
+    if (parsed.value !== value) onCommit(parsed.value);
+  };
+  return (
+    <Input
+      value={shown}
+      disabled={disabled}
+      inputMode="numeric"
+      aria-label={label}
+      className="h-8 w-20 text-right tabular-nums"
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={() => finish(true)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          event.currentTarget.blur();
+        } else if (event.key === "Escape") {
+          discarded.current = true;
+          setDraft(null);
+          event.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
+function EditorSheet({ target, onOpenChange, onSaved }: { target: Announcement | "new" | null; onOpenChange: (open: boolean) => void; onSaved: (saved: Announcement, created: boolean) => void }) {
+  const t = useT();
+  const message = useErrorMessage();
+  const shown = useSnapshot(target);
+  const existing = shown && shown !== "new" ? shown : null;
+  const [form, setForm] = useState<AnnouncementForm>(EMPTY_FORM);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (target !== null) setForm(formOf(target === "new" ? null : target));
+  }, [target]);
+
+  const set = <K extends keyof AnnouncementForm>(key: K, value: AnnouncementForm[K]) => setForm((f) => ({ ...f, [key]: value }));
+
+  const save = async () => {
+    if (busy) return;
+    const body = bodyOf(form, existing ?? undefined);
+    if (!body) {
+      toast.error(t("adminAnnounce.toast.invalidInput"), { description: t("adminAnnounce.toast.invalidInputBody") });
+      return;
+    }
+    setBusy(true);
+    try {
+      const saved = existing ? await updateAnnouncement(existing.id, body) : await createAnnouncement(body);
+      toast.success(t(existing ? "adminAnnounce.toast.updated" : "adminAnnounce.toast.created"));
+      onSaved(saved, !existing);
+      onOpenChange(false);
+    } catch (error) {
+      toast.error(t("adminAnnounce.toast.saveFailed"), { description: message(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Sheet
+      open={target !== null}
+      onOpenChange={onOpenChange}
+      busy={busy}
+      size="xl"
+      title={existing ? t("adminAnnounce.form.editTitle") : t("adminAnnounce.form.createTitle")}
+      footer={
+        <>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+            {t("common.actions.cancel")}
+          </Button>
+          <Button loading={busy} onClick={save}>
+            {t("common.actions.save")}
+          </Button>
+        </>
+      }
+    >
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="grid content-start gap-4">
+          <Field required>
+            <FieldLabel>{t("adminAnnounce.form.title")}</FieldLabel>
+            <Input value={form.title} maxLength={120} onChange={(e) => set("title", e.target.value)} />
+          </Field>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>{t("adminAnnounce.form.type")}</FieldLabel>
+              <OptionSelect value={form.type} onChange={(v) => set("type", v)} options={ANNOUNCEMENT_TYPES.map((x) => ({ value: x, label: t(`adminAnnounce.types.${x}`) }))} className="w-full" />
+            </Field>
+            <Field>
+              <FieldLabel>{t("adminAnnounce.form.priority")}</FieldLabel>
+              <Input value={form.priority} inputMode="numeric" onChange={(e) => set("priority", e.target.value)} />
+              <FieldHint>{t("adminAnnounce.form.priorityHint")}</FieldHint>
+            </Field>
+          </div>
+          <div className="flex flex-wrap gap-6">
+            <label className="flex items-center gap-3 text-sm font-medium">
+              <Switch checked={form.pinned} onCheckedChange={(on) => set("pinned", on)} />
+              {t("adminAnnounce.form.pinned")}
+            </label>
+            <label className="flex items-center gap-3 text-sm font-medium">
+              <Switch checked={form.active} onCheckedChange={(on) => set("active", on)} />
+              {t("adminAnnounce.form.active")}
+            </label>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field>
+              <FieldLabel>{t("adminAnnounce.form.startDate")}</FieldLabel>
+              <Input type="date" value={form.startDate} max={form.endDate || undefined} onChange={(e) => set("startDate", e.target.value)} />
+            </Field>
+            <Field>
+              <FieldLabel>{t("adminAnnounce.form.endDate")}</FieldLabel>
+              <Input type="date" value={form.endDate} min={form.startDate || undefined} onChange={(e) => set("endDate", e.target.value)} />
+            </Field>
+            <FieldHint className="sm:col-span-2">{t("adminAnnounce.form.windowHint")}</FieldHint>
+          </div>
+          <Field required>
+            <FieldLabel>{t("adminAnnounce.form.content")}</FieldLabel>
+            <Textarea rows={12} value={form.content} maxLength={20000} onChange={(e) => set("content", e.target.value)} className="font-mono text-[13px]" />
+          </Field>
+        </div>
+        <div className="space-y-2">
+          <div className="text-sm font-medium">{t("adminAnnounce.form.preview")}</div>
+          <div className="min-h-48 rounded-lg border bg-card p-4">
+            {form.content.trim() ? <MarkdownPreview source={form.content} /> : <p className="text-sm text-muted-foreground">{t("adminAnnounce.form.previewEmpty")}</p>}
+          </div>
+        </div>
+      </div>
+    </Sheet>
+  );
+}
