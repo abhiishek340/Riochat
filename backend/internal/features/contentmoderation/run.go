@@ -520,3 +520,278 @@ func (r *Run) recordPass(ctx context.Context, direction, modality, model string,
 	}
 	r.addStats(pctx, statDeltasFor(direction, modality, ResultPassed, items, latency, nil))
 }
+
+// recordFailure stores a failed-open event for a check that could not finish.
+func (r *Run) recordFailure(ctx context.Context, direction, modality, code string, items int, latency int64, cause error) {
+	r.mu.Lock()
+	r.failures++
+	r.mu.Unlock()
+	s := r.s
+	fields := []logx.Field{logx.F("code", code), logx.F("direction", direction), logx.F("modality", modality)}
+	if cause != nil {
+		fields = append(fields, errField(cause))
+	}
+	s.log.Warn("content_moderation_check_failed_open", fields...)
+
+	pctx, cancel := s.persistCtx(ctx)
+	defer cancel()
+	e := r.newEvent(direction, modality, ResultFailedOpen)
+	e.LatencyMS = latency
+	e.ErrorCode = code
+	e.ErrorMessage = truncate(publicTextFor(code), 255)
+	e.ContentExpiresAt = s.clock.Now().Add(contentRetention)
+	if err := s.createEvent(pctx, e); err != nil {
+		s.log.Error("content_moderation_event_write_failed", errField(err))
+	}
+	r.addStats(pctx, statDeltasFor(direction, modality, ResultFailedOpen, items, latency, nil))
+}
+
+// recordConfigMissing notes that the configuration could not be read at the
+// start of a run.
+func (r *Run) recordConfigMissing(ctx context.Context) {
+	s := r.s
+	pctx, cancel := s.persistCtx(ctx)
+	defer cancel()
+	e := r.newEvent(DirectionInput, ModalityText, ResultFailedOpen)
+	e.ModelName, e.PolicyVersion = "", 0
+	e.ErrorCode = CodeConfigMissing
+	e.ErrorMessage = truncate(publicTextFor(CodeConfigMissing), 255)
+	e.ContentExpiresAt = s.clock.Now().Add(contentRetention)
+	if err := s.createEvent(pctx, e); err != nil {
+		s.log.Error("content_moderation_event_write_failed", errField(err))
+	}
+	if err := s.addStats(pctx, statDeltasFor(DirectionInput, ModalityText, ResultFailedOpen, 1, 0, nil)...); err != nil {
+		s.log.Error("content_moderation_stats_failed", errField(err))
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// loadedImage is an image that was loaded and prepared for checking.
+type loadedImage struct {
+	ref      ImageRef
+	index    int // position among the refs handed to the check
+	hash     string
+	orig     []byte
+	send     []byte
+	sendMIME string
+}
+
+// loadImages fetches and prepares the images. Non-images are skipped quietly,
+// images with a repeated stored hash are checked once, and every real failure
+// is recorded as a failed-open event. Output images that carry neither a file
+// nor bytes are dropped without a record: the caller reports them through
+// ReportOutputImageFailure.
+func (r *Run) loadImages(ctx context.Context, direction string, refs []ImageRef) []loadedImage {
+	s := r.s
+	var out []loadedImage
+	seen := map[string]bool{}
+	for i, ref := range refs {
+		data := ref.Bytes
+		var mime string
+		if len(data) == 0 {
+			if ref.FileID == 0 {
+				if direction != DirectionOutput {
+					r.recordFailure(ctx, direction, ModalityImage, CodeServiceError, 1, 0, ErrFileEmpty)
+				}
+				continue
+			}
+			if s.files == nil {
+				r.recordFailure(ctx, direction, ModalityImage, CodeServiceError, 1, 0, errors.New("no file loader"))
+				continue
+			}
+			loaded, m, err := s.files.Load(ctx, ref.FileID)
+			if errors.Is(err, ErrNotImage) {
+				continue
+			}
+			if err != nil {
+				r.recordFailure(ctx, direction, ModalityImage, CodeServiceError, 1, 0, err)
+				continue
+			}
+			data, mime = loaded, m
+		}
+		if len(data) == 0 {
+			r.recordFailure(ctx, direction, ModalityImage, CodeServiceError, 1, 0, ErrFileEmpty)
+			continue
+		}
+		if mime = strings.ToLower(strings.TrimSpace(mime)); mime == "" || mime == "application/octet-stream" {
+			mime = sniffMIME(data)
+		}
+		if !strings.HasPrefix(mime, "image/") {
+			continue
+		}
+		send, sendMIME, err := prepareImage(data, s.imageMaxDim)
+		if err != nil {
+			r.recordFailure(ctx, direction, ModalityImage, CodeServiceError, 1, 0, err)
+			continue
+		}
+		hash := strings.ToLower(strings.TrimSpace(ref.SHA256))
+		if hash != "" {
+			if seen[hash] {
+				continue
+			}
+			seen[hash] = true
+		}
+		out = append(out, loadedImage{ref: ref, index: i, hash: hash, orig: data, send: send, sendMIME: sendMIME})
+	}
+	return out
+}
+
+func (r *Run) runImages(ctx context.Context, direction string, refs []ImageRef) {
+	s := r.s
+	loaded := r.loadImages(ctx, direction, refs)
+	if len(loaded) == 0 {
+		return
+	}
+	if s.provider == nil {
+		r.recordFailure(ctx, direction, ModalityImage, CodeServiceError, len(loaded), 0, errors.New("no provider"))
+		return
+	}
+	selected := r.cfg.Policy.Selected(direction, ModalityImage)
+	images := make([]Image, len(loaded))
+	for i, li := range loaded {
+		images[i] = Image{Data: li.send, MIME: li.sendMIME}
+	}
+	start := s.clock.Now()
+	resp, err := s.provider.CheckImages(ctx, r.cfg.clientConfig(), images, Scope{Direction: direction, Modality: ModalityImage, Selected: selected})
+	latency := s.clock.Now().Sub(start).Milliseconds()
+	if err != nil {
+		r.recordFailure(ctx, direction, ModalityImage, errorCodeOf(err), len(loaded), latency, err)
+		return
+	}
+	model := r.cfg.Model
+	if resp != nil && resp.Model != "" {
+		model = resp.Model
+	}
+	dec := decideHit(resp, selected, ModalityImage)
+	loc := contentLocation{Field: fieldFor(direction, ModalityImage)}
+	if !dec.Hit {
+		r.recordPass(ctx, direction, ModalityImage, model, len(loaded), latency, loc)
+		return
+	}
+	if dec.FirstResult >= 0 && dec.FirstResult < len(loaded) {
+		hitImg := loaded[dec.FirstResult]
+		loc.Attachment, loc.FileID = hitImg.index, hitImg.ref.FileID
+	}
+
+	pctx, cancel := s.persistCtx(ctx)
+	defer cancel()
+	e := r.newEvent(direction, ModalityImage, ResultHit)
+	e.ModelName, e.LatencyMS = model, latency
+	e.CategoriesJSON = categoriesToJSON(dec.Categories)
+	e.CategoryScoresJSON = mustJSON(dec.Scores, "{}")
+	e.ContentLocationJSON = mustJSON(loc, "{}")
+	e.ContentSummary = summaryFor(direction, ModalityImage, ResultHit)
+	e.ContentExpiresAt = s.clock.Now().Add(contentRetention)
+
+	metas := r.isolateImages(pctx, e.PublicID, loaded)
+	e.ImageCount = len(metas)
+	e.ImageMetaJSON = mustJSON(nonNilMetas(metas), "[]")
+
+	eventID := e.PublicID
+	if err := s.createEvent(pctx, e); err != nil {
+		s.log.Error("content_moderation_event_write_failed", errField(err))
+		eventID = ""
+		for _, m := range metas {
+			if derr := s.objects.Delete(pctx, m.StoragePath); derr != nil {
+				s.log.Warn("content_moderation_isolated_cleanup_failed", errField(derr))
+			}
+		}
+	}
+	r.addStats(pctx, statDeltasFor(direction, ModalityImage, ResultHit, len(loaded), latency, dec.Categories))
+	if direction == DirectionOutput {
+		r.revokeGenerated(pctx, refs)
+	}
+	r.registerHit(blockInfo{EventID: eventID, Direction: direction, Categories: dec.Categories}, pctx)
+}
+
+func nonNilMetas(m []imageMeta) []imageMeta {
+	if m == nil {
+		return []imageMeta{}
+	}
+	return m
+}
+
+// isolateImages stores an encrypted copy of every checked image for review.
+// The copy is the prepared (downscaled) image that was sent for checking. Each
+// image keeps its position in the task as its index; a failure for one image
+// is logged and only reduces what the reviewer can see.
+func (r *Run) isolateImages(ctx context.Context, eventID string, loaded []loadedImage) []imageMeta {
+	s := r.s
+	if s.objects == nil {
+		s.log.Warn("content_moderation_isolation_unavailable")
+		return nil
+	}
+	var metas []imageMeta
+	for idx, li := range loaded {
+		if len(li.send) == 0 {
+			continue
+		}
+		cipher, err := s.secrets.EncryptBound(base64.StdEncoding.EncodeToString(li.send), imageBinding(eventID, idx))
+		if err != nil {
+			s.log.Error("content_moderation_image_encrypt_failed", errField(err))
+			continue
+		}
+		hash := li.hash
+		if hash == "" {
+			sum := sha256.Sum256(li.orig)
+			hash = hex.EncodeToString(sum[:])
+		}
+		key := IsolatedImageKey(eventID, idx, hash)
+		if err := s.objects.Put(ctx, key, []byte(cipher), "application/octet-stream"); err != nil {
+			s.log.Error("content_moderation_image_store_failed", errField(err))
+			continue
+		}
+		m := imageMeta{
+			Index: idx, SHA256: hash, MIMEType: li.sendMIME,
+			SizeBytes: int64(len(li.send)), StoragePath: key,
+		}
+		if li.ref.FileID != 0 {
+			m.SourceFileID = fmt.Sprint(li.ref.FileID)
+		}
+		metas = append(metas, m)
+	}
+	return metas
+}
+
+// IsolatedImageFolder is the object-store folder holding encrypted evidence.
+const IsolatedImageFolder = "moderation-isolated"
+
+// IsolatedImageKey is the object key of one isolated image: the event's public
+// id, the image's index and the first 16 characters of its hash.
+func IsolatedImageKey(eventID string, index int, hash string) string {
+	if len(hash) > 16 {
+		hash = hash[:16]
+	}
+	return fmt.Sprintf("%s/%s/%d_%s.bin", IsolatedImageFolder, eventID, index, hash)
+}
+
+// revokeGenerated withdraws generated files of a flagged output, whether or
+// not their bytes could be isolated.
+func (r *Run) revokeGenerated(ctx context.Context, refs []ImageRef) {
+	s := r.s
+	if s.files == nil {
+		return
+	}
+	var ids []uint
+	for _, ref := range refs {
+		if ref.FileID == 0 {
+			continue
+		}
+		if err := s.files.Revoke(ctx, ref.FileID); err != nil {
+			s.log.Error("content_moderation_revoke_failed", logx.F("file_id", ref.FileID), errField(err))
+			continue
+		}
+		ids = append(ids, ref.FileID)
+	}
+	if len(ids) > 0 {
+		if err := s.files.DeleteObjects(ctx, ids); err != nil {
+			s.log.Warn("content_moderation_object_delete_failed", errField(err))
+		}
+	}
+}
