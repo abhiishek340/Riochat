@@ -189,3 +189,196 @@ type EventFilter struct {
 	RunID     string
 	From, To  *time.Time
 }
+
+func (s *Service) createEvent(ctx context.Context, e *Event) error {
+	if e.PublicID == "" {
+		e.PublicID = newPublicID()
+	}
+	if err := s.db.WithContext(ctx).Create(e).Error; err != nil {
+		return database.Translate(err)
+	}
+	return nil
+}
+
+func (s *Service) eventByPublicID(ctx context.Context, publicID string) (*Event, error) {
+	var e Event
+	err := s.db.WithContext(ctx).Where("public_id = ?", publicID).First(&e).Error
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, ErrEventNotFound
+		}
+		return nil, err
+	}
+	return &e, nil
+}
+
+// applyEventFilter adds the list conditions. userIDs are users whose name or
+// public id matched the free-text query.
+func applyEventFilter(q *gorm.DB, f EventFilter, userIDs []uint) *gorm.DB {
+	if f.Result != "" {
+		q = q.Where("result = ?", f.Result)
+	}
+	if f.Direction != "" {
+		q = q.Where("direction = ?", f.Direction)
+	}
+	if f.Modality != "" {
+		q = q.Where("modality = ?", f.Modality)
+	}
+	if f.Category != "" {
+		q = q.Where("categories_json LIKE ?", `%"`+f.Category+`"%`)
+	}
+	if f.UserID != 0 {
+		q = q.Where("user_id = ?", f.UserID)
+	}
+	if f.RunID != "" {
+		q = q.Where("run_id = ?", f.RunID)
+	}
+	if f.From != nil {
+		q = q.Where("created_at >= ?", *f.From)
+	}
+	if f.To != nil {
+		q = q.Where("created_at <= ?", *f.To)
+	}
+	if f.Query != "" {
+		raw := []string{f.Query}
+		if lower := strings.ToLower(f.Query); lower != f.Query {
+			raw = append(raw, lower)
+		}
+		var conds []string
+		var args []any
+		for _, col := range []string{"public_id", "run_id", "message_public_id", "result", "direction",
+			"modality", "model", "error_code", "content_summary"} {
+			conds = append(conds, col+" IN ?")
+			args = append(args, raw)
+		}
+		ids := append([]uint(nil), userIDs...)
+		if n, err := strconv.ParseUint(f.Query, 10, 64); err == nil && n > 0 {
+			ids = append(ids, uint(n))
+		}
+		if len(ids) > 0 {
+			conds = append(conds, "user_id IN ?")
+			args = append(args, ids)
+		}
+		q = q.Where("("+strings.Join(conds, " OR ")+")", args...)
+	}
+	return q
+}
+
+// EventPage is a page of listed events.
+type EventPage struct {
+	Items    []EventItem `json:"items"`
+	Total    int64       `json:"total"`
+	Page     int         `json:"page"`
+	PageSize int         `json:"pageSize"`
+}
+
+func (s *Service) listEvents(ctx context.Context, f EventFilter, page, pageSize int) (EventPage, error) {
+	var userIDs []uint
+	if f.Query != "" && s.users != nil {
+		ids, err := s.users.Search(ctx, f.Query)
+		if err != nil {
+			s.log.Warn("content_moderation_user_search_failed", errField(err))
+		} else {
+			userIDs = ids
+		}
+	}
+	q := applyEventFilter(s.db.WithContext(ctx).Model(&Event{}), f, userIDs)
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return EventPage{}, database.Translate(err)
+	}
+	var rows []Event
+	offset := (page - 1) * pageSize
+	err := applyEventFilter(s.db.WithContext(ctx).Model(&Event{}), f, userIDs).
+		Order("id DESC").Offset(offset).Limit(pageSize).Find(&rows).Error
+	if err != nil {
+		return EventPage{}, database.Translate(err)
+	}
+	items := make([]EventItem, 0, len(rows))
+	for _, r := range rows {
+		items = append(items, eventItem(r))
+	}
+	s.attachLabels(ctx, items)
+	return EventPage{Items: items, Total: total, Page: page, PageSize: pageSize}, nil
+}
+
+// attachLabels fills user labels in one batch; unresolved users stay unlabeled.
+func (s *Service) attachLabels(ctx context.Context, items []EventItem) {
+	if s.users == nil || len(items) == 0 {
+		return
+	}
+	seen := map[uint]bool{}
+	var ids []uint
+	for _, it := range items {
+		if it.UserID != 0 && !seen[it.UserID] {
+			seen[it.UserID] = true
+			ids = append(ids, it.UserID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	labels, err := s.users.Labels(ctx, ids)
+	if err != nil {
+		s.log.Warn("content_moderation_user_labels_failed", errField(err))
+		return
+	}
+	for i := range items {
+		if l, ok := labels[items[i].UserID]; ok {
+			items[i].UserLabel, items[i].Username = l.Label, l.Username
+		}
+	}
+}
+
+// ImageInfo is an isolated image as shown to administrators.
+type ImageInfo struct {
+	Index        int    `json:"index"`
+	SHA256       string `json:"sha256"`
+	MIMEType     string `json:"mimeType"`
+	SizeBytes    int64  `json:"sizeBytes"`
+	SourceFileID string `json:"sourceFileID,omitempty"`
+}
+
+// EventDetail is the detail view of one event.
+type EventDetail struct {
+	Event           EventItem          `json:"event"`
+	CategoryScores  map[string]float64 `json:"categoryScores"`
+	DecryptedText   string             `json:"decryptedText,omitempty"`
+	TextAvailable   bool               `json:"textAvailable"`
+	ImagesAvailable bool               `json:"imagesAvailable"`
+	Images          []ImageInfo        `json:"images"`
+}
+
+func (s *Service) contentRetained(e *Event) bool {
+	return s.clock.Now().Before(e.ContentExpiresAt)
+}
+
+func (s *Service) buildDetail(ctx context.Context, e *Event) EventDetail {
+	d := EventDetail{
+		Event:          eventItem(*e),
+		CategoryScores: scoresFromJSON(e.CategoryScoresJSON),
+		Images:         []ImageInfo{},
+	}
+	retained := s.contentRetained(e)
+	if retained && e.Result == ResultHit && e.Modality == ModalityText && e.EncryptedText != "" {
+		plain, _, err := s.secrets.DecryptBound(e.EncryptedText, textBinding(e.PublicID))
+		if err == nil {
+			d.DecryptedText, d.TextAvailable = plain, true
+		} else {
+			s.log.Warn("content_moderation_text_decrypt_failed", errField(err))
+		}
+	}
+	if e.Modality == ModalityImage {
+		metas := imagesFromJSON(e.ImageMetaJSON)
+		if retained && len(metas) > 0 {
+			d.ImagesAvailable = true
+			for _, m := range metas {
+				d.Images = append(d.Images, ImageInfo{
+					Index: m.Index, SHA256: m.SHA256, MIMEType: m.MIMEType,
+					SizeBytes: m.SizeBytes, SourceFileID: m.SourceFileID,
+				})
+			}
+		}
+	}
+	return d
+}
