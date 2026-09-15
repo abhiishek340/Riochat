@@ -172,3 +172,143 @@ func (s *Service) CleanupExpired(ctx context.Context) error {
 	}
 	return s.pruneStats(ctx)
 }
+
+// clearEventContent deletes an event's isolated objects and, only when all of
+// them are gone, wipes its content fields.
+func (s *Service) clearEventContent(ctx context.Context, e *Event) bool {
+	metas, parsed := parseImageMeta(e.ImageMetaJSON)
+	if !parsed {
+		s.log.Warn("content_moderation_image_meta_unreadable", logx.F("event", e.PublicID))
+		return false
+	}
+	if len(metas) > 0 || e.ImageCount > 0 {
+		if s.objects == nil {
+			return false
+		}
+		for _, m := range metas {
+			if err := s.objects.Delete(ctx, m.StoragePath); err != nil {
+				s.log.Warn("content_moderation_isolated_delete_failed", logx.F("event", e.PublicID), errField(err))
+				return false
+			}
+		}
+	}
+	err := s.db.WithContext(ctx).Unscoped().Model(&Event{}).Where("id = ?", e.ID).Updates(map[string]any{
+		"encrypted_text": "", "image_count": 0, "image_meta_json": "[]", "content_summary": "",
+	}).Error
+	if err != nil {
+		s.log.Error("content_moderation_clear_content_failed", errField(err))
+		return false
+	}
+	return true
+}
+
+// DeleteEventsBefore removes events created before cutoff (the admin log
+// cleanup of type "moderation"). Events whose isolated images cannot be deleted
+// are kept. It returns the number of rows removed.
+func (s *Service) DeleteEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	var withImages []Event
+	err := s.db.WithContext(ctx).Unscoped().
+		Where("created_at < ? AND image_count > 0", cutoff).Find(&withImages).Error
+	if err != nil {
+		return 0, err
+	}
+	keep := []uint{}
+	for i := range withImages {
+		for _, m := range imagesFromJSON(withImages[i].ImageMetaJSON) {
+			if s.objects == nil {
+				keep = append(keep, withImages[i].ID)
+				break
+			}
+			if derr := s.objects.Delete(ctx, m.StoragePath); derr != nil {
+				keep = append(keep, withImages[i].ID)
+				break
+			}
+		}
+	}
+	q := s.db.WithContext(ctx).Unscoped().Where("created_at < ?", cutoff)
+	if len(keep) > 0 {
+		q = q.Where("id NOT IN ?", keep)
+	}
+	res := q.Delete(&Event{})
+	return res.RowsAffected, res.Error
+}
+
+// RecoverStaleRuns settles runs that were left moderating or pending by a
+// process that no longer tracks them.
+func (s *Service) RecoverStaleRuns(ctx context.Context) error {
+	if s.runs == nil {
+		return nil
+	}
+	refs, err := s.runs.StaleRuns(ctx, s.clock.Now().Add(-staleRunAge))
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, ref := range refs {
+		if err := s.RecoverRun(ctx, ref); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// RecoverRun settles one stuck run unless this process is still tracking it.
+// Chat code also calls it when a client resumes a run in state moderating or
+// pending.
+func (s *Service) RecoverRun(ctx context.Context, ref RunRef) error {
+	if s.isTracked(ref.RunID) {
+		return nil
+	}
+	var hit Event
+	err := s.db.WithContext(ctx).Where("run_id = ? AND result = ?", ref.RunID, ResultHit).
+		Order("id DESC").First(&hit).Error
+	switch {
+	case err == nil:
+		b := blockInfo{EventID: hit.PublicID, Direction: hit.Direction, Categories: categoriesFromJSON(hit.CategoriesJSON)}
+		spec := BlockSpec{RunID: ref.RunID, EventID: b.EventID, Direction: b.Direction, Categories: b.Categories}
+		// A block remembered by this process already told the client (or will,
+		// when its retry lands): recovery must not emit a second terminal event.
+		s.trackMu.Lock()
+		_, hadPending := s.pendingBlocks[ref.RunID]
+		already := s.notified[ref.RunID] || hadPending
+		s.trackMu.Unlock()
+		if !s.persistBlock(ctx, spec) {
+			return errors.New("content moderation: block could not be persisted yet")
+		}
+		if !already {
+			s.announceBlock(ctx, ref.RunID, b, "")
+		}
+		return nil
+	case !database.IsNotFound(err):
+		// A storage failure must never turn a possibly known hit into failed-open.
+		return err
+	}
+	s.recordWorkerLost(ctx, ref)
+	if s.runs != nil {
+		if err := s.runs.SetRunState(ctx, ref.RunID, StateFailedOpen, "", ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recordWorkerLost notes that the checks of a run were lost with their process.
+// Only the run id is known to this path, so the event carries no user,
+// conversation or message ids, and no daily statistic is counted.
+func (s *Service) recordWorkerLost(ctx context.Context, ref RunRef) {
+	cfg, cfgErr := s.currentConfig(ctx)
+	now := s.clock.Now()
+	e := &Event{
+		PublicID: newPublicID(), RunID: ref.RunID,
+		Direction: DirectionOutput, Modality: ModalityText, Result: ResultFailedOpen,
+		CategoriesJSON: "[]", CategoryScoresJSON: "{}", ContentLocationJSON: "{}", ImageMetaJSON: "[]",
+		ErrorCode: CodeWorkerLost, ErrorMessage: truncate(publicTextFor(CodeWorkerLost), 255),
+		ContentExpiresAt: now.Add(contentRetention), MetadataExpiresAt: now.Add(metadataRetention),
+	}
+	if cfgErr == nil {
+		e.ModelName, e.PolicyVersion = cfg.Model, cfg.Policy.Version
+	}
+	if err := s.createEvent(ctx, e); err != nil {
+		s.log.Error("content_moderation_event_write_failed", errField(err))
+	}
+}
