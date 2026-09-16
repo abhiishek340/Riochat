@@ -186,3 +186,228 @@ export function priceLabel(price: PlanPrice | undefined, display: Display, local
 }
 
 // ---- payment -------------------------------------------------------------------
+
+export function PaymentDialog({
+  target,
+  onOpenChange,
+  ctx,
+}: {
+  target: PaymentTarget | null;
+  onOpenChange: (open: boolean) => void;
+  ctx: BillingContext;
+}) {
+  const t = useT();
+  const { locale } = useI18n();
+  const errorMessage = useErrorMessage();
+  const { options, selection, setSelection } = useMethods(ctx.config);
+  const [busy, setBusy] = useState(false);
+  const last = useRef<PaymentTarget | null>(null);
+  if (target) last.current = target;
+  const shown = target ?? last.current;
+
+  const go = async () => {
+    if (!target) {
+      toast.error(t("settings.billing.payment.noPlan"));
+      return;
+    }
+    setBusy(true);
+    try {
+      const url = await createCheckout({
+        orderType: "subscription",
+        priceID: target.price.id,
+        cycles: 1,
+        paymentProvider: selection.provider,
+        epayType: selection.provider === "epay" ? selection.epayType : undefined,
+        ...checkoutUrls(checkoutOrigin()),
+      });
+      if (!url) {
+        toast.error(t("settings.billing.payment.checkoutFailed"), { description: t("settings.billing.payment.urlMissing") });
+        return;
+      }
+      openCheckout(url);
+      onOpenChange(false);
+    } catch (e) {
+      toast.error(t("settings.billing.payment.checkoutFailed"), { description: errorMessage(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const kindKey = shown?.kind === "renew" ? "renew" : shown?.kind === "upgrade" ? "upgrade" : "default";
+  const impact = shown?.kind === "renew" ? (shown.protectedHigher ? "renewAfterHigher" : "renew") : shown?.kind === "upgrade" ? "upgrade" : "";
+  const usd = shown ? shown.price.amountCents / 100 : 0;
+
+  return (
+    <Dialog open={target !== null} onOpenChange={(next) => (busy ? undefined : onOpenChange(next))}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t(`settings.billing.payment.titles.${kindKey}`)}</DialogTitle>
+          <DialogDescription>
+            {impact ? t(`settings.billing.payment.impact.${impact}`) : t("settings.billing.payment.description")}
+          </DialogDescription>
+        </DialogHeader>
+        {shown ? (
+          <p className="rounded-lg bg-muted px-3 py-2 text-sm font-medium">
+            {shown.plan.name || shown.plan.code} / {priceLabel(shown.price, ctx.display, locale, t)}
+          </p>
+        ) : null}
+        <MethodPicker options={options} selection={selection} onSelect={setSelection} usd={usd} display={ctx.display} disabled={busy} locale={locale} />
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+            {t("common.actions.cancel")}
+          </Button>
+          <Button loading={busy} disabled={options.length === 0} onClick={() => void go()}>
+            {t("common.actions.continue")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ---- top-up --------------------------------------------------------------------
+
+export function TopupDialog({ open, onOpenChange, ctx }: { open: boolean; onOpenChange: (open: boolean) => void; ctx: BillingContext }) {
+  const t = useT();
+  const { locale } = useI18n();
+  const errorMessage = useErrorMessage();
+  const { options, selection, setSelection } = useMethods(ctx.config);
+  const [text, setText] = useState("20");
+  const [busy, setBusy] = useState(false);
+  const disabled = ctx.loading || busy || !paymentEnabled(ctx.config);
+
+  useEffect(() => {
+    if (open) setText("20");
+  }, [open]);
+
+  const amount = parseAmount(text);
+  const usd = amount !== null && amount > 0 ? fromDisplay(amount, ctx.display) : 0;
+  const symbol = currencySymbol(ctx.display.currency);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!isValidTopup(amount)) {
+      toast.error(t("settings.billing.topup.invalid"));
+      return;
+    }
+    setBusy(true);
+    try {
+      const url = await createCheckout({
+        orderType: "topup",
+        amountMinorUnits: minorUnits(amount),
+        cycles: 1,
+        paymentProvider: selection.provider,
+        epayType: selection.provider === "epay" ? selection.epayType : undefined,
+        ...checkoutUrls(checkoutOrigin()),
+      });
+      if (!url) {
+        toast.error(t("settings.billing.payment.checkoutFailed"), { description: t("settings.billing.payment.urlMissing") });
+        return;
+      }
+      openCheckout(url);
+      onOpenChange(false);
+    } catch (err) {
+      toast.error(t("settings.billing.payment.checkoutFailed"), { description: errorMessage(err) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => (busy ? undefined : onOpenChange(next))}>
+      <DialogContent>
+        <form noValidate onSubmit={(e) => void submit(e)} className="grid gap-4">
+          <DialogHeader>
+            <DialogTitle>{t("settings.billing.topup.title")}</DialogTitle>
+            <DialogDescription>{t("settings.billing.topup.description")}</DialogDescription>
+          </DialogHeader>
+          <Field>
+            <FieldLabel>{t("settings.billing.topup.amount")}</FieldLabel>
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">{symbol.trim()}</span>
+              <Input type="number" inputMode="decimal" min={0} step={0.01} value={text} disabled={disabled} onChange={(e) => setText(e.target.value)} />
+            </div>
+            <p className="text-[13px] text-muted-foreground">
+              {t("settings.billing.topup.balance", { balance: formatMoney(ctx.overview?.balanceUSD ?? 0, ctx.display, locale) })}
+            </p>
+          </Field>
+          <MethodPicker options={options} selection={selection} onSelect={setSelection} usd={usd} display={ctx.display} disabled={disabled} locale={locale} />
+          <DialogFooter>
+            <Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+              {t("common.actions.cancel")}
+            </Button>
+            <Button type="submit" loading={busy} disabled={disabled || options.length === 0}>
+              {t("common.actions.continue")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ---- redemption ----------------------------------------------------------------
+
+export function RedeemDialog({
+  open,
+  onOpenChange,
+  onRedeemed,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onRedeemed: (overview: Overview) => void;
+}) {
+  const t = useT();
+  const errorMessage = useErrorMessage();
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!open) setCode("");
+  }, [open]);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    const value = code.trim();
+    if (!value) {
+      toast.error(t("settings.billing.redeem.invalid"));
+      return;
+    }
+    setBusy(true);
+    try {
+      onRedeemed(await redeemCode(value));
+      setCode("");
+      onOpenChange(false);
+      toast.success(t("settings.billing.redeem.succeeded"));
+    } catch (err) {
+      toast.error(t("settings.billing.redeem.failed"), { description: errorMessage(err) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => (busy ? undefined : onOpenChange(next))}>
+      <DialogContent>
+        <form onSubmit={(e) => void submit(e)} className="grid gap-4">
+          <DialogHeader>
+            <DialogTitle>{t("settings.billing.redeem.title")}</DialogTitle>
+            <DialogDescription>{t("settings.billing.redeem.description")}</DialogDescription>
+          </DialogHeader>
+          <Field>
+            <FieldLabel>{t("settings.billing.redeem.code")}</FieldLabel>
+            <Input value={code} className="font-mono" autoComplete="off" spellCheck={false} disabled={busy} onChange={(e) => setCode(e.target.value)} />
+          </Field>
+          <DialogFooter>
+            <Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+              {t("common.actions.cancel")}
+            </Button>
+            <Button type="submit" loading={busy}>
+              {t("settings.billing.redeem.submit")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
