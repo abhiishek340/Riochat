@@ -266,3 +266,326 @@ func wholeInt(f *float64) *int {
 func invalidConfig(reason string) error {
 	return ErrInvalidConfig.WithCause(errors.New(reason))
 }
+
+// UpdateConfig merges the request into the stored configuration, validates the
+// result and saves it atomically.
+func (s *Service) UpdateConfig(ctx context.Context, actor Actor, req UpdateRequest) (*ConfigView, error) {
+	if err := actor.requireSuper(); err != nil {
+		return nil, err
+	}
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	cur, err := s.store.read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	next := cur
+
+	if req.BaseURL != nil {
+		v := strings.TrimSpace(*req.BaseURL)
+		if v == "" {
+			v = DefaultBaseURL
+		}
+		if err := ValidateBaseURL(v); err != nil {
+			return nil, invalidConfig("base url")
+		}
+		next.BaseURL = v
+	}
+	switch {
+	case req.ClearAPIKey != nil && *req.ClearAPIKey:
+		next.APIKey = ""
+	case req.APIKey != nil:
+		next.APIKey = strings.TrimSpace(*req.APIKey)
+	}
+	if req.Model != nil {
+		v := strings.TrimSpace(*req.Model)
+		if v == "" {
+			return nil, invalidConfig("model is empty")
+		}
+		next.Model = v
+	}
+	if req.TimeoutSeconds != nil {
+		if v := *req.TimeoutSeconds; v < 1 || v > maxTimeoutSeconds {
+			return nil, invalidConfig("timeoutSeconds out of range")
+		}
+		next.TimeoutSeconds = *req.TimeoutSeconds
+	}
+	if req.MaxConcurrency != nil {
+		if v := *req.MaxConcurrency; v < 1 || v > maxMaxConcurrency {
+			return nil, invalidConfig("maxConcurrency out of range")
+		}
+		next.MaxConcurrency = *req.MaxConcurrency
+	}
+	if req.QueueCapacity != nil {
+		if v := *req.QueueCapacity; v < 1 || v > maxQueueCapacity {
+			return nil, invalidConfig("queueCapacity out of range")
+		}
+		next.QueueCapacity = *req.QueueCapacity
+	}
+	if req.Policy != nil {
+		p, err := Policy{
+			InputTextCategories:   req.Policy.InputTextCategories,
+			OutputTextCategories:  req.Policy.OutputTextCategories,
+			InputImageCategories:  req.Policy.InputImageCategories,
+			OutputImageCategories: req.Policy.OutputImageCategories,
+		}.normalize()
+		if err != nil {
+			return nil, invalidConfig(err.Error())
+		}
+		p.Version = cur.Policy.Version
+		if !p.sameCategories(cur.Policy) {
+			p.Version++
+		}
+		next.Policy = p.nonNil()
+	}
+	if req.Enabled != nil {
+		next.Enabled = *req.Enabled
+	}
+
+	if next.Enabled {
+		if err := ValidateBaseURL(next.BaseURL); err != nil {
+			return nil, invalidConfig("base url")
+		}
+		if !next.Policy.AnySelected() || strings.TrimSpace(next.BaseURL) == "" ||
+			strings.TrimSpace(next.Model) == "" || next.APIKey == "" {
+			return nil, ErrConfigRequired
+		}
+	}
+
+	if err := s.store.write(ctx, next); err != nil {
+		return nil, err
+	}
+	s.exec.resize(next.MaxConcurrency, next.QueueCapacity)
+	v := viewOf(next)
+	return &v, nil
+}
+
+// currentConfig is the runtime view of the configuration (cached briefly).
+func (s *Service) currentConfig(ctx context.Context) (Config, error) { return s.store.get(ctx) }
+
+// ---- probe ------------------------------------------------------------------
+
+// ProbeTarget is the outcome of probing one modality.
+type ProbeTarget struct {
+	Valid     bool   `json:"valid"`
+	Model     string `json:"model,omitempty"`
+	LatencyMS int64  `json:"latencyMS"`
+	Error     string `json:"error,omitempty"`
+}
+
+// ProbeResult is the data of POST /probe.
+type ProbeResult struct {
+	Text  ProbeTarget `json:"text"`
+	Image ProbeTarget `json:"image"`
+}
+
+// probePNG is a 1x1 transparent PNG.
+const probePNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEklEQVR4nAAFAPr/AgAAAAADAAAPAANCp/UOAAAAAElFTkSuQmCC"
+
+const probeImageError = "moderation response missing image category_applied_input_types"
+
+// Probe checks the saved configuration against the provider with one text and
+// one image request. Provider failures are reported per target, not as errors.
+func (s *Service) Probe(ctx context.Context, actor Actor) (*ProbeResult, error) {
+	if err := actor.requireSuper(); err != nil {
+		return nil, err
+	}
+	if s.provider == nil {
+		return nil, errors.New("content moderation: no provider available")
+	}
+	cfg, err := s.store.read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cc := cfg.clientConfig()
+	res := &ProbeResult{}
+
+	start := s.clock.Now()
+	resp, perr := s.provider.CheckText(ctx, cc, "hello", Scope{Direction: DirectionInput, Modality: ModalityText})
+	res.Text = probeOutcome(resp, perr, cfg.Model, s.clock.Now().Sub(start), false)
+
+	pngBytes, _ := base64.StdEncoding.DecodeString(probePNG)
+	start = s.clock.Now()
+	resp, perr = s.provider.CheckImages(ctx, cc, []Image{{Data: pngBytes, MIME: "image/png"}},
+		Scope{Direction: DirectionInput, Modality: ModalityImage})
+	res.Image = probeOutcome(resp, perr, cfg.Model, s.clock.Now().Sub(start), true)
+	return res, nil
+}
+
+func probeOutcome(resp *Response, err error, configured string, took time.Duration, needImage bool) ProbeTarget {
+	t := ProbeTarget{LatencyMS: took.Milliseconds()}
+	if err != nil {
+		t.Error = probeErrorText(err)
+		return t
+	}
+	valid := false
+	imageDeclared := false
+	if resp != nil {
+		for _, r := range resp.Results {
+			if r.Categories != nil {
+				valid = true
+			}
+			for _, types := range r.AppliedInputTypes {
+				for _, ty := range types {
+					if strings.EqualFold(strings.TrimSpace(ty), ModalityImage) {
+						imageDeclared = true
+					}
+				}
+			}
+		}
+	}
+	if !valid {
+		t.Error = publicErrorText[CodeInvalidResponse]
+		return t
+	}
+	if needImage && !imageDeclared {
+		t.Error = probeImageError
+		return t
+	}
+	t.Valid = true
+	t.Model = resp.Model
+	if t.Model == "" {
+		t.Model = configured
+	}
+	return t
+}
+
+func probeErrorText(err error) string {
+	var pe *ProviderError
+	switch {
+	case errors.As(err, &pe):
+		return pe.Error()
+	case errors.Is(err, context.DeadlineExceeded):
+		return publicErrorText[CodeTimeout]
+	}
+	return "content moderation probe failed"
+}
+
+// ---- statistics ---------------------------------------------------------------
+
+// Stats returns the daily aggregates in range. Nil bounds use the defaults.
+func (s *Service) Stats(ctx context.Context, actor Actor, from, to *time.Time) ([]StatItem, error) {
+	if !actor.isAdmin() {
+		return nil, ErrAdminRequired
+	}
+	start, end, ok := statsWindow(s.clock.Now(), from, to)
+	if !ok {
+		return nil, ErrInvalidQuery
+	}
+	return s.listStats(ctx, start, end)
+}
+
+// ---- events -----------------------------------------------------------------
+
+// ListEvents pages through recorded events.
+func (s *Service) ListEvents(ctx context.Context, actor Actor, f EventFilter, page, pageSize int) (*EventPage, error) {
+	if err := actor.requireSuper(); err != nil {
+		return nil, err
+	}
+	res, err := s.listEvents(ctx, f, page, pageSize)
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// GetEvent returns the detail of one event and audits the view.
+func (s *Service) GetEvent(ctx context.Context, actor Actor, info AuditInfo, publicID string) (*EventDetail, error) {
+	if err := actor.requireSuper(); err != nil {
+		return nil, err
+	}
+	e, err := s.eventByPublicID(ctx, publicID)
+	if err != nil {
+		return nil, err
+	}
+	d := s.buildDetail(ctx, e)
+	s.recordAudit(ctx, actor, info, AuditActionEventView, e.PublicID, map[string]any{"retainedTextAvailable": d.TextAvailable})
+	return &d, nil
+}
+
+// EventImage returns the decrypted bytes of an isolated image and audits the
+// read.
+func (s *Service) EventImage(ctx context.Context, actor Actor, info AuditInfo, publicID string, index int) (data []byte, mime string, err error) {
+	if err := actor.requireSuper(); err != nil {
+		return nil, "", err
+	}
+	e, err := s.eventByPublicID(ctx, publicID)
+	if err != nil {
+		return nil, "", err
+	}
+	if !s.contentRetained(e) || s.objects == nil {
+		return nil, "", ErrEventNotFound
+	}
+	var meta *imageMeta
+	for _, m := range imagesFromJSON(e.ImageMetaJSON) {
+		if m.Index == index {
+			m := m
+			meta = &m
+			break
+		}
+	}
+	if meta == nil {
+		return nil, "", ErrEventNotFound
+	}
+	payload, err := s.objects.Get(ctx, meta.StoragePath)
+	if err != nil {
+		return nil, "", err
+	}
+	plain, _, err := s.secrets.DecryptBound(string(payload), imageBinding(e.PublicID, meta.Index))
+	if err != nil {
+		return nil, "", err
+	}
+	data, err = base64.StdEncoding.DecodeString(plain)
+	if err != nil {
+		return nil, "", err
+	}
+	mime = meta.MIMEType
+	if mime == "" {
+		mime = "image/png"
+	}
+	s.recordAudit(ctx, actor, info, AuditActionEventImageView, e.PublicID, map[string]any{"imageIndex": index})
+	return data, mime, nil
+}
+
+func (s *Service) recordAudit(ctx context.Context, actor Actor, info AuditInfo, action, resourceID string, detail map[string]any) {
+	if s.audit == nil {
+		return
+	}
+	err := s.audit.Record(ctx, AuditEntry{
+		ActorID: actor.UserID, RequestID: info.RequestID, ClientIP: info.ClientIP, UserAgent: info.UserAgent,
+		Action: action, ResourceType: AuditResourceEvent, ResourceID: resourceID, Detail: detail,
+	})
+	if err != nil {
+		s.log.Warn("content_moderation_audit_failed", logx.F("action", action), errField(err))
+	}
+}
+
+// ReencryptSecrets moves the stored API key and the retained flagged texts to
+// the active encryption key. Isolated images are not re-encrypted: they expire
+// on their own and need the previous key until then.
+func (s *Service) ReencryptSecrets(ctx context.Context) (changed int, err error) {
+	if ok, err := s.store.reencrypt(ctx); err != nil {
+		return changed, err
+	} else if ok {
+		changed++
+	}
+	var rows []Event
+	if err := s.db.WithContext(ctx).Where("encrypted_text <> ''").Find(&rows).Error; err != nil {
+		return changed, err
+	}
+	for _, e := range rows {
+		next, did, err := s.secrets.ReencryptBound(e.EncryptedText, textBinding(e.PublicID))
+		if err != nil {
+			return changed, err
+		}
+		if !did {
+			continue
+		}
+		if err := s.db.WithContext(ctx).Model(&Event{}).Where("id = ?", e.ID).Update("encrypted_text", next).Error; err != nil {
+			return changed, err
+		}
+		changed++
+	}
+	return changed, nil
+}
