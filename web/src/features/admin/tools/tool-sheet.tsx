@@ -228,3 +228,160 @@ export function ToolSheet({ server, onClose, onServerChange, onSync }: { server:
     </Sheet>
   );
 }
+
+function SchemaDialog({ tool, onClose }: { tool: McpTool | null; onClose: () => void }) {
+  const t = useT();
+  const shown = useSnapshot(tool);
+  return (
+    <Dialog open={tool !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{t("adminTools.tools.schemaTitle", { name: shown ? toolLabel(shown) : "" })}</DialogTitle>
+        </DialogHeader>
+        <JsonView text={shown?.inputSchemaJSON || "{}"} maxHeight="max-h-[60vh]" />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function draftOfTool(tool: McpTool): { displayName: string; description: string; attachment: AttachmentDraft; encoding: string } {
+  return {
+    displayName: tool.displayName,
+    description: tool.description,
+    attachment: {
+      mode: tool.attachmentInputMode === "image" ? "image" : "none",
+      imageArgument: tool.attachmentArgument,
+      promptEnabled: tool.attachmentPromptArgument !== "",
+      promptArgument: tool.attachmentPromptArgument,
+    },
+    encoding: tool.attachmentEncoding === "data_url" ? "data_url" : "base64",
+  };
+}
+
+/** The body of a tool save: attachment settings travel only for image mode. */
+export function toolPatchOf(tool: McpTool, draft: ReturnType<typeof draftOfTool>): ToolPatch {
+  const patch: ToolPatch = { displayName: draft.displayName.trim(), description: draft.description.trim() };
+  if (draft.attachment.mode === "image") {
+    patch.attachmentInputMode = "image";
+    patch.attachmentArgument = draft.attachment.imageArgument;
+    patch.attachmentEncoding = draft.encoding;
+    patch.attachmentPromptArgument = draft.attachment.promptEnabled ? draft.attachment.promptArgument : "";
+  } else {
+    patch.attachmentInputMode = "none";
+  }
+  void tool;
+  return patch;
+}
+
+function ToolEditDialog({ tool, onClose, onSaved }: { tool: McpTool | null; onClose: () => void; onSaved: (tool: McpTool) => void }) {
+  const t = useT();
+  const message = useErrorMessage();
+  const shown = useSnapshot(tool);
+  const [draft, setDraft] = useState<ReturnType<typeof draftOfTool> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (tool) {
+      setDraft(draftOfTool(tool));
+      setError(null);
+    }
+  }, [tool]);
+
+  const args = useMemo(() => stringArguments(shown?.inputSchemaJSON), [shown?.inputSchemaJSON]);
+  if (!shown || !draft) return <Dialog open={false} onOpenChange={() => undefined} />;
+
+  const problem = attachmentProblem(shown.inputSchemaJSON, draft.attachment);
+  const set = (patch: Partial<AttachmentDraft>) => setDraft((d) => (d ? { ...d, attachment: { ...d.attachment, ...patch } } : d));
+  const argOptions = [{ value: "", label: t("adminTools.edit.choose") }, ...args.map((a) => ({ value: a.name, label: a.required ? `${a.name} (${t("adminTools.edit.required")})` : a.name }))];
+
+  const save = async () => {
+    if (busy || problem) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const saved = await patchTool(shown.id, toolPatchOf(shown, draft));
+      onSaved(saved);
+      onClose();
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={tool !== null} onOpenChange={(open) => !busy && !open && onClose()}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{t("adminTools.edit.title", { name: toolLabel(shown) })}</DialogTitle>
+          <DialogDescription>{t("adminTools.edit.priceNote")}</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <Field>
+            <FieldLabel>{t("adminTools.edit.displayName")}</FieldLabel>
+            <Input value={draft.displayName} placeholder={shown.name} onChange={(e) => setDraft({ ...draft, displayName: e.target.value })} />
+            <FieldHint>{t("adminTools.edit.displayNameHint")}</FieldHint>
+          </Field>
+          <Field>
+            <FieldLabel>{t("adminTools.edit.description")}</FieldLabel>
+            <Textarea rows={3} value={draft.description} onChange={(e) => setDraft({ ...draft, description: e.target.value })} />
+          </Field>
+          <div className="space-y-3 rounded-lg border p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium">{t("adminTools.edit.attachmentTitle")}</div>
+                <p className="text-[13px] text-muted-foreground">{t("adminTools.edit.attachmentHint")}</p>
+              </div>
+              <Switch checked={draft.attachment.mode === "image"} onCheckedChange={(on) => set({ mode: on ? "image" : "none" })} aria-label={t("adminTools.edit.attachmentTitle")} />
+            </div>
+            {draft.attachment.mode === "image" ? (
+              args.length === 0 ? (
+                <p className="text-[13px] text-destructive">{t("adminTools.edit.noStringArguments")}</p>
+              ) : (
+                <div className="grid gap-3">
+                  <Field invalid={problem === "imageArgument"}>
+                    <FieldLabel>{t("adminTools.edit.imageArgument")}</FieldLabel>
+                    <OptionSelect value={draft.attachment.imageArgument} onChange={(v) => set({ imageArgument: v })} options={argOptions} className="w-full" />
+                  </Field>
+                  <Field>
+                    <FieldLabel>{t("adminTools.edit.encoding")}</FieldLabel>
+                    <OptionSelect
+                      value={draft.encoding}
+                      onChange={(v) => setDraft({ ...draft, encoding: v })}
+                      options={[
+                        { value: "base64", label: t("adminTools.edit.base64") },
+                        { value: "data_url", label: t("adminTools.edit.dataUrl") },
+                      ]}
+                      className="w-full"
+                    />
+                  </Field>
+                  <label className="flex items-center gap-3 text-sm">
+                    <Switch checked={draft.attachment.promptEnabled} onCheckedChange={(on) => set({ promptEnabled: on, promptArgument: on ? draft.attachment.promptArgument : "" })} />
+                    {t("adminTools.edit.passPrompt")}
+                  </label>
+                  {draft.attachment.promptEnabled ? (
+                    <Field invalid={problem === "promptArgument" || problem === "promptSame"}>
+                      <FieldLabel>{t("adminTools.edit.promptArgument")}</FieldLabel>
+                      <OptionSelect value={draft.attachment.promptArgument} onChange={(v) => set({ promptArgument: v })} options={argOptions} className="w-full" />
+                    </Field>
+                  ) : null}
+                  <FieldError>{problem ? t(`adminTools.edit.problems.${problem}`) : null}</FieldError>
+                </div>
+              )
+            ) : null}
+          </div>
+          <FieldError>{error}</FieldError>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={onClose}>
+            {t("common.actions.cancel")}
+          </Button>
+          <Button loading={busy} disabled={problem !== null} onClick={save}>
+            {t("common.actions.save")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
