@@ -131,3 +131,140 @@ pub fn reset_tmp(layout: &Layout) -> std::io::Result<()> {
 pub fn portable_identifier(base: &str, instance_id: &str) -> String {
     format!("{base}.portable-{instance_id}")
 }
+
+pub const WRITE_ERROR_MESSAGE: &str = "Riochat Portable is unable to save files into its data folder.\n\
+Please relocate the Riochat folder to a location you can write to (avoid read-only drives and protected directories), then launch it again. \
+Your data will never be saved in any other place.";
+
+pub const WEBVIEW2_DOWNLOAD_URL: &str = "https://developer.microsoft.com/microsoft-edge/webview2/";
+
+pub fn webview2_missing_message(bundled: bool) -> String {
+    let en = if bundled {
+        "The WebView2 runtime bundled in this portable copy failed to load. The offline package could be damaged or incomplete, so please download it once more."
+    } else {
+        "Riochat relies on the Microsoft Edge WebView2 runtime, and it could not be found on this computer."
+    };
+    format!("{en}\n\nOpen the download page?\n({WEBVIEW2_DOWNLOAD_URL})")
+}
+
+/// Security identifiers of the two AppContainer groups that need read and
+/// execute rights on an extracted Fixed Version runtime: ALL APPLICATION
+/// PACKAGES and ALL RESTRICTED APPLICATION PACKAGES.
+pub const APPCONTAINER_SIDS: [&str; 2] = ["*S-1-15-2-1", "*S-1-15-2-2"];
+const ACL_STAMP: &str = ".riochat-acl-granted";
+
+/// Grants the AppContainer groups access to a Fixed Version runtime folder,
+/// once per extracted folder (tracked by a stamp file inside it).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn grant_runtime_access(runtime_dir: &Path) -> std::io::Result<()> {
+    let stamp = runtime_dir.join(ACL_STAMP);
+    if stamp.exists() {
+        return Ok(());
+    }
+    for sid in APPCONTAINER_SIDS {
+        let status = std::process::Command::new("icacls")
+            .arg(runtime_dir)
+            .arg("/grant")
+            .arg(format!("{sid}:(OI)(CI)(RX)"))
+            .args(["/T", "/C", "/Q"])
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!("icacls failed with {status}")));
+        }
+    }
+    std::fs::write(&stamp, b"granted\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_validity() {
+        assert!(is_valid_instance_id("0123456789abcdef"));
+        for bad in [
+            "",
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "../etc/passwd....",
+            "0123456789abcdeg",
+        ] {
+            assert!(!is_valid_instance_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn repeated_creation_is_stable() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("data").join("instance-id");
+        let a = instance_id(&f).unwrap();
+        let b = instance_id(&f).unwrap();
+        assert_eq!(a, b);
+        assert!(is_valid_instance_id(&a));
+    }
+
+    #[test]
+    fn copied_file_keeps_id_and_separate_folders_differ() {
+        let d = tempfile::tempdir().unwrap();
+        let f1 = d.path().join("a").join("instance-id");
+        let f2 = d.path().join("b").join("instance-id");
+        let id1 = instance_id(&f1).unwrap();
+        std::fs::create_dir_all(f2.parent().unwrap()).unwrap();
+        std::fs::copy(&f1, &f2).unwrap();
+        assert_eq!(instance_id(&f2).unwrap(), id1);
+        let f3 = d.path().join("c").join("instance-id");
+        assert_ne!(instance_id(&f3).unwrap(), id1);
+    }
+
+    #[test]
+    fn stored_ids_are_trimmed_and_lowercased_invalid_replaced() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("instance-id");
+        std::fs::write(&f, "  0123456789ABCDEF \r\n").unwrap();
+        assert_eq!(instance_id(&f).unwrap(), "0123456789abcdef");
+        for bad in ["", "garbage", "../../x", "0123", "zzzzzzzzzzzzzzzz"] {
+            std::fs::write(&f, bad).unwrap();
+            let id = instance_id(&f).unwrap();
+            assert!(is_valid_instance_id(&id), "{bad:?} -> {id}");
+            assert_eq!(std::fs::read_to_string(&f).unwrap().trim(), id);
+        }
+    }
+
+    #[test]
+    fn prepare_leaves_no_probe_and_fails_when_unwritable() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        prepare_data_folder(&layout).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&layout.data).unwrap().collect();
+        assert!(leftovers.is_empty());
+
+        // a regular file where the folder should be cannot be written into
+        let blocked = tempfile::tempdir().unwrap();
+        std::fs::write(blocked.path().join(DATA_DIR), b"x").unwrap();
+        let err = prepare_data_folder(&Layout::new(blocked.path())).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn tmp_is_emptied() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        std::fs::create_dir_all(layout.tmp()).unwrap();
+        std::fs::write(layout.tmp().join("old"), b"1").unwrap();
+        reset_tmp(&layout).unwrap();
+        assert!(layout.tmp().is_dir());
+        assert_eq!(std::fs::read_dir(layout.tmp()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn identity_and_messages() {
+        assert_eq!(
+            portable_identifier("com.riochat.desktop", "0123456789abcdef"),
+            "com.riochat.desktop.portable-0123456789abcdef"
+        );
+        assert!(webview2_missing_message(true).contains("bundled"));
+        assert!(webview2_missing_message(false).contains(WEBVIEW2_DOWNLOAD_URL));
+        assert!(WRITE_ERROR_MESSAGE.contains("Riochat Portable"));
+    }
+}
