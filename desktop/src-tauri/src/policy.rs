@@ -211,3 +211,194 @@ fn read_hive(root: winreg::HKEY) -> RawHive {
         proxy_bypass: text("ProxyBypassList"),
     }
 }
+
+/// Loads the effective policy. Other platforms always use the defaults.
+pub fn load() -> Policy {
+    #[cfg(windows)]
+    {
+        use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+        let policy = Policy::resolve(&read_hive(HKEY_LOCAL_MACHINE), &read_hive(HKEY_CURRENT_USER));
+        if policy.is_active() {
+            log::info!("enterprise policy is active: {:?}", policy.info());
+        }
+        policy
+    }
+    #[cfg(not(windows))]
+    {
+        Policy::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hive() -> RawHive {
+        RawHive::default()
+    }
+
+    #[test]
+    fn default_policy_info_has_exactly_five_fields() {
+        let v = serde_json::to_value(Policy::default().info()).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 5);
+        assert!(v["defaultServerUrl"].is_null());
+        assert_eq!(v["serverUrlLocked"], false);
+        assert_eq!(v["localModeAllowed"], true);
+        assert_eq!(v["autoUpdateDisabledByPolicy"], false);
+        assert_eq!(v["proxyManagedByPolicy"], false);
+    }
+
+    #[test]
+    fn locked_default_is_normalized_and_enforced() {
+        let user = RawHive {
+            default_server_url: Some("  HTTPS://Chat.Corp:443/ ".into()),
+            lock_server_url: Some(true),
+            ..hive()
+        };
+        let p = Policy::resolve(&hive(), &user);
+        assert_eq!(p.default_server_url.as_deref(), Some("https://chat.corp"));
+        assert!(p.server_url_locked);
+        assert!(!p.local_mode_allowed());
+        assert!(p.check_remote("https://chat.corp").is_ok());
+        for other in ["https://other.corp", "http://chat.corp", "https://chat.corp:8443"] {
+            let e = p.check_remote(other).unwrap_err();
+            assert_eq!(e.message, "policy: server address is locked by your administrator");
+        }
+        assert_eq!(
+            p.check_local().unwrap_err().message,
+            "policy: server address is locked by your administrator"
+        );
+    }
+
+    #[test]
+    fn lock_without_valid_default_is_ignored() {
+        let p = Policy::resolve(
+            &hive(),
+            &RawHive {
+                lock_server_url: Some(true),
+                default_server_url: Some("not a url".into()),
+                ..hive()
+            },
+        );
+        assert!(!p.server_url_locked);
+        assert!(p.check_remote("https://anything.example").is_ok());
+        assert!(p.local_mode_allowed());
+    }
+
+    #[test]
+    fn default_without_lock_restricts_nothing() {
+        let p = Policy::resolve(
+            &hive(),
+            &RawHive {
+                default_server_url: Some("https://a.b".into()),
+                ..hive()
+            },
+        );
+        assert_eq!(p.default_server_url.as_deref(), Some("https://a.b"));
+        assert!(p.check_remote("https://x.y").is_ok());
+        assert!(p.check_local().is_ok());
+    }
+
+    #[test]
+    fn disabling_local_mode_alone() {
+        let p = Policy::resolve(
+            &RawHive {
+                disable_local_mode: Some(true),
+                ..hive()
+            },
+            &hive(),
+        );
+        assert_eq!(
+            p.check_local().unwrap_err().message,
+            "policy: local mode is disabled by your administrator"
+        );
+        assert!(p.check_remote("https://x.y").is_ok());
+        assert!(!p.info().local_mode_allowed);
+    }
+
+    #[test]
+    fn machine_hive_beats_user_hive_even_for_false() {
+        let machine = RawHive {
+            disable_auto_update: Some(false),
+            disable_local_mode: Some(false),
+            ..hive()
+        };
+        let user = RawHive {
+            disable_auto_update: Some(true),
+            disable_local_mode: Some(true),
+            ..hive()
+        };
+        let p = Policy::resolve(&machine, &user);
+        assert!(!p.auto_update_disabled);
+        assert!(!p.local_mode_disabled);
+        let p = Policy::resolve(&hive(), &user);
+        assert!(p.auto_update_disabled);
+        assert_eq!(
+            p.check_update().unwrap_err().message,
+            "policy: update checks are disabled by your administrator"
+        );
+    }
+
+    #[test]
+    fn machine_proxy_mode_decides_the_whole_group() {
+        let machine = RawHive {
+            proxy_mode: Some("Direct".into()),
+            ..hive()
+        };
+        let user = RawHive {
+            proxy_mode: Some("fixed_servers".into()),
+            proxy_server: Some("p:1".into()),
+            ..hive()
+        };
+        assert_eq!(Policy::resolve(&machine, &user).proxy, ProxyPolicy::Direct);
+        // unusable machine mode is not replaced by the user's
+        let bad_machine = RawHive {
+            proxy_mode: Some("pac_script".into()),
+            ..hive()
+        };
+        assert_eq!(Policy::resolve(&bad_machine, &user).proxy, ProxyPolicy::None);
+    }
+
+    #[test]
+    fn user_proxy_falls_back_to_machine_server_and_bypass() {
+        let machine = RawHive {
+            proxy_server: Some("proxy.corp:3128".into()),
+            proxy_bypass: Some("10.*;.corp".into()),
+            ..hive()
+        };
+        let user = RawHive {
+            proxy_mode: Some("FIXED_SERVERS".into()),
+            ..hive()
+        };
+        match Policy::resolve(&machine, &user).proxy {
+            ProxyPolicy::Fixed { endpoint, bypass } => {
+                assert_eq!(endpoint.address(), "http://proxy.corp:3128");
+                assert!(bypass.starts_with("10.0.0.0/8,.corp"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unusable_fixed_server_means_no_policy() {
+        for server in [None, Some("https://p:1"), Some("u:p@x:1"), Some("")] {
+            let user = RawHive {
+                proxy_mode: Some("fixed_servers".into()),
+                proxy_server: server.map(|s| s.to_string()),
+                ..hive()
+            };
+            assert_eq!(Policy::resolve(&hive(), &user).proxy, ProxyPolicy::None, "{server:?}");
+        }
+        let p = Policy::resolve(
+            &hive(),
+            &RawHive {
+                proxy_mode: Some("system".into()),
+                ..hive()
+            },
+        );
+        assert_eq!(p.proxy, ProxyPolicy::System);
+        assert!(p.proxy_managed());
+        assert!(p.proxy_edit_error().is_some());
+    }
+}
