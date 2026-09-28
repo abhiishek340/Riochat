@@ -1,0 +1,69 @@
+# Keep the image build context small and free of anything private. The build
+# needs only VERSION, NOTICE, the root workspace manifests, web/ and backend/.
+
+# version control
+.git
+.gitignore
+.gitattributes
+.github
+
+# dependencies
+**/node_modules
+.pnpm-store
+
+# build outputs and tool caches
+**/.next
+**/out
+**/dist
+**/build
+**/coverage
+.cache
+**/.turbo
+**/.eslintcache
+**/*.tsbuildinfo
+**/next-env.d.ts
+
+# logs and incremental info
+**/*.log
+
+# python bytecode and virtual environments
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/venv
+**/.ruff_cache
+
+# editor and OS files
+**/.DS_Store
+**/Thumbs.db
+.idea
+.vscode
+**/*.swp
+
+# the desktop shell and its Rust build output are not part of the server image
+desktop
+
+# configuration and secrets must never enter a build context
+config.yaml
+config.yml
+backend/config.yaml
+backend/config.yml
+**/.env
+**/.env.*
+deploy
+
+# local data
+.local
+backend/data
+backend/storage
+data
+storage
+tmp
+.tmp
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# docs and compose files are not needed to build
+docs
+*.md
