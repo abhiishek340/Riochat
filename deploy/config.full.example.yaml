@@ -1,0 +1,100 @@
+# Riochat backend configuration: full container profile.
+# App + PostgreSQL + Redis, all started by docker-compose.full.yml.
+#
+# Use:   cp deploy/config.full.example.yaml deploy/config.yaml
+#        docker compose -f deploy/docker-compose.full.yml up -d
+#
+# Precedence: environment variables > this file > built-in defaults. The Compose
+# file overrides database.postgres.dsn and database.redis.{addr,username,password}
+# through POSTGRES_DSN, REDIS_ADDR, REDIS_USERNAME and REDIS_PASSWORD, so the
+# values below are only fallbacks that document the shape.
+#
+# The bundled datastore passwords and the secrets below are DEMO values for
+# local use only. Replace them (and set app.env to prod) before anything but
+# your own machine can reach this deployment.
+
+app:
+  name: Riochat
+  env: dev                   # dev | prod
+
+server:
+  http_port: "8080"          # if you change it, change the Compose port mapping too
+  cors_allow_origin: "http://127.0.0.1:8080,http://localhost:8080,tauri://localhost,http://tauri.localhost"
+  trusted_proxies: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7"
+  public_api_base_url: ""
+  public_web_base_url: ""
+  frontend_dist_dir: /app/frontend/out
+  read_header_timeout_seconds: 10
+  read_timeout_seconds: 120
+  idle_timeout_seconds: 120
+  max_header_bytes: 1048576
+  shutdown_timeout_seconds: 10
+
+security:
+  jwt_secret: riochat-dev-jwt-secret-do-not-use-in-production
+  data_encryption_key: riochat-dev-data-encryption-key-do-not-use-in-production
+  data_encryption_keys_previous: []
+  mcp_user_context_secret: ""
+  ssrf_protection_enabled: false
+  ssrf_allowed_hosts: ""
+  ssrf_allowed_cidrs: ""
+  turnstile_siteverify_url: https://challenges.cloudflare.com/turnstile/v0/siteverify
+
+branding:
+  title: Riochat
+  short_name: Riochat
+  description: Riochat is a multi-model AI conversation system.
+  logo_url: ""
+  favicon_url: /favicon.ico
+  pwa_icon_192_url: /pwa/icon-192.png
+  pwa_icon_512_url: /pwa/icon-512.png
+  pwa_maskable_icon_512_url: /pwa/icon-maskable-512.png
+  apple_touch_icon_180_url: /pwa/apple-touch-icon.png
+
+database:
+  driver: postgres
+  postgres:
+    dsn: host=postgres port=5432 user=riochat password=riochat-demo-password dbname=riochat sslmode=disable TimeZone=Asia/Shanghai
+    max_open_conns: 30
+    max_idle_conns: 10
+    conn_max_lifetime_minutes: 60
+    conn_max_idle_time_minutes: 10
+  redis:
+    addr: redis:6379
+    username: ""
+    password: riochat-demo-redis
+    db: 0
+    tls_enabled: false
+    tls_insecure_skip_verify: false
+
+cache:
+  driver: redis
+
+storage:
+  backend: local             # local | s3
+  local:
+    root_dir: /app/storage
+  s3:                        # required when backend is s3
+    endpoint: ""
+    region: auto
+    bucket: ""
+    prefix: ""
+    access_key_id: ""
+    secret_access_key: ""
+    force_path_style: true
+
+geoip:
+  provider: none
+  database_path: /app/data/geoip/geoip.mmdb
+  database_max_bytes: 104857600
+  refresh_interval_hours: 168
+  timeout_ms: 2500
+
+observability:
+  tracing:
+    enabled: false
+    endpoint: ""
+    headers: ""
+    insecure: false
+    protocol: grpc
+    sampling_rate: 1

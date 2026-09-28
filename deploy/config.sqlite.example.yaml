@@ -1,0 +1,86 @@
+# Riochat backend configuration: lightweight container profile.
+# SQLite and an in-process cache, no external services.
+#
+# Use:   cp deploy/config.sqlite.example.yaml deploy/config.yaml
+#        docker compose -f deploy/docker-compose.sqlite.yml up -d
+#
+# Precedence: environment variables > this file > built-in defaults.
+# Paths below are inside the container: /app/data and /app/storage are volumes.
+#
+# The secrets are placeholders for local use only. Before exposing this
+# deployment: app.env prod, new random secrets, https public URLs, narrow CORS
+# (see the checklist in config.example.yaml).
+
+app:
+  name: Riochat
+  env: dev                   # dev | prod
+
+server:
+  http_port: "8080"          # if you change it, change the Compose port mapping too
+  cors_allow_origin: "http://127.0.0.1:8080,http://localhost:8080,tauri://localhost,http://tauri.localhost"
+  trusted_proxies: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7"
+  public_api_base_url: ""
+  public_web_base_url: ""
+  frontend_dist_dir: /app/frontend/out
+  read_header_timeout_seconds: 10
+  read_timeout_seconds: 120
+  idle_timeout_seconds: 120
+  max_header_bytes: 1048576
+  shutdown_timeout_seconds: 10
+
+security:
+  jwt_secret: riochat-dev-jwt-secret-do-not-use-in-production
+  data_encryption_key: riochat-dev-data-encryption-key-do-not-use-in-production
+  data_encryption_keys_previous: []
+  mcp_user_context_secret: ""
+  ssrf_protection_enabled: false
+  ssrf_allowed_hosts: ""
+  ssrf_allowed_cidrs: ""
+  turnstile_siteverify_url: https://challenges.cloudflare.com/turnstile/v0/siteverify
+
+branding:
+  title: Riochat
+  short_name: Riochat
+  description: Riochat is a multi-model AI conversation system.
+  logo_url: ""
+  favicon_url: /favicon.ico
+  pwa_icon_192_url: /pwa/icon-192.png
+  pwa_icon_512_url: /pwa/icon-512.png
+  pwa_maskable_icon_512_url: /pwa/icon-maskable-512.png
+  apple_touch_icon_180_url: /pwa/apple-touch-icon.png
+
+database:
+  driver: sqlite
+  sqlite:
+    path: /app/data/riochat.db
+    dsn: ""
+    max_open_conns: 1
+    busy_timeout_ms: 5000
+    cache_size_kb: 20480
+    mmap_size_bytes: 268435456
+    synchronous: NORMAL
+    temp_store: MEMORY
+
+cache:
+  driver: memory             # single process only
+
+storage:
+  backend: local
+  local:
+    root_dir: /app/storage
+
+geoip:
+  provider: none
+  database_path: /app/data/geoip/geoip.mmdb
+  database_max_bytes: 104857600
+  refresh_interval_hours: 168
+  timeout_ms: 2500
+
+observability:
+  tracing:
+    enabled: false
+    endpoint: ""
+    headers: ""
+    insecure: false
+    protocol: grpc
+    sampling_rate: 1

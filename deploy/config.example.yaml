@@ -1,0 +1,134 @@
+# Riochat backend configuration: default / development template.
+#
+# Use:   cp deploy/config.example.yaml deploy/config.yaml
+# Then:  make api                      (local development, reads this file)
+#        docker compose -f deploy/docker-compose.yml up -d   (external PostgreSQL + Redis)
+#
+# Precedence: environment variables > this file > built-in defaults.
+# Relative paths are resolved against the directory of this file.
+# Business settings (sign-up rules, models, billing, moderation, announcements)
+# are NOT configured here; they live in the database and are edited in the
+# admin console.
+#
+# The secrets below are placeholders for local use only. A public deployment
+# must set app.env to prod, replace BOTH secrets with new random values and use
+# https public URLs (see the checklist at the end of this file).
+
+app:
+  name: Riochat
+  env: dev                   # dev | prod
+
+server:
+  http_port: "8080"          # if you change it, change the Compose port mapping too
+  # Comma separated string or a YAML list. Includes the web dev server (3000)
+  # and the desktop shell origins.
+  cors_allow_origin: "http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:3000,http://localhost:3000,tauri://localhost,http://tauri.localhost"
+  # Peers allowed to set X-Forwarded-For (loopback, private ranges, IPv6 loopback and ULA).
+  trusted_proxies: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7"
+  public_api_base_url: ""    # e.g. https://chat.example.com (required in prod)
+  public_web_base_url: ""    # e.g. https://chat.example.com (required in prod)
+  frontend_dist_dir: ../web/out   # container images use /app/frontend/out (set by the image)
+  read_header_timeout_seconds: 10
+  read_timeout_seconds: 120
+  idle_timeout_seconds: 120
+  max_header_bytes: 1048576
+  shutdown_timeout_seconds: 10    # keep below the orchestrator's termination grace period (e.g. 30s)
+
+security:
+  # Placeholders, accepted only while app.env is dev. Replace for any real use.
+  jwt_secret: riochat-dev-jwt-secret-do-not-use-in-production
+  # At least 32 bytes. Protects upstream API keys, SSO secrets, MCP tokens and TOTP secrets.
+  data_encryption_key: riochat-dev-data-encryption-key-do-not-use-in-production
+  # Key rotation: put the new key above and move the old one here, then restart.
+  # Stored data stays readable through the old key. This build does not re-encrypt
+  # it in the background, so keep the old key listed.
+  data_encryption_keys_previous: []
+  # Only needed when an MCP server definition uses the signed user-context placeholder.
+  mcp_user_context_secret: ""
+  # Block outbound requests to private and metadata networks. Enable in production.
+  ssrf_protection_enabled: false
+  ssrf_allowed_hosts: ""     # comma separated exact host names (no scheme, port, path, IP or wildcard)
+  ssrf_allowed_cidrs: ""     # comma separated CIDRs; independent of the hosts list
+  # Override only for a compatible verification proxy.
+  turnstile_siteverify_url: https://challenges.cloudflare.com/turnstile/v0/siteverify
+
+# Changes to branding take effect after a restart.
+branding:
+  title: Riochat
+  short_name: Riochat
+  description: Riochat is a multi-model AI conversation system.
+  logo_url: ""
+  favicon_url: /favicon.ico
+  pwa_icon_192_url: /pwa/icon-192.png
+  pwa_icon_512_url: /pwa/icon-512.png
+  pwa_maskable_icon_512_url: /pwa/icon-maskable-512.png
+  apple_touch_icon_180_url: /pwa/apple-touch-icon.png
+
+database:
+  driver: postgres           # postgres | sqlite
+  postgres:
+    # Under Compose use host.docker.internal instead of 127.0.0.1 to reach a
+    # PostgreSQL running on the Docker host.
+    dsn: host=127.0.0.1 port=5432 user=riochat password=riochat dbname=riochat sslmode=disable TimeZone=Asia/Shanghai
+    max_open_conns: 30
+    max_idle_conns: 10
+    conn_max_lifetime_minutes: 60
+    conn_max_idle_time_minutes: 10
+  sqlite:                    # used when driver is sqlite
+    path: ../.local/data/riochat.db
+    dsn: ""
+    max_open_conns: 1
+    busy_timeout_ms: 5000
+    cache_size_kb: 20480
+    mmap_size_bytes: 268435456
+    synchronous: NORMAL
+    temp_store: MEMORY
+  redis:                     # used when cache.driver is redis
+    addr: 127.0.0.1:6379     # under Compose: host.docker.internal:6379
+    username: ""
+    password: ""
+    db: 0
+    tls_enabled: false
+    tls_insecure_skip_verify: false
+
+cache:
+  driver: redis              # redis | memory (memory only for a single process)
+
+storage:
+  backend: local             # local | s3
+  local:
+    root_dir: ../.local/storage
+  s3:                        # required when backend is s3
+    endpoint: ""
+    region: auto
+    bucket: ""
+    prefix: ""
+    access_key_id: ""
+    secret_access_key: ""
+    force_path_style: true
+
+geoip:
+  provider: none             # none | ipwhois | mmdb
+  database_url: ""           # mmdb: where to download the database from
+  database_path: ../.local/data/geoip/geoip.mmdb
+  database_max_bytes: 104857600
+  refresh_interval_hours: 168
+  timeout_ms: 2500
+
+observability:
+  tracing:
+    enabled: false           # setting an endpoint enables tracing unless enabled is set explicitly
+    endpoint: ""
+    headers: ""
+    insecure: false
+    protocol: grpc           # grpc | http
+    sampling_rate: 1
+
+# Production checklist
+#   1. app.env: prod
+#   2. security.jwt_secret and security.data_encryption_key: new random values
+#      (for example `openssl rand -hex 32`), never reused from this file.
+#   3. server.public_api_base_url and public_web_base_url: your https address.
+#   4. server.cors_allow_origin: only your own origin(s); never "*".
+#   5. security.ssrf_protection_enabled: true
+#   6. PostgreSQL and Redis with non-default credentials, behind a TLS reverse proxy.

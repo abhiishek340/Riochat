@@ -1,0 +1,38 @@
+# Lightweight profile: the Riochat app with SQLite and an in-memory cache. No
+# other services.
+#
+#   cp deploy/config.sqlite.example.yaml deploy/config.yaml     # then edit
+#   docker compose -f deploy/docker-compose.sqlite.yml up -d
+#
+# The database lives in /app/data and uploaded files in /app/storage; both are
+# named volumes, so back them up. The port is published on loopback only.
+# Use a locally built image with:
+#   docker build -t riochat:local . && RIOCHAT_CHAT_IMAGE=riochat:local docker compose -f deploy/docker-compose.sqlite.yml up -d
+
+name: riochat
+
+services:
+  app:
+    image: ${RIOCHAT_CHAT_IMAGE:-ghcr.io/riochat/riochat:latest}
+    container_name: riochat-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - riochat-app-storage:/app/storage
+      - riochat-app-data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - riochat-network
+
+networks:
+  riochat-network:
+    name: riochat-network
+
+volumes:
+  riochat-app-storage:
+    name: riochat-app-storage
+  riochat-app-data:
+    name: riochat-app-data

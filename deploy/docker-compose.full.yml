@@ -1,0 +1,99 @@
+# Full profile: the Riochat app, PostgreSQL (with pgvector) and Redis.
+#
+#   cp deploy/config.full.example.yaml deploy/config.yaml     # then edit
+#   docker compose -f deploy/docker-compose.full.yml up -d
+#
+# WARNING: the passwords below are DEMO defaults. Replace them before anything
+# but your own machine can reach this stack, by exporting
+# RIOCHAT_POSTGRES_PASSWORD and RIOCHAT_REDIS_PASSWORD or putting them in
+# deploy/.env (see .env.example). Use letters and digits only: the password is
+# embedded in a key=value connection string.
+#
+# Environment variables set on the app service take priority over the values
+# in config.yaml. Datastore ports are published on loopback only.
+# Use a locally built image with:
+#   docker build -t riochat:local . && RIOCHAT_CHAT_IMAGE=riochat:local docker compose -f deploy/docker-compose.full.yml up -d
+
+name: riochat
+
+services:
+  app:
+    image: ${RIOCHAT_CHAT_IMAGE:-ghcr.io/riochat/riochat:latest}
+    container_name: riochat-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: host=postgres port=5432 user=riochat password=${RIOCHAT_POSTGRES_PASSWORD:-riochat-demo-password} dbname=riochat sslmode=disable TimeZone=Asia/Shanghai
+      REDIS_ADDR: redis:6379
+      REDIS_USERNAME: ""
+      REDIS_PASSWORD: ${RIOCHAT_REDIS_PASSWORD:-riochat-demo-redis}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - riochat-app-storage:/app/storage
+      - riochat-app-data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - riochat-network
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: riochat-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: riochat
+      POSTGRES_DB: riochat
+      POSTGRES_PASSWORD: ${RIOCHAT_POSTGRES_PASSWORD:-riochat-demo-password}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - riochat-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U riochat -d riochat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - riochat-network
+
+  redis:
+    image: redis:7
+    container_name: riochat-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${RIOCHAT_REDIS_PASSWORD:-riochat-demo-redis}"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - riochat-redis-data:/data
+    healthcheck:
+      # REDISCLI_AUTH keeps the password off the process command line.
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    environment:
+      REDIS_PASSWORD: ${RIOCHAT_REDIS_PASSWORD:-riochat-demo-redis}
+    networks:
+      - riochat-network
+
+networks:
+  riochat-network:
+    name: riochat-network
+
+volumes:
+  riochat-app-storage:
+    name: riochat-app-storage
+  riochat-app-data:
+    name: riochat-app-data
+  riochat-postgres-data:
+    name: riochat-postgres-data
+  riochat-redis-data:
+    name: riochat-redis-data
