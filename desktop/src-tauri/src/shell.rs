@@ -652,3 +652,52 @@ impl Shell {
         self.network_status()
     }
 }
+
+/// Handles download events of any webview.
+fn handle_download(app: &AppHandle, pending: &Pending, webview: &Webview, event: DownloadEvent<'_>) -> bool {
+    match event {
+        DownloadEvent::Requested { url, destination } => {
+            if !downloads::destination_ok(destination) {
+                log::warn!("refusing a download without a usable destination folder");
+                let payload = downloads::Finished {
+                    file_name: downloads::file_name_of(destination),
+                    success: false,
+                };
+                let _ = app.emit_to(webview.label(), EVENT_DOWNLOAD_FINISHED, payload);
+                return false;
+            }
+            pending.note(url.as_str(), downloads::file_name_of(destination));
+            true
+        }
+        DownloadEvent::Finished { url, path, success } => {
+            let payload = pending.finish(url.as_str(), path.as_deref(), success);
+            let _ = app.emit_to(webview.label(), EVENT_DOWNLOAD_FINISHED, payload);
+            true
+        }
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_script_sets_the_flag_the_web_client_reads() {
+        assert!(DESKTOP_MARKER_SCRIPT.contains("window.__RIOCHAT_DESKTOP__ = true"));
+    }
+
+    #[test]
+    fn event_names_are_the_documented_ones() {
+        assert_eq!(EVENT_TABS_CHANGED, "tabs:changed");
+        assert_eq!(EVENT_OAUTH_CALLBACK, "oauth-loopback-callback");
+        assert_eq!(EVENT_DOWNLOAD_FINISHED, "downloads:finished");
+    }
+
+    #[test]
+    fn only_tab_labels_may_use_session_commands() {
+        assert!(Shell::require_tab("tab-3").is_ok());
+        assert!(Shell::require_tab("chrome").is_err());
+        assert!(Shell::require_tab("main").is_err());
+    }
+}
