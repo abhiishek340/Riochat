@@ -187,3 +187,160 @@ export function SkillsSettingsPage() {
     </SettingsPage>
   );
 }
+
+function SkillEditor({
+  target,
+  onOpenChange,
+  onSaved,
+}: {
+  target: { skill: SkillSummary | null } | null;
+  onOpenChange: (open: boolean) => void;
+  onSaved: (skill: SkillSummary) => void;
+}) {
+  const t = useT();
+  const errorMessage = useErrorMessage();
+  const open = target !== null;
+  const editing = target?.skill ?? null;
+  const [draft, setDraft] = useState<SkillInput>(EMPTY);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!target) return;
+    if (!target.skill) {
+      setDraft(EMPTY);
+      return;
+    }
+    const id = target.skill.id;
+    setDraft({ title: target.skill.title, trigger: target.skill.trigger, description: target.skill.description, markdown: "" });
+    setLoading(true);
+    const controller = new AbortController();
+    getSkill(id, controller.signal)
+      .then((full: SkillFull | null) => {
+        if (!controller.signal.aborted && full) setDraft((d) => ({ ...d, markdown: full.markdown }));
+      })
+      .catch((e: unknown) => {
+        if (!controller.signal.aborted) toast.error(t("settings.skills.toasts.loadFailed"), { description: errorMessage(e) });
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+    // Seed when the target changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target]);
+
+  const valid = validateSkill(draft);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!valid || saving) return;
+    setSaving(true);
+    try {
+      const body = { ...draft, title: draft.title.trim(), trigger: normalizeTrigger(draft.trigger), description: draft.description.trim() };
+      const saved = editing ? await patchSkill(editing.id, body) : await createSkill(body);
+      if (saved) {
+        onSaved(saved);
+        toast.success(editing ? t("settings.skills.toasts.updated") : t("settings.skills.toasts.created"));
+        onOpenChange(false);
+      }
+    } catch (err) {
+      toast.error(t("settings.skills.toasts.saveFailed"), { description: errorMessage(err) });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const set = (patch: Partial<SkillInput>) => setDraft((d) => ({ ...d, ...patch }));
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => (saving ? undefined : onOpenChange(next))}>
+      <DialogContent className="max-w-xl">
+        <form onSubmit={(e) => void submit(e)} className="grid gap-4">
+          <DialogHeader>
+            <DialogTitle>{editing ? t("settings.skills.editTitle") : t("settings.skills.addTitle")}</DialogTitle>
+            <DialogDescription>{t("settings.skills.editorBody")}</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field required>
+              <FieldLabel>{t("settings.skills.fieldTitle")}</FieldLabel>
+              <Input value={draft.title} maxLength={SKILL_LIMITS.title} onChange={(e) => set({ title: e.target.value })} />
+            </Field>
+            <Field required>
+              <FieldLabel>{t("settings.skills.fieldTrigger")}</FieldLabel>
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono text-muted-foreground">/</span>
+                <Input value={draft.trigger} maxLength={SKILL_LIMITS.trigger + 4} className="font-mono" onChange={(e) => set({ trigger: e.target.value })} />
+              </div>
+              <FieldHint>{t("settings.skills.triggerHint")}</FieldHint>
+            </Field>
+          </div>
+          <Field>
+            <FieldLabel>{t("settings.skills.fieldDescription")}</FieldLabel>
+            <Input value={draft.description} maxLength={SKILL_LIMITS.description} onChange={(e) => set({ description: e.target.value })} />
+          </Field>
+          <Field required>
+            <FieldLabel>{t("settings.skills.fieldMarkdown")}</FieldLabel>
+            <Textarea
+              value={draft.markdown}
+              maxLength={SKILL_LIMITS.markdown}
+              disabled={loading}
+              className="h-56 resize-y font-mono text-[13px]"
+              onChange={(e) => set({ markdown: e.target.value })}
+            />
+            <FieldHint>{t("settings.skills.markdownHint", { count: draft.markdown.length, max: SKILL_LIMITS.markdown })}</FieldHint>
+          </Field>
+          <DialogFooter>
+            <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)}>
+              {t("common.actions.cancel")}
+            </Button>
+            <Button type="submit" loading={saving} disabled={!valid || loading}>
+              {t("common.actions.save")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function SkillViewer({ skill, onOpenChange }: { skill: SkillSummary | null; onOpenChange: (open: boolean) => void }) {
+  const t = useT();
+  const errorMessage = useErrorMessage();
+  const [body, setBody] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!skill) return;
+    setBody("");
+    setLoading(true);
+    const controller = new AbortController();
+    getSkill(skill.id, controller.signal)
+      .then((full) => {
+        if (!controller.signal.aborted) setBody(full?.markdown ?? "");
+      })
+      .catch((e: unknown) => {
+        if (!controller.signal.aborted) toast.error(t("settings.skills.toasts.loadFailed"), { description: errorMessage(e) });
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skill?.id]);
+
+  return (
+    <Dialog open={skill !== null} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{skill?.title}</DialogTitle>
+          <DialogDescription>{skill ? `/${skill.trigger}${skill.description ? ` · ${skill.description}` : ""}` : ""}</DialogDescription>
+        </DialogHeader>
+        {loading ? <Skeleton className="h-40 w-full" /> : <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-3 font-mono text-[13px]">{body}</pre>}
+        <DialogFooter>
+          <Button onClick={() => onOpenChange(false)}>{t("common.actions.close")}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
