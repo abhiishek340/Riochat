@@ -495,3 +495,236 @@ export function RedemptionsTab({ remountKey, codeId }: TabProps & { codeId?: num
 }
 
 // --- conversation events ------------------------------------------------------------------------------
+
+export function ConversationTab({ remountKey }: TabProps) {
+  const t = useT();
+  const { locale } = useI18n();
+  const label = useLabel();
+  const notify = useNotify();
+  const [q, setQ] = useState("");
+  const [conversation, setConversation] = useState("");
+  const [eventType, setEventType] = useState("");
+  const [status, setStatus] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [sort, setSort] = useState("created_desc");
+  const filters = useMemo(() => ({ q, conversation, eventType, status, from, to, sort, remountKey }), [q, conversation, eventType, status, from, to, sort, remountKey]);
+  const list = usePagedQuery({
+    filters,
+    fetch: ({ page, pageSize, filters: f, signal }) =>
+      listConversationEvents({ page, page_size: pageSize, ...searchParams(f.q, "user_id"), conversation_id: /^\d+$/.test(f.conversation.trim()) ? f.conversation.trim() : undefined, event_type: f.eventType, status: f.status, ...dateRange(f.from, f.to), sort: f.sort }, signal),
+    onError: (error) => notify.error(loadFailed("conversation"), error),
+  });
+  const types = distinct(list.rows.map((r) => r.eventType));
+  const columns: Column<ConversationEvent>[] = [
+    { id: "time", header: t("adminLogs.conversation.columns.time"), cell: (r) => time(r.startedAt || r.createdAt, locale) },
+    { id: "user", header: t("adminLogs.conversation.columns.user"), cell: (r) => userText(r) },
+    { id: "type", header: t("adminLogs.conversation.columns.type"), cell: (r) => <Mono>{r.eventType}</Mono> },
+    { id: "summary", header: t("adminLogs.conversation.columns.summary"), className: "max-w-[22rem]", cell: (r) => <span className="line-clamp-2 text-[13px]">{r.title || r.summary || r.toolName || "-"}</span> },
+    { id: "status", header: t("adminLogs.conversation.columns.status"), cell: (r) => <StatusBadge value={r.status} prefix="adminLogs.results" /> },
+    { id: "latency", header: t("adminLogs.conversation.columns.latency"), className: "whitespace-nowrap tabular-nums", cell: (r) => formatLatency(r.latencyMS, locale) },
+  ];
+  return (
+    <LogView
+      list={list}
+      columns={columns}
+      rowKey={(r) => r.id}
+      label={t("adminLogs.tabs.conversation")}
+      empty={t("adminLogs.empty")}
+      detailTitle={(r) => r.title || r.eventType}
+      filters={
+        <>
+          <SearchBox value={q} onChange={setQ} placeholder={t("adminLogs.conversation.search")} />
+          <SearchBox value={conversation} onChange={setConversation} placeholder={t("adminLogs.conversation.conversationId")} className="sm:w-44" />
+          <OptionSelect value={eventType} onChange={setEventType} label={t("adminLogs.conversation.columns.type")} options={[{ value: "", label: t("adminLogs.conversation.anyType") }, ...types.map((v) => ({ value: v, label: v }))]} />
+          <OptionSelect value={status} onChange={setStatus} label={t("adminLogs.conversation.columns.status")} options={[{ value: "", label: t("adminLogs.conversation.anyStatus") }, ...withObserved(["success", "failed", "running"], distinct(list.rows.map((r) => r.status))).map((v) => ({ value: v, label: label("adminLogs.results", v) }))]} />
+          <DateRangeFilter from={from} to={to} onFrom={setFrom} onTo={setTo} />
+          <OptionSelect value={sort} onChange={setSort} label={t("adminLogs.sort")} options={["created_desc", "created_asc", "latency_desc", "seq_asc"].map((s) => ({ value: s, label: t(`adminLogs.conversation.sorts.${s}` as "adminLogs.conversation.sorts.created_desc") }))} />
+        </>
+      }
+      detail={(r) => <ConversationDetail row={r} />}
+    />
+  );
+}
+
+function ConversationDetail({ row }: { row: ConversationEvent }) {
+  const t = useT();
+  const { locale } = useI18n();
+  const [full, setFull] = useState<ConversationEvent>(row);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+
+  // The list row shows at once; the detail fills in the large payload fields. Only the latest request may update it.
+  useEffect(() => {
+    const controller = new AbortController();
+    setFull(row);
+    setLoading(true);
+    setFailed(false);
+    getConversationEvent(row.id, controller.signal).then(
+      (detail) => {
+        setFull({ ...row, ...detail });
+        setLoading(false);
+      },
+      (error: unknown) => {
+        if (isAbortError(error)) return;
+        setLoading(false);
+        setFailed(true);
+      },
+    );
+    return () => controller.abort();
+  }, [row]);
+
+  const blob = (title: string, text: string, omitted: boolean, size: number) =>
+    text || omitted ? (
+      <DetailSection title={title}>
+        {text ? <JsonView text={text} /> : <p className="text-sm text-muted-foreground">{loading ? t("adminLogs.conversation.loadingPayload") : t("adminLogs.conversation.omitted", { size: formatBytes(size, locale) })}</p>}
+      </DetailSection>
+    ) : null;
+
+  return (
+    <div className="space-y-5">
+      {failed ? (
+        <p role="alert" className="text-sm font-medium text-destructive">
+          {t("adminLogs.detailFailed")}
+        </p>
+      ) : null}
+      <DetailList
+        items={[
+          [t("adminLogs.conversation.columns.time"), formatDateTime(full.startedAt, locale)],
+          [t("adminLogs.conversation.columns.user"), `${userText(full)} (#${full.userID})`],
+          [t("adminLogs.fields.conversation"), `#${full.conversationID}`],
+          [t("adminLogs.conversation.run"), full.runID],
+          [t("adminLogs.conversation.scope"), `${full.eventScope} / ${full.phase} / ${full.stage}`],
+          [t("adminLogs.conversation.columns.type"), full.eventType],
+          [t("adminLogs.conversation.columns.status"), full.status],
+          [t("adminLogs.conversation.tool"), full.toolName],
+          [t("adminLogs.conversation.model"), [full.platformModelName, full.upstreamName, full.upstreamModelName].filter(Boolean).join(" / ")],
+          [t("adminLogs.conversation.columns.latency"), formatLatency(full.latencyMS, locale)],
+          [t("adminLogs.conversation.seq"), full.seq],
+        ]}
+      />
+      {full.contentMarkdown ? (
+        <DetailSection title={t("adminLogs.conversation.content")}>
+          <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border bg-muted/40 p-3 text-[13px]">{full.contentMarkdown}</pre>
+        </DetailSection>
+      ) : null}
+      {blob(t("adminLogs.conversation.input"), full.inputJSON, full.inputOmitted, full.inputSizeBytes)}
+      {blob(t("adminLogs.conversation.output"), full.outputJSON, full.outputOmitted, full.outputSizeBytes)}
+      {blob(t("adminLogs.conversation.payload"), full.payloadJSON, full.payloadOmitted, full.payloadSizeBytes)}
+      {blob(t("adminLogs.conversation.error"), full.errorJSON, full.errorOmitted, full.errorSizeBytes)}
+    </div>
+  );
+}
+
+// --- error logs ----------------------------------------------------------------------------------------
+
+export function ErrorsTab({ remountKey }: TabProps) {
+  const t = useT();
+  const { locale } = useI18n();
+  const notify = useNotify();
+  const [q, setQ] = useState("");
+  const [statusClass, setStatusClass] = useState("");
+  const filters = useMemo(() => ({ q, statusClass, remountKey }), [q, statusClass, remountKey]);
+  const list = usePagedQuery({
+    filters,
+    fetch: ({ page, pageSize, filters: f, signal }) => listErrors({ page, page_size: pageSize, query: f.q.trim(), status_class: f.statusClass }, signal),
+    onError: (error) => notify.error(loadFailed("errors"), error),
+  });
+  const copy = async (text: string) => {
+    if (await copyText(text)) toast.success(t("adminCommon.toast.copied"));
+    else toast.error(t("adminCommon.toast.copyFailed"));
+  };
+  const columns: Column<ErrorLog>[] = [
+    { id: "time", header: t("adminLogs.errors.columns.time"), cell: (r) => time(r.createdAt, locale) },
+    { id: "status", header: t("adminLogs.errors.columns.status"), cell: (r) => <Badge tone={r.statusCode >= 500 ? "danger" : "warning"}>{r.statusCode}</Badge> },
+    { id: "request", header: t("adminLogs.errors.columns.request"), cell: (r) => <Mono className="break-all">{r.method} {r.route || r.path}</Mono> },
+    { id: "code", header: t("adminLogs.errors.columns.code"), cell: (r) => <Mono>{r.errorCode || "-"}</Mono> },
+    {
+      id: "cause",
+      header: t("adminLogs.errors.columns.cause"),
+      className: "max-w-[20rem]",
+      cell: (r) => (
+        <span className="flex items-start gap-1">
+          <span className="line-clamp-2 text-[13px] text-muted-foreground">{r.cause || "-"}</span>
+          {r.cause ? (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={t("adminLogs.errors.copyCause")}
+              onClick={(event) => {
+                event.stopPropagation();
+                void copy(r.cause);
+              }}
+            >
+              <Copy />
+            </Button>
+          ) : null}
+        </span>
+      ),
+    },
+  ];
+  return (
+    <LogView
+      list={list}
+      columns={columns}
+      rowKey={(r) => r.id}
+      label={t("adminLogs.tabs.errors")}
+      empty={t("adminLogs.empty")}
+      detailTitle={(r) => `${r.statusCode} ${r.errorCode}`.trim()}
+      filters={
+        <>
+          <SearchBox value={q} onChange={setQ} placeholder={t("adminLogs.errors.search")} />
+          <OptionSelect value={statusClass} onChange={setStatusClass} label={t("adminLogs.errors.columns.status")} options={[{ value: "", label: t("adminLogs.errors.anyClass") }, { value: "5xx", label: t("adminLogs.errors.class5xx") }, { value: "stream", label: t("adminLogs.errors.classStream") }]} />
+        </>
+      }
+      detail={(r) => <ErrorDetail row={r} />}
+    />
+  );
+}
+
+function ErrorDetail({ row }: { row: ErrorLog }) {
+  const t = useT();
+  const { locale } = useI18n();
+  const [raw, setRaw] = useState(false);
+  return (
+    <div className="space-y-5">
+      <DetailSection title={t("adminLogs.errors.request")}>
+        <DetailList
+          items={[
+            [t("adminLogs.errors.columns.time"), formatDateTime(row.createdAt, locale)],
+            [t("adminLogs.errors.columns.status"), row.statusCode],
+            [t("adminLogs.errors.columns.code"), row.errorCode],
+            [t("adminLogs.errors.route"), `${row.method} ${row.route || row.path}`],
+            [t("adminLogs.errors.path"), row.path],
+            [t("adminLogs.fields.requestId"), row.requestID],
+            [t("adminLogs.errors.trace"), row.traceID],
+            [t("adminLogs.usage.columns.latency"), formatLatency(row.latencyMS, locale)],
+          ]}
+        />
+      </DetailSection>
+      <DetailSection title={t("adminLogs.errors.client")}>
+        <DetailList items={[[t("adminLogs.fields.ip"), row.clientIP], [t("adminLogs.fields.userAgent"), row.userAgent]]} />
+      </DetailSection>
+      <DetailSection title={t("adminLogs.errors.user")}>
+        <DetailList items={[[t("adminLogs.errors.account"), row.userID ? `${userText(row)} (#${row.userID})` : ""]]} />
+      </DetailSection>
+      {row.cause ? (
+        <DetailSection title={t("adminLogs.errors.columns.cause")}>
+          <p className="whitespace-pre-wrap break-words rounded-lg border bg-muted/40 p-3 text-[13px]">{row.cause}</p>
+        </DetailSection>
+      ) : null}
+      {row.detail ? (
+        <DetailSection title={t("adminLogs.fields.detail")}>
+          <div className="mb-2 inline-flex rounded-md bg-muted p-0.5 text-xs">
+            {[false, true].map((value) => (
+              <button key={String(value)} type="button" onClick={() => setRaw(value)} className={`rounded px-2 py-1 ${raw === value ? "bg-background shadow-sm" : "text-muted-foreground"}`}>
+                {value ? t("adminLogs.errors.rawView") : t("adminLogs.errors.formattedView")}
+              </button>
+            ))}
+          </div>
+          <JsonView text={row.detail} pretty={!raw} />
+        </DetailSection>
+      ) : null}
+    </div>
+  );
+}
