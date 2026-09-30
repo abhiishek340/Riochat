@@ -304,3 +304,97 @@ function StatisticsContent() {
     </AdminPage>
   );
 }
+
+function MetricSwitch({ value, onChange, label, metricLabel }: { value: Metric; onChange: (m: Metric) => void; label: string; metricLabel: (m: Metric) => string }) {
+  return (
+    <OptionSelect value={value} onChange={(v) => onChange(v as Metric)} label={label} options={METRICS.map((m) => ({ value: m, label: metricLabel(m) }))} className="h-8 w-32 sm:min-w-0" />
+  );
+}
+
+function FilterPanel({ filters, models, groups, multiUser, onChange }: { filters: Filters; models: PlatformModel[]; groups: PermissionGroup[]; multiUser: boolean; onChange: (f: Filters) => void }) {
+  const t = useT();
+  const [query, setQuery] = useState("");
+  const debounced = useDebouncedValue(query, 250);
+  const [found, setFound] = useState<UserRecord[]>([]);
+  useEffect(() => {
+    if (!multiUser || !debounced.trim()) {
+      setFound([]);
+      return;
+    }
+    const controller = new AbortController();
+    api.get<unknown>("/admin/users", { signal: controller.signal, query: { q: debounced.trim(), page: 1, page_size: 20 } }).then(
+      (raw) => setFound(readPage<UserRecord>(raw).results),
+      () => undefined,
+    );
+    return () => controller.abort();
+  }, [debounced, multiUser]);
+  const names = useMemo(() => [...new Set(models.map((m) => m.platformModelName).filter(Boolean))].sort((a, b) => a.localeCompare(b)), [models]);
+  const subject = filters.subject;
+  const subjectKind = subject.kind;
+  return (
+    <div className="grid gap-4 border-t pt-4 md:grid-cols-3">
+      {multiUser ? (
+        <div className="space-y-2">
+          <div className="text-sm font-medium">{t("adminStats.filters.subject")}</div>
+          <OptionSelect
+            value={subjectKind}
+            onChange={(k) => onChange(withSubject(filters, k === "group" ? { kind: "group", id: groups[0]?.id ?? 0 } : k === "user" ? { kind: "user", id: 0, label: "" } : { kind: "all" }))}
+            label={t("adminStats.filters.subject")}
+            options={[
+              { value: "all", label: t("adminStats.filters.everyone") },
+              { value: "user", label: t("adminStats.filters.oneUser") },
+              { value: "group", label: t("adminStats.filters.oneGroup") },
+            ]}
+            className="w-full"
+          />
+          {subject.kind === "group" ? <OptionSelect label={t("adminStats.filters.oneGroup")} value={String(subject.id)} onChange={(v) => onChange(withSubject(filters, { kind: "group", id: Number(v) }))} options={groups.map((g) => ({ value: String(g.id), label: g.name }))} className="w-full" /> : null}
+          {subject.kind === "user" ? (
+            <div className="space-y-1">
+              <Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={subject.label || t("adminStats.filters.searchUser")} aria-label={t("adminStats.filters.searchUser")} />
+              {found.length > 0 ? (
+                <ul className="max-h-40 overflow-auto rounded-md border">
+                  {found.map((u) => (
+                    <li key={u.id}>
+                      <button
+                        type="button"
+                        className="w-full px-2 py-1.5 text-left text-sm hover:bg-muted"
+                        onClick={() => {
+                          onChange(withSubject(filters, { kind: "user", id: u.id, label: u.displayName || u.username }));
+                          setQuery("");
+                          setFound([]);
+                        }}
+                      >
+                        {u.displayName || u.username} <span className="text-xs text-muted-foreground">@{u.username}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      <div className="space-y-2">
+        <div className="text-sm font-medium">{t("adminStats.filters.model")}</div>
+        <OptionSelect value={filters.model} onChange={(v) => onChange({ ...filters, model: v })} label={t("adminStats.filters.model")} options={[{ value: "", label: t("adminStats.filters.allModels") }, ...names.map((n) => ({ value: n, label: n }))]} className="w-full" />
+      </div>
+      <div className="space-y-2">
+        <div className="text-sm font-medium">{t("adminStats.filters.scope")}</div>
+        <OptionSelect
+          value={filters.scope}
+          onChange={(v) => onChange({ ...filters, scope: v as Filters["scope"] })}
+          label={t("adminStats.filters.scope")}
+          options={[
+            { value: "all", label: t("adminStats.filters.scopeAll") },
+            { value: "free", label: t("adminStats.filters.scopeFree") },
+            { value: "billable", label: t("adminStats.filters.scopeBillable") },
+          ]}
+          className="w-full"
+        />
+        <Button variant="ghost" size="sm" disabled={activeFilterCount(filters) === 0} onClick={() => onChange(NO_FILTERS)}>
+          {t("adminStats.filters.clear")}
+        </Button>
+      </div>
+    </div>
+  );
+}
