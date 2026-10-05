@@ -1,0 +1,26 @@
+# RapidOCR extraction service. Start an application profile first (it creates
+# riochat-network) or create the network by hand: docker network create riochat-network
+#
+#   docker compose -f deploy/services/rapidocr/docker-compose.yml up -d --build
+#
+# Point the application at http://host.docker.internal:8002/ocr (or
+# http://riochat-rapidocr:8002/ocr from inside riochat-network).
+
+name: riochat-rapidocr
+
+services:
+  rapidocr:
+    build: .
+    container_name: riochat-rapidocr
+    restart: unless-stopped
+    environment:
+      RAPIDOCR_RENDER_SCALE: ${RAPIDOCR_RENDER_SCALE:-1.25}
+    ports:
+      - "127.0.0.1:8002:8002"
+    networks:
+      - riochat-network
+
+networks:
+  riochat-network:
+    external: true
+    name: riochat-network
