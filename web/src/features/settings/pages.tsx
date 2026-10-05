@@ -1,0 +1,12 @@
+export { AboutSettingsPage } from "./about/about-page";
+export { AccountSettingsPage } from "./account/account-page";
+export { ChatSettingsPage } from "./chat/chat-page";
+export { GeneralSettingsPage } from "./general/general-page";
+export { ProviderImportPage } from "./import/import-page";
+export { McpSettingsPage } from "./mcp/mcp-page";
+export { MemorySettingsPage } from "./memory/memory-page";
+export { ModelsSettingsPage } from "./models/models-page";
+export { NetworkSettingsPage } from "./network/network-page";
+export { SettingsLayout } from "./shell/settings-layout";
+export { SkillsSettingsPage } from "./skills/skills-page";
+export { SubscriptionSettingsPage } from "./subscription/subscription-page";
