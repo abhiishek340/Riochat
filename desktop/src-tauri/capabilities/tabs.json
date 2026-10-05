@@ -1,0 +1,35 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tabs",
+  "description": "Content tab webviews. No shell, filesystem or generic network access. The updater permissions are added at runtime, and only in auto-update mode.",
+  "local": true,
+  "webviews": ["tab-*"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-focus",
+    "process:allow-restart",
+    "notification:allow-notify",
+    "notification:allow-show",
+    "notification:allow-is-permission-granted",
+    "notification:allow-permission-state",
+    "notification:allow-request-permission",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "http://*" }, { "url": "https://*" }]
+    },
+    "allow-get-distribution",
+    "allow-check-update-notice",
+    "allow-get-network-proxy",
+    "allow-set-network-proxy",
+    "allow-get-server",
+    "allow-set-remote-server",
+    "allow-set-local-server",
+    "allow-leave-server",
+    "allow-local-sign-in",
+    "allow-store-session",
+    "allow-clear-session",
+    "allow-refresh-session",
+    "allow-start-oauth-loopback",
+    "allow-stop-oauth-loopback"
+  ]
+}
