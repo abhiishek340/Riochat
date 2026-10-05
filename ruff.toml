@@ -1,0 +1,12 @@
+# Python is limited to the optional extraction services under deploy/services.
+target-version = "py311"
+line-length = 100
+extend-exclude = ["node_modules", "web", "desktop"]
+
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+# FastAPI declares request parameters as default values (File(...), Form(...)).
+extend-per-file-ignores = { "deploy/services/*/app.py" = ["B008"] }
+
+[lint.isort]
+known-first-party = ["pages"]
