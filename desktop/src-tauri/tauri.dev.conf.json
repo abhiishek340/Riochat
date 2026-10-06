@@ -1,0 +1,7 @@
+{
+  "productName": "Riochat Dev",
+  "identifier": "com.riochat.desktop.dev",
+  "build": {
+    "beforeDevCommand": "node scripts/dev-server.mjs"
+  }
+}
