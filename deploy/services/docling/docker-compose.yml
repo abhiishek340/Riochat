@@ -1,0 +1,30 @@
+# Docling document conversion service. Start an application profile first (it
+# creates riochat-network) or create the network by hand:
+#   docker network create riochat-network
+#
+#   docker compose -f deploy/services/docling/docker-compose.yml up -d --build
+#
+# Point the application at http://host.docker.internal:8005/ocr.
+
+name: riochat-docling
+
+services:
+  docling:
+    build: .
+    container_name: riochat-docling
+    restart: unless-stopped
+    volumes:
+      - riochat-docling-models:/home/ocr/.cache
+    ports:
+      - "127.0.0.1:8005:8005"
+    networks:
+      - riochat-network
+
+networks:
+  riochat-network:
+    external: true
+    name: riochat-network
+
+volumes:
+  riochat-docling-models:
+    name: riochat-docling-models
