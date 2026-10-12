@@ -179,3 +179,129 @@ export function KbDetailSheet({ kb, onClose, onChanged }: { kb: KnowledgeBase; o
     </Sheet>
   );
 }
+
+function AddFilesDialog({ open, kb, onOpenChange, onAdded }: { open: boolean; kb: KnowledgeBase; onOpenChange: (open: boolean) => void; onAdded: (count: number) => void }) {
+  const t = useT();
+  const { locale } = useI18n();
+  const notify = useNotify();
+  const [q, setQ] = useState("");
+  const [rows, setRows] = useState<KbFile[]>([]);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const selection = useSelection<string>();
+
+  const load = useCallback(
+    (signal?: AbortSignal) => {
+      setLoading(true);
+      return listAvailableFiles(kb.publicID, q, page, 10, signal).then(
+        (result) => {
+          setRows(result.results);
+          setTotal(result.total);
+          setLoading(false);
+        },
+        (error: unknown) => {
+          if (isAbortError(error)) return;
+          setLoading(false);
+          notify.error("adminKb.toast.filesLoadFailed", error);
+        },
+      );
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [kb.publicID, q, page],
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
+  }, [open, load]);
+
+  useEffect(() => {
+    if (open) {
+      setQ("");
+      setPage(1);
+      selection.clear();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const add = async () => {
+    const ids = [...selection.selected];
+    if (ids.length === 0) return;
+    setBusy(true);
+    try {
+      await addKbFiles(kb.publicID, ids);
+      notify.success("adminKb.toast.added", { count: ids.length });
+      onAdded(ids.length);
+      onOpenChange(false);
+    } catch (error) {
+      notify.error("adminKb.toast.addFailed", error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const keys = rows.map((r) => r.fileID);
+  return (
+    <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{t("adminKb.files.addTitle")}</DialogTitle>
+          <DialogDescription>{t("adminKb.files.addBody")}</DialogDescription>
+        </DialogHeader>
+        <SearchBox
+          value={q}
+          onChange={(v) => {
+            setQ(v);
+            setPage(1);
+          }}
+          placeholder={t("adminKb.files.search")}
+          className="sm:w-full"
+        />
+        <div className="max-h-72 overflow-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-muted/90 text-left text-xs uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="w-10 px-3 py-2">
+                  <Checkbox aria-label={t("adminCommon.table.selectAll")} checked={selection.headerState(keys)} disabled={keys.length === 0} onCheckedChange={(on) => selection.toggleAll(keys, on)} />
+                </th>
+                <th className="px-3 py-2">{t("adminKb.files.columns.name")}</th>
+                <th className="px-3 py-2">{t("adminKb.files.columns.size")}</th>
+              </tr>
+            </thead>
+            <tbody className={loading ? "opacity-60" : undefined}>
+              {rows.map((r) => (
+                <tr key={r.fileID} className="border-t">
+                  <td className="px-3 py-2">
+                    <Checkbox aria-label={t("adminCommon.table.selectRowNamed", { name: r.fileName })} checked={selection.has(r.fileID)} onCheckedChange={(on) => selection.toggle(r.fileID, on)} />
+                  </td>
+                  <td className="px-3 py-2">{r.fileName}</td>
+                  <td className="whitespace-nowrap px-3 py-2 tabular-nums">{formatBytes(r.sizeBytes, locale)}</td>
+                </tr>
+              ))}
+              {rows.length === 0 && !loading ? (
+                <tr>
+                  <td colSpan={3} className="h-20 text-center text-muted-foreground">
+                    {t("adminKb.files.noneAvailable")}
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+        <Pagination page={page} pageSize={10} total={total} onPage={setPage} />
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+            {t("common.actions.cancel")}
+          </Button>
+          <Button loading={busy} disabled={selection.count === 0} onClick={add}>
+            {t("adminKb.files.addSelected", { count: selection.count })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
