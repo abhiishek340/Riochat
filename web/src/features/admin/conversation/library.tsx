@@ -170,3 +170,207 @@ function LibraryList({ kind }: { kind: LibraryKind }) {
     </div>
   );
 }
+
+function TemplateDialog({ kind, target, onOpenChange, onSaved }: { kind: "prompts" | "skills"; target: PromptItem | SkillItem | "new" | null; onOpenChange: (open: boolean) => void; onSaved: () => void }) {
+  const t = useT();
+  const message = useErrorMessage();
+  const shown = useSnapshot(target);
+  const existing = shown && shown !== "new" ? shown : null;
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [content, setContent] = useState("");
+  const [enabled, setEnabled] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (target === null) return;
+    const item = target === "new" ? null : target;
+    setName(item ? item.trigger || item.title : "");
+    setDescription(item?.description ?? "");
+    setContent(item ? (kind === "skills" ? (item as SkillItem).markdown : (item as PromptItem).content) : "");
+    setEnabled(item ? item.enabled : true);
+  }, [target, kind]);
+
+  const save = async () => {
+    if (busy) return;
+    const found = validateTemplate({ name, description, content });
+    if (found) {
+      toast.error(t("adminConversation.library.saveFailed"), { description: problemText(t, found) });
+      return;
+    }
+    const normalized = normalizeTemplateName(name);
+    const body: Record<string, unknown> = { title: normalized, trigger: normalized, description: description.trim(), enabled, sortOrder: existing?.sortOrder ?? 0 };
+    body[kind === "skills" ? "markdown" : "content"] = content.trim();
+    setBusy(true);
+    try {
+      if (existing) await updateLibrary(kind, existing.id, body);
+      else await createLibrary(kind, body);
+      toast.success(t("adminConversation.library.saved"));
+      onSaved();
+      onOpenChange(false);
+    } catch (error) {
+      toast.error(t("adminConversation.library.saveFailed"), { description: message(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={target !== null} onOpenChange={(open) => !busy && onOpenChange(open)}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{existing ? t(`adminConversation.library.edit.${kind}`) : t(`adminConversation.library.new.${kind}`)}</DialogTitle>
+          <DialogDescription>{t("adminConversation.library.templateHint")}</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <Field required>
+            <FieldLabel>{t("adminConversation.library.fields.name")}</FieldLabel>
+            <Input value={name} maxLength={LIMITS.name + 8} onChange={(e) => setName(e.target.value)} placeholder="summarize" autoComplete="off" />
+            <FieldHint>{t("adminConversation.library.fields.nameHint")}</FieldHint>
+          </Field>
+          <Field>
+            <FieldLabel>{t("adminConversation.library.fields.description")}</FieldLabel>
+            <Input value={description} onChange={(e) => setDescription(e.target.value)} />
+          </Field>
+          <Field required>
+            <FieldLabel>{kind === "skills" ? t("adminConversation.library.fields.markdown") : t("adminConversation.library.fields.content")}</FieldLabel>
+            <Textarea rows={10} value={content} onChange={(e) => setContent(e.target.value)} className="font-mono text-[13px]" />
+            <FieldHint>{t("adminConversation.library.fields.contentCount", { count: [...content.trim()].length, max: LIMITS.content })}</FieldHint>
+          </Field>
+          <label className="flex items-center gap-3 text-sm font-medium">
+            <Switch checked={enabled} onCheckedChange={setEnabled} />
+            {t("adminConversation.library.columns.enabled")}
+          </label>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+            {t("common.actions.cancel")}
+          </Button>
+          <Button loading={busy} onClick={save}>
+            {t("common.actions.save")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ComponentDialog({ target, onOpenChange, onSaved }: { target: ComponentItem | "new" | null; onOpenChange: (open: boolean) => void; onSaved: () => void }) {
+  const t = useT();
+  const message = useErrorMessage();
+  const shown = useSnapshot(target);
+  const existing = shown && shown !== "new" ? shown : null;
+  const builtin = existing?.scope === "builtin";
+  const [draft, setDraft] = useState({ name: "", description: "", propsSummary: "", propsSchema: "", rendererSource: "", enabled: true });
+  const [sample, setSample] = useState("{}");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (target === null) return;
+    const item = target === "new" ? null : target;
+    setDraft({
+      name: item?.name ?? "",
+      description: item?.description ?? "",
+      propsSummary: item?.propsSummary ?? "",
+      propsSchema: item?.propsSchema ?? "",
+      rendererSource: item?.rendererSource ?? "",
+      enabled: item ? item.enabled : true,
+    });
+    setSample("{}");
+  }, [target]);
+
+  const sampleProps = parseSampleProps(sample);
+  const set = <K extends keyof typeof draft>(key: K, value: (typeof draft)[K]) => setDraft((d) => ({ ...d, [key]: value }));
+
+  const save = async () => {
+    if (busy) return;
+    if (!builtin) {
+      const found = validateComponent(draft);
+      if (found) {
+        toast.error(t("adminConversation.library.saveFailed"), { description: problemText(t, found) });
+        return;
+      }
+    }
+    // Built-in components accept only the enabled flag.
+    const body: Record<string, unknown> = builtin
+      ? { enabled: draft.enabled }
+      : { name: draft.name.trim(), description: draft.description.trim(), propsSummary: draft.propsSummary.trim(), propsSchema: draft.propsSchema.trim(), rendererSource: draft.rendererSource, enabled: draft.enabled, sortOrder: existing?.sortOrder ?? 0 };
+    setBusy(true);
+    try {
+      if (existing) await updateLibrary("components", existing.id, body);
+      else await createLibrary("components", body);
+      toast.success(t("adminConversation.library.saved"));
+      onSaved();
+      onOpenChange(false);
+    } catch (error) {
+      toast.error(t("adminConversation.library.saveFailed"), { description: message(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={target !== null} onOpenChange={(open) => !busy && onOpenChange(open)}>
+      <DialogContent className="max-w-5xl">
+        <DialogHeader>
+          <DialogTitle>{existing ? t("adminConversation.library.edit.components") : t("adminConversation.library.new.components")}</DialogTitle>
+          <DialogDescription>{builtin ? t("adminConversation.library.builtinNote") : t("adminConversation.library.componentHint")}</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-6 lg:grid-cols-2">
+          <div className="grid content-start gap-4">
+            <Field required>
+              <FieldLabel>{t("adminConversation.library.fields.componentName")}</FieldLabel>
+              <Input value={draft.name} readOnly={builtin} onChange={(e) => set("name", e.target.value)} placeholder="price-card" autoComplete="off" spellCheck={false} />
+              <FieldHint>{t("adminConversation.library.fields.componentNameHint")}</FieldHint>
+            </Field>
+            <Field required>
+              <FieldLabel>{t("adminConversation.library.fields.description")}</FieldLabel>
+              <Input value={draft.description} readOnly={builtin} onChange={(e) => set("description", e.target.value)} />
+            </Field>
+            <Field required>
+              <FieldLabel>{t("adminConversation.library.fields.propsSummary")}</FieldLabel>
+              <Textarea rows={3} value={draft.propsSummary} readOnly={builtin} onChange={(e) => set("propsSummary", e.target.value)} />
+            </Field>
+            <Field>
+              <FieldLabel>{t("adminConversation.library.fields.propsSchema")}</FieldLabel>
+              <Textarea rows={5} value={draft.propsSchema} readOnly={builtin} spellCheck={false} onChange={(e) => set("propsSchema", e.target.value)} className="font-mono text-[12.5px]" />
+              <FieldHint>{t("adminConversation.library.fields.propsSchemaHint")}</FieldHint>
+            </Field>
+            <label className="flex items-center gap-3 text-sm font-medium">
+              <Switch checked={draft.enabled} onCheckedChange={(on) => set("enabled", on)} />
+              {t("adminConversation.library.columns.enabled")}
+            </label>
+          </div>
+          <div className="grid content-start gap-4">
+            <Field required>
+              <FieldLabel>{t("adminConversation.library.fields.rendererSource")}</FieldLabel>
+              <Textarea rows={9} value={draft.rendererSource} readOnly={builtin} spellCheck={false} onChange={(e) => set("rendererSource", e.target.value)} className="font-mono text-[12.5px]" />
+            </Field>
+            {!builtin ? (
+              <>
+                <Field invalid={sampleProps === null}>
+                  <FieldLabel>{t("adminConversation.library.fields.sampleProps")}</FieldLabel>
+                  <Textarea rows={3} value={sample} spellCheck={false} onChange={(e) => setSample(e.target.value)} className="font-mono text-[12.5px]" />
+                  <FieldError>{sampleProps === null ? t("adminConversation.library.fields.sampleInvalid") : null}</FieldError>
+                </Field>
+                {sampleProps !== null && draft.rendererSource.trim() ? (
+                  <ComponentPreview source={draft.rendererSource} props={sampleProps} title={t("adminConversation.library.fields.preview")} />
+                ) : (
+                  <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">{t("adminConversation.library.fields.previewOff")}</p>
+                )}
+              </>
+            ) : null}
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+            {t("common.actions.cancel")}
+          </Button>
+          <Button loading={busy} onClick={save}>
+            {t("common.actions.save")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

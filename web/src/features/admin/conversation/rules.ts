@@ -120,3 +120,153 @@ export const OPTION_PROTOCOLS = [
 ] as const;
 
 export type PathDoc = Record<string, string[]>;
+
+/** Blank text means the built-in defaults. */
+export const DEFAULT_ALLOWED: PathDoc = {
+  default: ["temperature", "top_p", "max_tokens", "max_output_tokens", "max_completion_tokens", "stop", "response_format.type"],
+  openai_chat_completions: ["service_tier", "presence_penalty", "frequency_penalty", "reasoning_effort", "verbosity", "thinking.type", "stream_options.include_usage"],
+  openai_responses: ["service_tier", "reasoning.effort", "reasoning.summary", "text.verbosity"],
+  openai_image_generations: ["background", "moderation", "n", "output_compression", "output_format", "partial_images", "quality", "response_format", "size", "style", "user"],
+  openai_image_edits: ["background", "input_fidelity", "n", "output_compression", "output_format", "partial_images", "quality", "response_format", "size", "user"],
+  anthropic_messages: ["speed", "top_k", "thinking.type", "thinking.budget_tokens"],
+  gemini_generate_content: [
+    "generationConfig.temperature",
+    "generationConfig.topP",
+    "generationConfig.maxOutputTokens",
+    "generationConfig.responseMimeType",
+    "generationConfig.thinkingConfig.includeThoughts",
+    "generationConfig.thinkingConfig.thinkingLevel",
+  ],
+  google_image_generation: ["generationConfig.responseModalities", "generationConfig.imageConfig.aspectRatio", "generationConfig.imageConfig.imageSize"],
+  gemini_interactions: [
+    "generation_config.temperature",
+    "generation_config.top_p",
+    "generation_config.max_output_tokens",
+    "generation_config.thinking_level",
+    "generation_config.thinking_summaries",
+    "response_format.type",
+    "response_format.aspect_ratio",
+    "response_format.image_size",
+    "response_format.mime_type",
+    "response_format.schema",
+    "generation_config.video_config.task",
+  ],
+  xai_responses: ["reasoning.effort", "min_p", "parallel_tool_calls", "store", "top_k"],
+  xai_image: ["aspect_ratio", "n", "resolution", "response_format"],
+  xai_image_edits: ["aspect_ratio", "n", "resolution", "response_format"],
+  xai_video: ["aspect_ratio", "duration", "resolution"],
+  xai_video_extensions: ["duration"],
+  openrouter_chat_completions: ["presence_penalty", "frequency_penalty", "reasoning_effort", "reasoning.effort", "reasoning.summary", "verbosity", "thinking.type", "stream_options.include_usage"],
+  openrouter_responses: ["reasoning.effort", "reasoning.summary"],
+  openrouter_images: ["aspect_ratio", "background", "n", "output_compression", "output_format", "provider.allow_fallbacks", "provider.ignore", "provider.only", "provider.order", "provider.sort", "quality", "resolution", "seed", "size", "user"],
+};
+
+export const DEFAULT_DENIED: PathDoc = {
+  default: ["model", "messages", "input", "instructions", "prompt", "system", "systemInstruction", "headers", "api_key", "apiKey", "base_url", "baseURL", "stream", "previous_response_id"],
+};
+
+/** Paths no policy can open, listed in the guide. */
+export const SYSTEM_DENIED = ["model", "messages", "input", "instructions", "prompt", "system", "systemInstruction", "headers", "api_key", "apiKey", "base_url", "baseURL"] as const;
+
+export function prettyDoc(doc: PathDoc): string {
+  return JSON.stringify(doc, null, 2);
+}
+
+export type DocParse = { ok: true; doc: PathDoc } | { ok: false; reason: "syntax" | "shape" | "protocol" };
+
+/** Parses a policy document: an object of protocol key to list of non-empty path strings. */
+export function parseDoc(text: string): DocParse {
+  const source = text.trim();
+  if (!source) return { ok: true, doc: {} };
+  let value: unknown;
+  try {
+    value = JSON.parse(source);
+  } catch {
+    return { ok: false, reason: "syntax" };
+  }
+  if (!isPlainObject(value)) return { ok: false, reason: "shape" };
+  const doc: PathDoc = {};
+  for (const [key, list] of Object.entries(value)) {
+    const protocol = key.trim().toLowerCase();
+    if (!(OPTION_PROTOCOLS as readonly string[]).includes(protocol)) return { ok: false, reason: "protocol" };
+    if (!Array.isArray(list) || list.some((p) => typeof p !== "string" || !p.trim())) return { ok: false, reason: "shape" };
+    doc[protocol] = list.map((p: string) => p.trim());
+  }
+  return { ok: true, doc };
+}
+
+/** Blank values show (and save) the defaults. */
+export function docText(stored: string, fallback: PathDoc): string {
+  return stored.trim() ? stored : prettyDoc(fallback);
+}
+
+function paths(doc: PathDoc, protocol: string): string[] {
+  return [...(doc.default ?? []), ...(protocol === "default" ? [] : (doc[protocol] ?? []))];
+}
+
+/** A rule covers a path when it equals it or is one of its ancestors. */
+export function covers(rule: string, path: string): boolean {
+  return path === rule || path.startsWith(`${rule}.`);
+}
+
+function underAny(list: readonly string[], path: string): string | undefined {
+  return list.find((rule) => covers(rule, path));
+}
+
+export type Verdict = "systemDenied" | "denylist" | "allowlist" | "notAllowed" | "notDenied" | "disabled";
+
+export interface PathResult {
+  path: string;
+  pass: boolean;
+  verdict: Verdict;
+  rule?: string;
+}
+
+/** Why one request parameter passes or is dropped under the current policy. */
+export function evaluatePath(path: string, protocol: string, mode: string, allowed: PathDoc, denied: PathDoc): PathResult {
+  const p = path.trim();
+  const system = underAny(SYSTEM_DENIED, p);
+  if (system) return { path: p, pass: false, verdict: "systemDenied", rule: system };
+  if (mode === "disabled") return { path: p, pass: false, verdict: "disabled" };
+  const deniedRule = underAny(paths(mergeWithDefault(denied, DEFAULT_DENIED), protocol), p);
+  if (deniedRule) return { path: p, pass: false, verdict: "denylist", rule: deniedRule };
+  if (mode === "denylist") return { path: p, pass: true, verdict: "notDenied" };
+  const allowRule = underAny(paths(allowed, protocol), p);
+  return allowRule ? { path: p, pass: true, verdict: "allowlist", rule: allowRule } : { path: p, pass: false, verdict: "notAllowed" };
+}
+
+/** Denied defaults are always layered on top of the stored denylist. */
+function mergeWithDefault(doc: PathDoc, defaults: PathDoc): PathDoc {
+  const out: PathDoc = { ...doc };
+  for (const [key, list] of Object.entries(defaults)) out[key] = [...new Set([...(out[key] ?? []), ...list])];
+  return out;
+}
+
+export function evaluatePaths(text: string, protocol: string, mode: string, allowed: PathDoc, denied: PathDoc): PathResult[] {
+  return text
+    .split(/[\n,]/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => evaluatePath(p, protocol, mode, allowed, denied));
+}
+
+/** Names of the models that can serve chat, for the model selects. */
+export function chatModelNames(models: ReadonlyArray<{ platformModelName: string; kindsJSON?: string }>): string[] {
+  const names = new Set<string>();
+  for (const m of models) {
+    let kinds: unknown = ["chat"];
+    try {
+      kinds = JSON.parse(m.kindsJSON || '["chat"]');
+    } catch {
+      /* treat as chat */
+    }
+    if (Array.isArray(kinds) && kinds.includes("chat") && m.platformModelName) names.add(m.platformModelName);
+  }
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+
+/** `conversations-export-20261016T101500.jsonl` style fallback. */
+export function exportFallbackName(now: Date = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `conversations-export-${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}T${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}.jsonl`;
+}
