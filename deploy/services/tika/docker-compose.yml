@@ -1,0 +1,24 @@
+# Apache Tika text extraction server (upstream image, no custom code). Start an
+# application profile first (it creates riochat-network) or create the network
+# by hand: docker network create riochat-network
+#
+#   docker compose -f deploy/services/tika/docker-compose.yml up -d
+#
+# Point the application at http://host.docker.internal:9998.
+
+name: riochat-tika
+
+services:
+  tika:
+    image: apache/tika:3.2.3.0
+    container_name: riochat-tika
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9998:9998"
+    networks:
+      - riochat-network
+
+networks:
+  riochat-network:
+    external: true
+    name: riochat-network
