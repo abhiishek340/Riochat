@@ -156,3 +156,190 @@ export function IndexPanel({ resetKey }: { resetKey: unknown }) {
     </div>
   );
 }
+
+function TasksDialog({ bucket, onClose, onChanged }: { bucket: TaskBucket | null; onClose: () => void; onChanged: () => void }) {
+  const t = useT();
+  const { locale } = useI18n();
+  const notify = useNotify();
+  const [q, setQ] = useState("");
+  const [rows, setRows] = useState<EmbeddingTask[]>([]);
+  const [page, setPage] = useState(1);
+  const [done, setDone] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [nonce, setNonce] = useState(0);
+  const selection = useSelection<string>();
+  const request = useRef(0);
+  // The follow-up page request is cancelled when the bucket, the search or the dialog changes.
+  const moreRequest = useRef<AbortController | null>(null);
+  const sentinel = useRef<HTMLDivElement>(null);
+
+  // A new bucket, search or refresh starts again from page one.
+  useEffect(() => {
+    if (!bucket) return;
+    const id = ++request.current;
+    const controller = new AbortController();
+    setRows([]);
+    setPage(1);
+    setDone(false);
+    selection.clear();
+    setLoading(true);
+    listTasks({ bucket, page: 1, pageSize: TASK_PAGE_SIZE, query: q }, controller.signal).then(
+      (result) => {
+        if (id !== request.current) return;
+        setRows(result.results);
+        setDone(result.results.length < TASK_PAGE_SIZE || result.results.length >= result.total);
+        setLoading(false);
+      },
+      (error: unknown) => {
+        if (isAbortError(error) || id !== request.current) return;
+        setLoading(false);
+        setDone(true);
+        notify.error("adminFiles.tasks.loadFailed", error);
+      },
+    );
+    return () => {
+      controller.abort();
+      moreRequest.current?.abort();
+      // Whatever is still on its way no longer belongs to the screen.
+      request.current += 1;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bucket, q, nonce]);
+
+  const loadMore = useCallback(async () => {
+    if (!bucket || loading || done) return;
+    const id = request.current;
+    const next = page + 1;
+    setLoading(true);
+    const controller = new AbortController();
+    moreRequest.current = controller;
+    try {
+      const result = await listTasks({ bucket, page: next, pageSize: TASK_PAGE_SIZE, query: q }, controller.signal);
+      if (id !== request.current) return;
+      setRows((current) => {
+        const merged = appendUnique(current, result.results, (x) => x.fileID);
+        // A page that adds nothing new ends the paging.
+        if (!merged.added || merged.items.length >= result.total) setDone(true);
+        return merged.items;
+      });
+      setPage(next);
+    } catch (error) {
+      if (!isAbortError(error)) {
+        setDone(true);
+        notify.error("adminFiles.tasks.loadFailed", error);
+      }
+    } finally {
+      if (id === request.current) setLoading(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bucket, loading, done, page, q]);
+
+  useEffect(() => {
+    const node = sentinel.current;
+    if (!node || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => entries.some((e) => e.isIntersecting) && void loadMore());
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [loadMore, rows.length]);
+
+  const retryable = useMemo(() => rows.filter((r) => r.retryable).map((r) => r.fileID), [rows]);
+
+  const retry = async () => {
+    const ids = [...selection.selected];
+    if (ids.length === 0) return;
+    setRetrying(true);
+    try {
+      let submitted = 0;
+      let skipped = 0;
+      for (const group of chunk(ids, 100)) {
+        const result = await retryTasks(group);
+        submitted += result.submittedFileIDs.length;
+        skipped += result.skipped.length;
+      }
+      if (submitted === 0) notify.warning("adminFiles.tasks.nothingRetried");
+      else if (skipped > 0) notify.success("adminFiles.tasks.retried", { count: submitted }, t("adminFiles.tasks.retriedSkipped", { skipped }));
+      else notify.success("adminFiles.tasks.retried", { count: submitted });
+      selection.clear();
+      setNonce((n) => n + 1);
+      onChanged();
+    } catch (error) {
+      notify.error("adminFiles.tasks.retryFailed", error);
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  return (
+    <Dialog open={bucket !== null} onOpenChange={(open) => !open && !retrying && onClose()}>
+      <DialogContent className="max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>{t("adminFiles.tasks.title", { bucket: bucket ? t(`adminFiles.index.buckets.${bucket}`) : "" })}</DialogTitle>
+        </DialogHeader>
+        <div className="flex flex-wrap items-center gap-2">
+          <SearchBox value={q} onChange={setQ} placeholder={t("adminFiles.tasks.search")} />
+          <Button size="sm" className="ml-auto" disabled={selection.count === 0} loading={retrying} onClick={retry}>
+            {t("adminFiles.tasks.retry")}
+            {selection.count > 0 ? ` (${selection.count})` : ""}
+          </Button>
+        </div>
+        <div className="max-h-[55vh] overflow-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-muted/90 text-left text-xs uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="w-10 px-3 py-2">
+                  <Checkbox
+                    aria-label={t("adminCommon.table.selectAll")}
+                    checked={selection.headerState(retryable)}
+                    disabled={retryable.length === 0}
+                    onCheckedChange={(on) => selection.toggleAll(retryable, on)}
+                  />
+                </th>
+                <th className="px-3 py-2">{t("adminFiles.tasks.columns.file")}</th>
+                <th className="px-3 py-2">{t("adminFiles.tasks.columns.owner")}</th>
+                <th className="px-3 py-2">{t("adminFiles.tasks.columns.size")}</th>
+                <th className="px-3 py-2">{t("adminFiles.tasks.columns.updated")}</th>
+                <th className="px-3 py-2">{t("adminFiles.tasks.columns.note")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.fileID} className="border-t">
+                  <td className="px-3 py-2">
+                    <Checkbox aria-label={t("adminCommon.table.selectRowNamed", { name: r.fileName })} checked={selection.has(r.fileID)} disabled={!r.retryable} onCheckedChange={(on) => selection.toggle(r.fileID, on)} />
+                  </td>
+                  <td className="max-w-[16rem] px-3 py-2">
+                    <div className="truncate font-medium">{r.fileName}</div>
+                    <div className="truncate text-xs text-muted-foreground">{r.mimeType}</div>
+                  </td>
+                  <td className="px-3 py-2">{r.userLabel || r.userID}</td>
+                  <td className="whitespace-nowrap px-3 py-2 tabular-nums">{formatBytes(r.sizeBytes, locale)}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">{formatDateTime(r.updatedAt, locale)}</td>
+                  <td className="px-3 py-2 text-[13px]">
+                    {r.stalled ? <Badge tone="warning">{t("adminFiles.tasks.stalled")}</Badge> : null}
+                    {r.embedError ? <div className="text-destructive">{r.embedError}</div> : null}
+                    {!r.retryable && r.retryBlockedReason ? <div className="text-muted-foreground">{t("adminFiles.tasks.cannotRetry")}: {r.retryBlockedReason}</div> : null}
+                  </td>
+                </tr>
+              ))}
+              {rows.length === 0 && !loading ? (
+                <tr>
+                  <td colSpan={6} className="h-24 text-center text-muted-foreground">
+                    {t("adminFiles.tasks.empty")}
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+          <div ref={sentinel} className="flex h-10 items-center justify-center">
+            {loading ? <Skeleton className="h-4 w-24" /> : !done ? (
+              <Button variant="ghost" size="sm" onClick={() => void loadMore()}>
+                {t("adminFiles.tasks.loadMore")}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
