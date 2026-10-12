@@ -1,0 +1,240 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+
+jobs:
+  # Decides which areas a change touches. Jobs that are skipped count as
+  # passing for required checks, so documentation-only changes stay cheap.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.detect.outputs.backend }}
+      web: ${{ steps.detect.outputs.web }}
+      python: ${{ steps.detect.outputs.python }}
+      docker: ${{ steps.detect.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          base=""
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            push) base="$PUSH_BEFORE" ;;
+          esac
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+            echo "web=true" >> "$GITHUB_OUTPUT"
+            echo "python=true" >> "$GITHUB_OUTPUT"
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(git diff --name-only "$base" "$HEAD_SHA")"
+          shared='^(VERSION|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|turbo\.json|scripts/|\.github/workflows/ci\.yml)'
+          if echo "$files" | grep -Eq "$shared|^backend/"; then
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend=false" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$files" | grep -Eq "$shared|^web/"; then
+            echo "web=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web=false" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$files" | grep -Eq '^(deploy/services/|ruff\.toml|\.github/workflows/ci\.yml)'; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The image contains the server and the web export, so any change to
+          # either, to the Dockerfile, the ignore file or deploy/ can break it.
+          if echo "$files" | grep -Eq "$shared|^(backend/|web/|Dockerfile|\.dockerignore|deploy/)"; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Always runs (it is cheap): the version manifests must agree with VERSION and
+  # the repository scripts must pass their own tests.
+  repo:
+    name: Version files and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Version manifests match VERSION
+        run: node scripts/sync-version.mjs --check
+      - name: Script tests
+        run: node --test scripts/sync-version.test.mjs scripts/build-api.test.mjs
+
+  commits:
+    name: Commit subjects
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check commit subjects
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test): [[:print:]]+$'
+          failed=0
+          for sha in $(git rev-list "$BASE_SHA..$HEAD_SHA"); do
+            subject="$(git log -1 --format=%s "$sha")"
+            case "$subject" in
+              "Merge "*) continue ;;
+            esac
+            if ! printf '%s' "$subject" | LC_ALL=C grep -Eq "$pattern"; then
+              echo "::error title=Commit subject::$sha: \"$subject\""
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "Commit subjects must look like 'type: subject' with type one of"
+            echo "build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test,"
+            echo "and the subject must be printable ASCII. See .github/CONTRIBUTING.md."
+            exit 1
+          fi
+
+  backend:
+    name: Backend (go build, vet, test)
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Build
+        run: go build ./...
+        env:
+          CGO_ENABLED: "1"
+      - name: Vet
+        run: go vet ./...
+        env:
+          CGO_ENABLED: "1"
+      - name: Test
+        run: go test ./...
+        env:
+          CGO_ENABLED: "1"
+
+  web:
+    name: Web (typecheck, lint, test, build)
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Test
+        run: pnpm test
+      - name: Cache Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: web/.next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('web/src/**', 'web/next.config.ts') }}
+          restore-keys: |
+            next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+      - name: Build static export
+        run: pnpm build
+      - name: Check export exists
+        run: test -f out/index.html
+
+  python:
+    name: Python (ruff, tests)
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check .
+      - name: Format
+        run: ruff format --check .
+      - name: Page range tests
+        run: |
+          for svc in rapidocr tesseract; do
+            (cd "deploy/services/$svc" && python -m unittest -v)
+          done
+
+  docker:
+    name: Docker image build
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
