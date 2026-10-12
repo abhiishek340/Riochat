@@ -1,0 +1,152 @@
+name: Image
+
+# Builds the container image for linux/amd64 and linux/arm64 on native runners
+# and publishes a multi-architecture manifest list per tag.
+#
+#   push to main  -> main, latest
+#   push to dev   -> dev
+#   tag v1.2.3    -> v1.2.3
+#
+# Images go to ghcr.io/<owner>/<repo>. They also go to Docker Hub when the
+# DOCKERHUB_TOKEN secret is set (user name from DOCKERHUB_USERNAME, else the
+# repository owner).
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  names:
+    name: Image names
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.names.outputs.images }}
+      tags: ${{ steps.names.outputs.tags }}
+      dockerhub: ${{ steps.names.outputs.dockerhub }}
+    env:
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      REF_NAME: ${{ github.ref_name }}
+      REF: ${{ github.ref }}
+      HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - id: names
+        run: |
+          set -eu
+          repo_lc="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          images="ghcr.io/${repo_lc}"
+          hub=false
+          if [ -n "$HUB_TOKEN" ]; then
+            hub=true
+            ns="${HUB_USER:-$OWNER}"
+            ns="$(printf '%s' "$ns" | tr '[:upper:]' '[:lower:]')"
+            name="$(printf '%s' "${REPO#*/}" | tr '[:upper:]' '[:lower:]')"
+            images="${images},${ns}/${name}"
+          fi
+          tags="$REF_NAME"
+          if [ "$REF" = "refs/heads/main" ]; then
+            tags="${tags},latest"
+          fi
+          echo "images=${images}" >> "$GITHUB_OUTPUT"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "dockerhub=${hub}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: names
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        if: needs.names.outputs.dockerhub == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || github.repository_owner }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Per-architecture tags
+        id: tags
+        env:
+          IMAGES: ${{ needs.names.outputs.images }}
+          TAGS: ${{ needs.names.outputs.tags }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          list=""
+          for image in ${IMAGES//,/ }; do
+            for tag in ${TAGS//,/ }; do
+              list="${list}${image}:${tag}-${ARCH}"$'\n'
+            done
+          done
+          {
+            echo "list<<EOF"
+            printf '%s' "$list"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            REFRESH_CATALOG_SNAPSHOTS=true
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,scope=image-${{ matrix.arch }},mode=min
+
+  manifest:
+    name: Multi-architecture manifests
+    needs: [names, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        if: needs.names.outputs.dockerhub == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || github.repository_owner }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create and inspect manifest lists
+        env:
+          IMAGES: ${{ needs.names.outputs.images }}
+          TAGS: ${{ needs.names.outputs.tags }}
+        run: |
+          set -eu
+          for image in ${IMAGES//,/ }; do
+            for tag in ${TAGS//,/ }; do
+              docker buildx imagetools create \
+                --tag "${image}:${tag}" \
+                "${image}:${tag}-amd64" "${image}:${tag}-arm64"
+              docker buildx imagetools inspect "${image}:${tag}"
+            done
+          done
