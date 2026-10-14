@@ -1,0 +1,340 @@
+name: Desktop
+
+# The desktop shell lives in desktop/ (Tauri 2). The jobs stay idle while
+# desktop/src-tauri/tauri.conf.json does not exist.
+#
+# Tags v*.*.* create one draft release (published by a person) and every build
+# leg uploads its installers into it. Manual runs and other pushes only build
+# and keep the installers as workflow artifacts named desktop-<leg>.
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ["v*.*.*", "v*.*.*-*"]
+    paths:
+      - "desktop/**"
+      - "backend/**"
+      - "web/**"
+      - "VERSION"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "desktop/**"
+      - "VERSION"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  NODE_VERSION: "24"
+
+jobs:
+  gate:
+    name: Shell present?
+    runs-on: ubuntu-latest
+    outputs:
+      present: ${{ steps.probe.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: probe
+        run: |
+          if [ -f desktop/src-tauri/tauri.conf.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "desktop/src-tauri/tauri.conf.json not found; skipping desktop jobs."
+          fi
+
+  check:
+    name: Rust format, lint, tests
+    needs: gate
+    if: needs.gate.outputs.present == 'true'
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version matches VERSION file
+        working-directory: .
+        run: |
+          want="$(tr -d '[:space:]' < VERSION)"
+          have="$(sed -n 's/^version = "\(.*\)"$/\1/p' desktop/src-tauri/Cargo.toml | head -n 1)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::VERSION is $want but desktop/src-tauri/Cargo.toml has $have"
+            exit 1
+          fi
+      - name: Install Linux libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libxdo-dev patchelf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Placeholder sidecar
+        # Tauri checks that the bundled server binary exists. Cargo commands do
+        # not need the real one, so an empty file named for the host triple is
+        # enough here.
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p binaries
+          : > "binaries/riochat-server-$triple"
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --lib
+
+  release:
+    name: Draft release
+    needs: [gate, check]
+    if: needs.gate.outputs.present == 'true' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+    steps:
+      # Created once, before the build legs start, so racing legs cannot each
+      # create their own draft.
+      - id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"${TAG}\") | .id")"
+          matches="$(printf '%s' "$ids" | grep -c . || true)"
+          if [ "$matches" -gt 1 ]; then
+            echo "::error::${matches} releases already exist for ${TAG}; delete the extra ones and re-run."
+            exit 1
+          fi
+          if [ "$matches" -eq 1 ]; then
+            id="$ids"
+          else
+            prerelease=false
+            case "$TAG" in *-*) prerelease=true ;; esac
+            cat > notes.md <<NOTES
+          Downloads
+
+          | Platform | File |
+          |---|---|
+          | macOS (Apple silicon) | Riochat dmg for aarch64 |
+          | macOS (Intel) | Riochat dmg for x64 |
+          | Linux | AppImage or deb |
+          | Windows | setup exe |
+          | Windows (managed) | msi |
+          | Windows (portable) | portable zip |
+
+          Checksums are listed in SHA256SUMS. The \`latest.json\` and \`.sig\` files
+          are used by the in-app updater; do not delete them.
+          NOTES
+            id="$(gh api "repos/${GITHUB_REPOSITORY}/releases" -X POST \
+              -f tag_name="$TAG" -f name="$TAG" -F draft=true -F prerelease="$prerelease" \
+              -F body=@notes.md --jq .id)"
+          fi
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Package (${{ matrix.label }})
+    needs: [gate, check, release]
+    # `release` is skipped on manual runs; the legs still run then.
+    if: ${{ !cancelled() && !failure() && needs.gate.outputs.present == 'true' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+    permissions:
+      contents: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - label: macos-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+          - label: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # runners have no FUSE; AppImage helper tools unpack themselves instead
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Updater signing key is configured
+        shell: bash
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set; updater artifacts cannot be signed."
+            exit 1
+          fi
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libxdo-dev patchelf
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Build web client
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: C compiler is available
+        shell: bash
+        run: |
+          if command -v gcc >/dev/null 2>&1; then gcc --version | head -n 1
+          elif command -v cc >/dev/null 2>&1; then cc --version | head -n 1
+          else echo "::error::no C compiler found; the server's SQLite driver needs cgo"; exit 1; fi
+      - name: Version manifests match VERSION
+        run: node scripts/sync-version.mjs --check
+      - name: Build server sidecar
+        # Tauri looks for <name>-<target triple> next to the other bundled
+        # binaries. The server needs cgo for SQLite, so each leg builds natively
+        # for its own target. The script embeds version, commit and build time.
+        shell: bash
+        env:
+          GIT_COMMIT: ${{ github.sha }}
+          RIOCHAT_REFRESH_CATALOG_SNAPSHOTS: "1"
+        run: node scripts/build-api.mjs --sidecar --target "${{ matrix.target }}"
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+      - name: Apple signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID_VALUE: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_VALUE: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID_VALUE: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -eu
+          present=""; missing=""
+          [ -n "$CERT" ] && present="$present APPLE_CERTIFICATE" || missing="$missing APPLE_CERTIFICATE"
+          [ -n "$APPLE_ID_VALUE" ] && present="$present APPLE_ID" || missing="$missing APPLE_ID"
+          [ -n "$APPLE_PASSWORD_VALUE" ] && present="$present APPLE_PASSWORD" || missing="$missing APPLE_PASSWORD"
+          if [ -z "$present" ]; then
+            echo "::warning::No Apple credentials set; the app is signed ad hoc and not notarized."
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+          elif [ -n "$missing" ]; then
+            echo "::error::Incomplete Apple signing credentials. Set:${present}. Missing:${missing}."
+            exit 1
+          else
+            {
+              echo "APPLE_CERTIFICATE=$CERT"
+              echo "APPLE_CERTIFICATE_PASSWORD=$CERT_PASSWORD"
+              echo "APPLE_ID=$APPLE_ID_VALUE"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD_VALUE"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID_VALUE"
+            } >> "$GITHUB_ENV"
+          fi
+      - name: Prepare AppImage tooling
+        # Replaces the cached linuxdeploy with a wrapper that never bundles the
+        # Wayland client libraries (copies of them break EGL on newer systems).
+        if: runner.os == 'Linux'
+        run: node desktop/scripts/prepare-appimage.mjs
+      - name: Release configuration
+        # Stable tags keep the configured updater endpoint; prerelease tags
+        # (v1.2.3-beta.1) poll the rolling desktop-beta manifest. Also sets the
+        # MSI product version. The JSON is written to a file because the action
+        # splits its argument string on quotes.
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -eu
+          channel=stable
+          case "$GITHUB_REF_NAME" in *-*) channel=beta ;; esac
+          line="$(node desktop/scripts/release-config.mjs --channel "$channel" --repository "$GITHUB_REPOSITORY")"
+          printf '%s\n' "${line#--config }" > desktop/release-config.json
+      - name: Build installers
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: desktop
+        run: cargo tauri build --target ${{ matrix.target }}
+      - name: Build installers and upload them to the draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: desktop
+          tauriScript: cargo tauri
+          args: --target ${{ matrix.target }} --config release-config.json
+          releaseId: ${{ needs.release.outputs.id }}
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+      - name: Upload installers
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.label }}
+          if-no-files-found: error
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz*
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage*
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe*
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi*
+
+  assets:
+    name: Public asset names and checksums
+    needs: [release, package]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && needs.package.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # The release is still a draft here. Renaming comes first so that
+      # SHA256SUMS lists the final names and latest.json points at them.
+      - name: Rename assets, reconcile latest.json, write SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          node desktop/scripts/release-assets.mjs "$TAG"
+          node desktop/scripts/checksums.mjs "$TAG"
