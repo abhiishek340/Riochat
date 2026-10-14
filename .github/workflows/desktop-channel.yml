@@ -1,0 +1,31 @@
+name: Desktop channel
+
+# Publishing a release offers its signed updater manifest (latest.json) to the
+# rolling "desktop-beta" release, which beta clients poll, when it is newer. The rolling release
+# itself is skipped, otherwise this workflow would trigger itself.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  beta:
+    name: Refresh the beta manifest
+    if: github.event.release.tag_name != 'desktop-beta'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # Creates the rolling prerelease on first use and uploads the manifest
+      # only when its version is strictly newer than the one already there.
+      - name: Refresh the beta manifest
+        run: node desktop/scripts/refresh-beta-manifest.mjs "$TAG"
