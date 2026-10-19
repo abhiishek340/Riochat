@@ -1,0 +1,26 @@
+Windows Registry Editor Version 5.00
+
+; Example Riochat desktop policy (computer-wide). Import with: reg import riochat-policy.example.reg
+; Values under HKEY_CURRENT_USER work the same way; where both hives set a value,
+; the computer hive wins. Replace the sample values before use.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Riochat]
+
+; Prefill the server address (http or https origin, no path).
+"DefaultServerUrl"="https://chat.example.com"
+
+; Allow connections only to the default server (also disables the built-in local server).
+"LockServerUrl"=dword:00000001
+
+; Disable the bundled local server.
+"DisableLocalMode"=dword:00000001
+
+; Turn off update checks and notifications.
+"DisableAutoUpdate"=dword:00000001
+
+; Proxy settings: the hive that sets ProxyMode decides all three values.
+; ProxyMode is one of: system, direct, fixed_servers.
+;"ProxyMode"="fixed_servers"
+; host:port, http://host:port or socks5://host:port, without credentials.
+;"ProxyServer"="http://proxy.example.com:3128"
+;"ProxyBypassList"="*.corp.example.com;10.0.0.0/8"
