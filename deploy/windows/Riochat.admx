@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitions revision="1.0" schemaVersion="1.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <policyNamespaces>
+    <target prefix="riochat" namespace="Riochat.Policies.Desktop" />
+    <using prefix="windows" namespace="Microsoft.Policies.Windows" />
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0" />
+  <supportedOn>
+    <definitions>
+      <definition name="SUPPORTED_Windows10OrLater" displayName="$(string.SUPPORTED_Windows10OrLater)" />
+    </definitions>
+  </supportedOn>
+  <categories>
+    <category name="Riochat" displayName="$(string.Category_Riochat)" />
+  </categories>
+  <policies>
+
+    <policy name="DefaultServerUrl" class="Both" displayName="$(string.DefaultServerUrl)" explainText="$(string.DefaultServerUrl_Explain)" presentation="$(presentation.DefaultServerUrl)" key="SOFTWARE\Policies\Riochat">
+      <parentCategory ref="Riochat" />
+      <supportedOn ref="SUPPORTED_Windows10OrLater" />
+      <elements>
+        <text id="DefaultServerUrl" valueName="DefaultServerUrl" maxLength="2048" />
+      </elements>
+    </policy>
+
+    <policy name="LockServerUrl" class="Both" displayName="$(string.LockServerUrl)" explainText="$(string.LockServerUrl_Explain)" key="SOFTWARE\Policies\Riochat" valueName="LockServerUrl">
+      <parentCategory ref="Riochat" />
+      <supportedOn ref="SUPPORTED_Windows10OrLater" />
+      <enabledValue>
+        <decimal value="1" />
+      </enabledValue>
+      <disabledValue>
+        <decimal value="0" />
+      </disabledValue>
+    </policy>
+
+    <policy name="DisableLocalMode" class="Both" displayName="$(string.DisableLocalMode)" explainText="$(string.DisableLocalMode_Explain)" key="SOFTWARE\Policies\Riochat" valueName="DisableLocalMode">
+      <parentCategory ref="Riochat" />
+      <supportedOn ref="SUPPORTED_Windows10OrLater" />
+      <enabledValue>
+        <decimal value="1" />
+      </enabledValue>
+      <disabledValue>
+        <decimal value="0" />
+      </disabledValue>
+    </policy>
+
+    <policy name="DisableAutoUpdate" class="Both" displayName="$(string.DisableAutoUpdate)" explainText="$(string.DisableAutoUpdate_Explain)" key="SOFTWARE\Policies\Riochat" valueName="DisableAutoUpdate">
+      <parentCategory ref="Riochat" />
+      <supportedOn ref="SUPPORTED_Windows10OrLater" />
+      <enabledValue>
+        <decimal value="1" />
+      </enabledValue>
+      <disabledValue>
+        <decimal value="0" />
+      </disabledValue>
+    </policy>
+
+    <policy name="ProxySettings" class="Both" displayName="$(string.ProxySettings)" explainText="$(string.ProxySettings_Explain)" presentation="$(presentation.ProxySettings)" key="SOFTWARE\Policies\Riochat">
+      <parentCategory ref="Riochat" />
+      <supportedOn ref="SUPPORTED_Windows10OrLater" />
+      <elements>
+        <enum id="ProxyMode" valueName="ProxyMode" required="true">
+          <item displayName="$(string.ProxyMode_System)">
+            <value>
+              <string>system</string>
+            </value>
+          </item>
+          <item displayName="$(string.ProxyMode_Direct)">
+            <value>
+              <string>direct</string>
+            </value>
+          </item>
+          <item displayName="$(string.ProxyMode_FixedServers)">
+            <value>
+              <string>fixed_servers</string>
+            </value>
+          </item>
+        </enum>
+        <text id="ProxyServer" valueName="ProxyServer" maxLength="2048" />
+        <text id="ProxyBypassList" valueName="ProxyBypassList" maxLength="8192" />
+      </elements>
+    </policy>
+
+  </policies>
+</policyDefinitions>
