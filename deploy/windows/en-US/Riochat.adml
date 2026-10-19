@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources revision="1.0" schemaVersion="1.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <displayName>Riochat desktop</displayName>
+  <description>Policy settings for the Riochat desktop application.</description>
+  <resources>
+    <stringTable>
+      <string id="SUPPORTED_Windows10OrLater">Windows 10 or later</string>
+      <string id="Category_Riochat">Riochat</string>
+
+      <string id="DefaultServerUrl">Default server address</string>
+      <string id="DefaultServerUrl_Explain">Prefills the server address that users connect to. The value must be an http or https origin without a path, for example https://chat.example.com. Users can still choose another server unless "Lock users to the default server" is enabled.</string>
+
+      <string id="LockServerUrl">Lock users to the default server</string>
+      <string id="LockServerUrl_Explain">When enabled, users can connect only to the default server address. The setting has no effect when no default server address is configured. Enabling it also turns off the built-in local server, and saved tabs for other servers, together with their stored sign-in, are removed.</string>
+
+      <string id="DisableLocalMode">Disable the built-in local server</string>
+      <string id="DisableLocalMode_Explain">When enabled, the local server bundled with the application cannot be used. Users can only connect to remote servers.</string>
+
+      <string id="DisableAutoUpdate">Turn off automatic updates</string>
+      <string id="DisableAutoUpdate_Explain">When enabled, the application does not check for updates and does not show update notifications. Use this when updates are distributed by other means, such as a software deployment system.</string>
+
+      <string id="ProxySettings">Network proxy</string>
+      <string id="ProxySettings_Explain">Controls how the application reaches the network. "Use the system proxy" follows the Windows settings, "Connect directly" never uses a proxy, and "Use fixed proxy servers" uses the server listed below. Connections to the local machine are always direct.
+
+If this policy is set in both the computer and the user hive, the computer hive decides all three values (mode, server and bypass list).
+
+Proxy server: host:port, http://host:port or socks5://host:port, without credentials. Required for fixed proxy servers.
+
+Bypass list: host names, wildcard domains, address prefixes or CIDR ranges that should skip the proxy.</string>
+      <string id="ProxyMode_System">Use the system proxy</string>
+      <string id="ProxyMode_Direct">Connect directly</string>
+      <string id="ProxyMode_FixedServers">Use fixed proxy servers</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="DefaultServerUrl">
+        <textBox refId="DefaultServerUrl">
+          <label>Server address:</label>
+        </textBox>
+      </presentation>
+      <presentation id="ProxySettings">
+        <dropdownList refId="ProxyMode" defaultItem="0">Proxy mode:</dropdownList>
+        <textBox refId="ProxyServer">
+          <label>Proxy server (required for fixed proxy servers):</label>
+        </textBox>
+        <textBox refId="ProxyBypassList">
+          <label>Bypass list:</label>
+        </textBox>
+      </presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>
